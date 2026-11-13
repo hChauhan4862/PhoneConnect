@@ -953,3 +953,140 @@ async fn relay_forwards_a_valid_frame_byte_for_byte() {
         "the relay forwards validated bytes unchanged"
     );
 }
+
+#[tokio::test]
+async fn a_new_lease_does_not_reset_the_session_byte_budget() {
+    let limits = RelayLimits {
+        max_session_bytes: 256,
+        ..RelayLimits::default()
+    };
+    let app = TestApp::with_relay(limits);
+    let (session_id, capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // One frame fits the budget, a second frame of the same size would not.
+    let frame = encode_frame(&envelope(&session_id, &[0u8; 100]), &FrameLimits::default())
+        .expect("frame encodes");
+    assert!(
+        frame.len() <= 256,
+        "the test frame must fit the budget: {}",
+        frame.len()
+    );
+    assert!(
+        frame.len() * 2 > 256,
+        "two test frames must exceed the budget: {}",
+        frame.len()
+    );
+    device
+        .send_bytes(&frame)
+        .await
+        .expect("first frame is within budget");
+    client
+        .recv_bytes()
+        .await
+        .expect("the peer drains the frame");
+
+    // Spending the budget ends the relay for both directions, not just the sender.
+    match device.send_frame(&envelope(&session_id, &[0u8; 512])).await {
+        Err(RelayClose::ByteBudgetExhausted) => {}
+        other => panic!("expected ByteBudgetExhausted, got {other:?}"),
+    }
+    assert_eq!(
+        client.recv_bytes().await,
+        Err(RelayClose::ByteBudgetExhausted),
+        "the receiving peer learns the session is spent"
+    );
+
+    // A new lease for the same session must not hand out a fresh allowance.
+    let (status, body) = app.relay_upgrade(&session_id, Some(&capability)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a spent relay session cannot be leased again: {body}"
+    );
+    assert_eq!(body["error"], "relay_unavailable");
+
+    match app.state.relay.attach(&session_id, PeerRole::Device).await {
+        Err(RelayClose::ByteBudgetExhausted) => {}
+        other => panic!("expected ByteBudgetExhausted on re-attach, got {other:?}"),
+    }
+    match device.send_bytes(&frame).await {
+        Err(RelayClose::ByteBudgetExhausted) => {}
+        other => panic!("a new lease must not reset the session byte budget, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_idle_timeout_does_not_reset_the_session_byte_budget() {
+    let limits = RelayLimits {
+        max_session_bytes: 256,
+        idle_timeout_ms: 50,
+        ..RelayLimits::default()
+    };
+    let app = TestApp::with_relay(limits);
+    let (session_id, capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let frame = encode_frame(&envelope(&session_id, &[0u8; 100]), &FrameLimits::default())
+        .expect("frame encodes");
+    assert!(frame.len() <= 256 && frame.len() * 2 > 256);
+    device.send_bytes(&frame).await.expect("first frame");
+    client.recv_bytes().await.expect("frame delivered");
+    assert_eq!(client.recv_frame().await, Err(RelayClose::IdleTimeout));
+
+    // An idle timeout is a per-receive deadline, not a budget reset: the bytes already
+    // forwarded still count after a new lease.
+    let (status, body) = app.relay_upgrade(&session_id, Some(&capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("re-attach after an idle timeout");
+    match device.send_bytes(&frame).await {
+        Err(RelayClose::ByteBudgetExhausted) => {}
+        other => panic!("an idle timeout must not reset the session byte budget, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_closed_relay_session_cannot_be_reopened_before_it_expires() {
+    let app = TestApp::new();
+    let (session_id, capability) = opened_session(&app).await;
+    app.state
+        .relay
+        .close_session(&session_id, RelayClose::SessionClosed);
+
+    // The close reason is part of the session's relay state, not a lease's, so a second
+    // lease inside the session lifetime is refused with that reason.
+    let (status, body) = app.relay_upgrade(&session_id, Some(&capability)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "relay_unavailable");
+    assert!(matches!(
+        app.state.relay.attach(&session_id, PeerRole::Device).await,
+        Err(RelayClose::SessionClosed)
+    ));
+}

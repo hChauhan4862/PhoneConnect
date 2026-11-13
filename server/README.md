@@ -62,6 +62,14 @@ revoked, or its store record disappears. Each case reports a distinct close reas
 (`SessionExpired`, `SessionRevoked`, `DeviceRevoked`, `UnknownSession`, and
 `StoreUnavailable` when authorization state cannot be read, which fails closed).
 
+A relay session is leased once. If its relay closes — the session byte budget is exhausted,
+the transport closes it, or revocation ends it — the same session id cannot be leased again
+until the session expires: the close reason is sticky and the per-session byte budget counts
+every byte forwarded under that session, not every byte forwarded under one lease. Asking for
+a new lease returns 409 `relay_unavailable`; peers that still need to relay request a new
+session. Closed relay state is dropped when the session expires, so memory stays bounded by
+sessions from the last five minutes.
+
 ## Configuration
 
 | Variable | Default | Meaning |

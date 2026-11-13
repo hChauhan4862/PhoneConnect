@@ -182,15 +182,22 @@ impl Relay {
         }
     }
 
-    /// Authorizes `session` and registers it for relay traffic. Expired, revoked, and
-    /// closed sessions are dropped here, so the session table stays bounded by live
-    /// sessions.
+    /// Authorizes `session` and registers it for relay traffic. Expired sessions are
+    /// dropped here, so the session table stays bounded by live sessions. A closed
+    /// session is **not** dropped and never revived: its close reason and the bytes it
+    /// already forwarded live as long as the session does.
     pub fn open(&self, session: &SessionRecord, now_ms: UnixMs) -> Result<RelayLease, RelayClose> {
         authorize_relay(session, now_ms)?;
         let mut sessions = self.sessions();
         sessions.retain(|_, relay| !relay.is_stale(now_ms));
         match sessions.get(&session.session_id) {
-            Some(existing) => existing.refresh_expiry(session.expires_at_ms),
+            Some(existing) => {
+                // A new lease is not a new allowance: a closed relay stays closed, so
+                // neither the per-session byte budget nor a close reason can be reset by
+                // asking for another lease.
+                existing.check_open()?;
+                existing.refresh_expiry(session.expires_at_ms);
+            }
             None => {
                 sessions.insert(
                     session.session_id.clone(),
@@ -222,7 +229,10 @@ impl Relay {
         Ok(RelayPeer { session, role })
     }
 
-    /// Closes a session and wakes every blocked peer with `reason`.
+    /// Closes a session and wakes every blocked peer with `reason`. A close is final for
+    /// the session's lifetime: a later [`Relay::open`] for the same session id returns the
+    /// recorded reason instead of a new lease, and the entry is dropped only when the
+    /// session expires.
     pub fn close_session(&self, session_id: &str, reason: RelayClose) {
         let session = {
             let sessions = self.sessions();
@@ -421,14 +431,10 @@ impl RelaySession {
         self.expires_at_ms.store(expires_at_ms, Ordering::SeqCst);
     }
 
-    /// True once the session must not accept new relay work. Only the snapshot is
-    /// consulted here so pruning stays cheap; [`Self::check_live`] is authoritative.
+    /// True once the entry may be dropped. Only expiry qualifies: a closed session keeps
+    /// its close reason and its spent byte budget until the session itself expires.
     fn is_stale(&self, now_ms: UnixMs) -> bool {
-        self.is_closed() || now_ms >= self.expires_at_ms.load(Ordering::SeqCst)
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.borrow().is_some()
+        now_ms >= self.expires_at_ms.load(Ordering::SeqCst)
     }
 
     fn check_open(&self) -> Result<(), RelayClose> {
@@ -495,7 +501,9 @@ impl RelaySession {
         let mut current = self.used_bytes.load(Ordering::SeqCst);
         loop {
             if current.saturating_add(length) > self.limits.max_session_bytes {
-                return Err(RelayClose::ByteBudgetExhausted);
+                // Spending the budget ends the relay: the reason is sticky, so a later
+                // lease request can never reset the allowance.
+                return Err(self.fail(RelayClose::ByteBudgetExhausted));
             }
             match self.used_bytes.compare_exchange(
                 current,
