@@ -6,6 +6,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod admin;
 pub mod auth;
 pub mod enrollment;
 pub mod relay;
@@ -53,11 +54,17 @@ impl AppState {
             admin_token,
             Arc::clone(&clock),
         )?);
+        let relay = Arc::new(Relay::new(
+            relay_endpoint.clone(),
+            relay_limits,
+            Arc::clone(&store),
+            Arc::clone(&clock),
+        ));
         Ok(Self {
             store,
             auth,
-            rendezvous: Arc::new(Rendezvous::new(relay_endpoint.clone())),
-            relay: Arc::new(Relay::new(relay_endpoint, relay_limits, Arc::clone(&clock))),
+            rendezvous: Arc::new(Rendezvous::new(relay_endpoint)),
+            relay,
             clock,
         })
     }
@@ -119,8 +126,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/enrollment-tokens", post(enrollment::issue_token))
+        .route(
+            "/api/enrollment-tokens/{token}/revoke",
+            post(admin::revoke_enrollment_token),
+        )
         .route("/api/devices/enroll", post(enrollment::enroll_device))
+        .route(
+            "/api/devices/{device_id}/revoke",
+            post(admin::revoke_device),
+        )
         .route("/api/sessions", post(rendezvous::create_session))
+        .route(
+            "/api/sessions/{session_id}/revoke",
+            post(admin::revoke_session),
+        )
         .route(
             "/api/sessions/{session_id}/candidates",
             get(rendezvous::session_candidates),

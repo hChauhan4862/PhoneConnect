@@ -391,3 +391,135 @@ async fn malformed_json_body_is_rejected() {
         response.1
     );
 }
+
+#[tokio::test]
+async fn admin_revocation_endpoints_require_the_admin_token() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let token = app.issue_token("user-a").await;
+
+    for (kind, id) in [
+        ("devices", device_id.as_str()),
+        ("sessions", session_id),
+        ("enrollment-tokens", token.as_str()),
+    ] {
+        let (status, body) = app.revoke(kind, id, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{kind}: {body}");
+        assert_eq!(body["error"], "missing_credentials");
+
+        let (status, body) = app.revoke(kind, id, Some("pcdev_not-the-admin")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{kind}: {body}");
+        assert_eq!(body["error"], "invalid_admin_token");
+    }
+
+    // A refused request revokes nothing.
+    let (status, body) = app.candidates(session_id, Some(&credential)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn admin_can_revoke_an_enrollment_token() {
+    let app = TestApp::new();
+    let token = app.issue_token("user-a").await;
+
+    let (status, body) = app
+        .revoke("enrollment-tokens", &token, Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revoked"], true);
+    let revoked_at = body["revoked_at"].as_i64().expect("revoked_at");
+    assert_eq!(revoked_at, app.now());
+
+    let (status, body) = app.enroll_raw(&token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "enrollment_token_revoked");
+
+    // Revocation is idempotent so an operator can retry safely, and the reported time
+    // stays the moment revocation took effect rather than the retry time.
+    app.clock.advance_ms(1_000);
+    let (status, body) = app
+        .revoke("enrollment-tokens", &token, Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revoked_at"].as_i64(), Some(revoked_at));
+}
+
+#[tokio::test]
+async fn admin_can_revoke_a_session() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let capability = session["capability"].as_str().expect("capability");
+
+    let (status, body) = app.revoke("sessions", session_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revoked"], true);
+    let revoked_at = body["revoked_at"].as_i64().expect("revoked_at");
+
+    for bearer in [capability, credential.as_str()] {
+        let (status, body) = app.candidates(session_id, Some(bearer)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"], "session_revoked");
+    }
+
+    app.clock.advance_ms(1_000);
+    let (status, body) = app.revoke("sessions", session_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "revoking the same session twice stays safe: {body}"
+    );
+    assert_eq!(
+        body["revoked_at"].as_i64(),
+        Some(revoked_at),
+        "a repeat revocation keeps the first revocation time"
+    );
+}
+
+#[tokio::test]
+async fn admin_can_revoke_a_device() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let capability = session["capability"].as_str().expect("capability");
+
+    let (status, body) = app.revoke("devices", &device_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revoked"], true);
+
+    let (status, body) = app.candidates(session_id, Some(&credential)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "device_revoked");
+
+    // The device's live sessions are revoked with it.
+    let (status, body) = app.candidates(session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "session_revoked");
+
+    let (status, body) = app.create_session_raw(&device_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "device_revoked");
+}
+
+#[tokio::test]
+async fn revoking_an_unknown_id_is_a_not_found() {
+    let app = TestApp::new();
+
+    for (kind, id, code) in [
+        ("devices", "dev_unknown", "device_unknown"),
+        ("sessions", "sess_unknown", "session_unknown"),
+        (
+            "enrollment-tokens",
+            "pcenr_unknown",
+            "enrollment_token_unknown",
+        ),
+    ] {
+        let (status, body) = app.revoke(kind, id, Some(ADMIN_TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{kind}: {body}");
+        assert_eq!(body["error"], code, "{kind}");
+    }
+}

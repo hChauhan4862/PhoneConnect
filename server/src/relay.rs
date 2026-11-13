@@ -5,12 +5,13 @@
 //! never queues more than [`RelayLimits`] allows. Every rejection is an explicit
 //! [`RelayClose`] so peers can tell backpressure from authorization failure.
 //!
-//! [`authorize_relay`] holds the expiry and revocation rules, and [`Relay::attach`] is the
-//! only way to obtain a peer handle, so later direct-path work can reuse both without
-//! weakening them.
+//! [`authorize_relay`] holds the expiry and revocation rules for opening a session,
+//! `RelaySession::check_live` applies the same rules to an attached session by re-reading
+//! the clock and store, and [`Relay::attach`] is the only way to obtain a peer handle, so
+//! later direct-path work can reuse them without weakening either.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ use tokio::time::Instant;
 
 use crate::AppState;
 use crate::auth::AuthError;
-use crate::store::{Clock, SessionRecord, UnixMs};
+use crate::store::{Clock, DeviceStore, SessionRecord, StoreError, UnixMs};
 
 /// Frames a relay direction may hold before it reports backpressure.
 pub const RELAY_MAX_QUEUED_FRAMES: usize = 32;
@@ -42,6 +43,10 @@ pub const RELAY_MAX_SESSION_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How long a peer may wait for the next frame before the session is closed.
 pub const RELAY_IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/// How often a peer blocked on receive re-reads the clock and store, so expiry and
+/// out-of-band revocation end an attached session without waiting for the next frame.
+pub const RELAY_LIVENESS_POLL_MS: u64 = 250;
 
 /// Per-session relay bounds. Nothing is unbounded: queue depth, queue bytes, total bytes,
 /// frame size, and idle time all have a ceiling.
@@ -97,10 +102,14 @@ pub enum RelayClose {
     SessionExpired,
     #[error("session was revoked")]
     SessionRevoked,
+    #[error("the device that owns the session was revoked: {device_id}")]
+    DeviceRevoked { device_id: String },
     #[error("peer closed its sending direction")]
     PeerClosed,
     #[error("malformed frame: {reason}")]
     MalformedFrame { reason: String },
+    #[error("frame carries {extra} bytes beyond the {declared}-byte envelope")]
+    TrailingBytes { declared: usize, extra: usize },
     #[error("oversized frame: {length} bytes exceeds the {limit}-byte limit")]
     OversizedFrame { length: usize, limit: usize },
     #[error("relay queue is full; the peer must drain before sending more")]
@@ -111,6 +120,8 @@ pub enum RelayClose {
     IdleTimeout,
     #[error("relay session was closed by the server")]
     SessionClosed,
+    #[error("authorization state is unavailable: {reason}")]
+    StoreUnavailable { reason: String },
 }
 
 /// Which end of the session a handle represents.
@@ -124,13 +135,18 @@ pub enum PeerRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RelayLease {
     pub session_id: String,
+    /// Transport contract, not a live route: this is the address peers are expected to
+    /// reach the relay through once the transport task binds it. Task 2 serves no route
+    /// at this value, so a lease is a statement of where relay traffic will go, and
+    /// nothing in this build may be probed there.
     pub endpoint: String,
     pub expires_at: UnixMs,
     pub limits: RelayLimits,
 }
 
-/// Authorizes a session for relay traffic. Expiry and revocation are checked here so every
-/// entry point shares one rule set.
+/// Authorizes a session for relay traffic at open time. Expiry and revocation are checked
+/// here so every entry point shares one rule set; an attached session is re-checked
+/// against the clock and store by the relay itself.
 pub fn authorize_relay(session: &SessionRecord, now_ms: UnixMs) -> Result<(), RelayClose> {
     if session.is_revoked() {
         return Err(RelayClose::SessionRevoked);
@@ -145,29 +161,48 @@ pub fn authorize_relay(session: &SessionRecord, now_ms: UnixMs) -> Result<(), Re
 pub struct Relay {
     endpoint: String,
     limits: RelayLimits,
+    store: Arc<dyn DeviceStore>,
     clock: Arc<dyn Clock>,
     sessions: Mutex<HashMap<String, Arc<RelaySession>>>,
 }
 
 impl Relay {
-    pub fn new(endpoint: impl Into<String>, limits: RelayLimits, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        limits: RelayLimits,
+        store: Arc<dyn DeviceStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             limits,
+            store,
             clock,
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Authorizes `session` and registers it for relay traffic. Expired and revoked
-    /// sessions are dropped here, so the session table stays bounded by live sessions.
+    /// Authorizes `session` and registers it for relay traffic. Expired, revoked, and
+    /// closed sessions are dropped here, so the session table stays bounded by live
+    /// sessions.
     pub fn open(&self, session: &SessionRecord, now_ms: UnixMs) -> Result<RelayLease, RelayClose> {
         authorize_relay(session, now_ms)?;
         let mut sessions = self.sessions();
-        sessions.retain(|_, relay| !relay.record.is_expired(now_ms) && !relay.record.is_revoked());
-        sessions
-            .entry(session.session_id.clone())
-            .or_insert_with(|| Arc::new(RelaySession::new(session.clone(), self.limits)));
+        sessions.retain(|_, relay| !relay.is_stale(now_ms));
+        match sessions.get(&session.session_id) {
+            Some(existing) => existing.refresh_expiry(session.expires_at_ms),
+            None => {
+                sessions.insert(
+                    session.session_id.clone(),
+                    Arc::new(RelaySession::new(
+                        session,
+                        self.limits,
+                        Arc::clone(&self.store),
+                        Arc::clone(&self.clock),
+                    )),
+                );
+            }
+        }
         Ok(RelayLease {
             session_id: session.session_id.clone(),
             endpoint: self.endpoint.clone(),
@@ -176,15 +211,14 @@ impl Relay {
         })
     }
 
-    /// Attaches one peer to an authorized session. Peers that are unknown, expired, or
-    /// revoked never receive a handle.
-    pub fn attach(&self, session_id: &str, role: PeerRole) -> Result<RelayPeer, RelayClose> {
+    /// Attaches one peer to an authorized session, re-reading the live record from the
+    /// store so a session revoked or expired after `open` never yields a handle.
+    pub async fn attach(&self, session_id: &str, role: PeerRole) -> Result<RelayPeer, RelayClose> {
         let session = {
             let sessions = self.sessions();
             Arc::clone(sessions.get(session_id).ok_or(RelayClose::UnknownSession)?)
         };
-        authorize_relay(&session.record, self.clock.now_ms())?;
-        session.check_open()?;
+        session.check_live().await?;
         Ok(RelayPeer { session, role })
     }
 
@@ -196,6 +230,20 @@ impl Relay {
         };
         if let Some(session) = session {
             session.close(reason);
+        }
+    }
+
+    /// Closes every relay session owned by `device_id`, so revoking a device ends its
+    /// open relays without waiting for the next frame or a liveness poll.
+    pub fn close_device(&self, device_id: &str, reason: RelayClose) {
+        let affected: Vec<Arc<RelaySession>> = self
+            .sessions()
+            .values()
+            .filter(|session| session.device_id == device_id)
+            .map(Arc::clone)
+            .collect();
+        for session in affected {
+            session.close(reason.clone());
         }
     }
 
@@ -216,7 +264,7 @@ impl std::fmt::Debug for RelayPeer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RelayPeer")
-            .field("session_id", &self.session.record.session_id)
+            .field("session_id", &self.session.session_id)
             .field("role", &self.role)
             .finish()
     }
@@ -225,16 +273,26 @@ impl std::fmt::Debug for RelayPeer {
 impl RelayPeer {
     /// Validates and enqueues an envelope for the other peer.
     pub async fn send_frame(&self, envelope: &Envelope) -> Result<(), RelayClose> {
+        self.session.check_live().await?;
         let frame = encode_frame(envelope, &self.session.frame_limits)
             .map_err(RelayClose::from_protocol)?;
         self.enqueue(frame)
     }
 
     /// Validates and enqueues an already framed envelope. The frame is forwarded byte for
-    /// byte after validation, so the relay never rewrites or interprets a payload.
+    /// byte after validation, so the relay never rewrites or interprets a payload. The
+    /// buffer must be exactly one frame: trailing bytes are refused rather than forwarded
+    /// past the declared length.
     pub async fn send_bytes(&self, frame: &[u8]) -> Result<(), RelayClose> {
-        self.session.check_open()?;
-        decode_frame(frame, &self.session.frame_limits).map_err(RelayClose::from_protocol)?;
+        self.session.check_live().await?;
+        let decoded =
+            decode_frame(frame, &self.session.frame_limits).map_err(RelayClose::from_protocol)?;
+        if frame.len() != decoded.consumed {
+            return Err(RelayClose::TrailingBytes {
+                declared: decoded.consumed,
+                extra: frame.len() - decoded.consumed,
+            });
+        }
         self.enqueue(frame.to_vec())
     }
 
@@ -248,7 +306,9 @@ impl RelayPeer {
         queued
     }
 
-    /// Waits for the next frame from the other peer within the idle timeout.
+    /// Waits for the next frame from the other peer within the idle timeout. While it
+    /// waits, the session's expiry and revocation state are re-read on a bounded interval,
+    /// so an attached relay stops forwarding when its authorization ends.
     pub async fn recv_bytes(&self) -> Result<Vec<u8>, RelayClose> {
         let deadline = Instant::now() + self.session.limits.idle_timeout();
         let mut closed = self.session.closed.subscribe();
@@ -256,7 +316,7 @@ impl RelayPeer {
             let readable = self.inbound().readable.notified();
             tokio::pin!(readable);
 
-            self.session.check_open()?;
+            self.session.check_live().await?;
             if let Some(frame) = self.inbound().try_pop() {
                 return Ok(frame);
             }
@@ -271,6 +331,7 @@ impl RelayPeer {
                         return Err(RelayClose::SessionClosed);
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(RELAY_LIVENESS_POLL_MS)) => {}
                 _ = tokio::time::sleep_until(deadline) => return Err(RelayClose::IdleTimeout),
             }
         }
@@ -320,9 +381,13 @@ impl RelayClose {
 }
 
 struct RelaySession {
-    record: SessionRecord,
+    session_id: String,
+    device_id: String,
+    expires_at_ms: AtomicI64,
     limits: RelayLimits,
     frame_limits: FrameLimits,
+    store: Arc<dyn DeviceStore>,
+    clock: Arc<dyn Clock>,
     to_device: Arc<Direction>,
     to_client: Arc<Direction>,
     used_bytes: AtomicU64,
@@ -330,17 +395,40 @@ struct RelaySession {
 }
 
 impl RelaySession {
-    fn new(record: SessionRecord, limits: RelayLimits) -> Self {
+    fn new(
+        record: &SessionRecord,
+        limits: RelayLimits,
+        store: Arc<dyn DeviceStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let (closed, _) = watch::channel(None);
         Self {
-            record,
+            session_id: record.session_id.clone(),
+            device_id: record.device_id.clone(),
+            expires_at_ms: AtomicI64::new(record.expires_at_ms),
             limits,
             frame_limits: limits.frame_limits(),
+            store,
+            clock,
             to_device: Arc::new(Direction::new(limits)),
             to_client: Arc::new(Direction::new(limits)),
             used_bytes: AtomicU64::new(0),
             closed,
         }
+    }
+
+    fn refresh_expiry(&self, expires_at_ms: UnixMs) {
+        self.expires_at_ms.store(expires_at_ms, Ordering::SeqCst);
+    }
+
+    /// True once the session must not accept new relay work. Only the snapshot is
+    /// consulted here so pruning stays cheap; [`Self::check_live`] is authoritative.
+    fn is_stale(&self, now_ms: UnixMs) -> bool {
+        self.is_closed() || now_ms >= self.expires_at_ms.load(Ordering::SeqCst)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.borrow().is_some()
     }
 
     fn check_open(&self) -> Result<(), RelayClose> {
@@ -350,10 +438,56 @@ impl RelaySession {
         }
     }
 
-    fn close(&self, reason: RelayClose) {
-        if self.closed.borrow().is_none() {
-            let _ = self.closed.send(Some(reason));
+    /// Re-reads the clock and the store. An attached session stops forwarding as soon as
+    /// its expiry passes or its session, or owning device, is revoked. Any refusal closes
+    /// the session so every attached peer learns why.
+    async fn check_live(&self) -> Result<(), RelayClose> {
+        self.check_open()?;
+        let now = self.clock.now_ms();
+        if now >= self.expires_at_ms.load(Ordering::SeqCst) {
+            return Err(self.fail(RelayClose::SessionExpired));
         }
+        let live = match self.store.relay_authorization(&self.session_id).await {
+            Ok(live) => live,
+            Err(StoreError::UnknownSession { .. }) => {
+                return Err(self.fail(RelayClose::UnknownSession));
+            }
+            Err(error) => {
+                return Err(self.fail(RelayClose::StoreUnavailable {
+                    reason: error.to_string(),
+                }));
+            }
+        };
+        self.refresh_expiry(live.session.expires_at_ms);
+        if live.device_revoked {
+            return Err(self.fail(RelayClose::DeviceRevoked {
+                device_id: live.session.device_id,
+            }));
+        }
+        if live.session.is_revoked() {
+            return Err(self.fail(RelayClose::SessionRevoked));
+        }
+        if live.session.is_expired(now) {
+            return Err(self.fail(RelayClose::SessionExpired));
+        }
+        Ok(())
+    }
+
+    fn fail(&self, reason: RelayClose) -> RelayClose {
+        self.close(reason.clone());
+        reason
+    }
+
+    fn close(&self, reason: RelayClose) {
+        // `send_if_modified` records the first reason even when no peer is subscribed yet
+        // (`send` would silently drop it) and never overwrites it afterwards.
+        self.closed.send_if_modified(|current| match current {
+            Some(_) => false,
+            None => {
+                *current = Some(reason.clone());
+                true
+            }
+        });
     }
 
     fn reserve_bytes(&self, length: usize) -> Result<(), RelayClose> {

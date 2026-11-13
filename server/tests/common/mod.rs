@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 pub const ADMIN_TOKEN: &str = "test-admin-token";
+/// The relay address advertised in leases and candidates. It is a transport contract, not
+/// a route this task serves: Task 3 binds the transport at this value.
 pub const RELAY_ENDPOINT: &str = "https://relay.test/api/relay";
 pub const NOW_MS: i64 = 1_760_000_000_000;
 
@@ -170,6 +172,18 @@ impl TestApp {
         self.request(
             Method::POST,
             &format!("/api/sessions/{session_id}/relay"),
+            bearer,
+            None,
+        )
+        .await
+    }
+
+    /// `POST /api/{kind}/{id}/revoke`, where `kind` is `devices`, `sessions`, or
+    /// `enrollment-tokens`.
+    pub async fn revoke(&self, kind: &str, id: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/{kind}/{id}/revoke"),
             bearer,
             None,
         )

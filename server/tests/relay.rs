@@ -63,7 +63,11 @@ async fn relay_upgrade_requires_an_authorized_session() {
 
     // An unauthorized session never becomes attachable.
     assert_eq!(
-        app.state.relay.attach(session_id, PeerRole::Device).err(),
+        app.state
+            .relay
+            .attach(session_id, PeerRole::Device)
+            .await
+            .err(),
         Some(RelayClose::UnknownSession)
     );
 }
@@ -90,6 +94,7 @@ async fn relay_upgrade_accepts_only_the_session_peers() {
         app.state
             .relay
             .attach(other_session_id, PeerRole::Device)
+            .await
             .err(),
         Some(RelayClose::UnknownSession)
     );
@@ -106,6 +111,8 @@ async fn relay_upgrade_describes_bounded_limits() {
     let (status, body) = app.relay_upgrade(session_id, Some(capability)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["session_id"], session_id);
+    // The lease advertises the transport contract only; Task 3 binds the actual route,
+    // so nothing in this task serves `RELAY_ENDPOINT` yet.
     assert_eq!(body["endpoint"], common::RELAY_ENDPOINT);
     assert_eq!(
         body["expires_at"].as_i64(),
@@ -163,11 +170,13 @@ async fn relay_forwards_opaque_frames_between_authenticated_peers() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     let frame = envelope(&session_id, PAYLOAD_MARKER);
@@ -199,11 +208,13 @@ async fn relay_rejects_malformed_frames_without_forwarding_them() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     // Declared 3-byte body that is not a valid envelope.
@@ -242,11 +253,13 @@ async fn relay_rejects_oversized_frames_at_the_length_prefix() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     let limit = FrameLimits::default().max_limit() as usize;
@@ -281,11 +294,13 @@ async fn relay_applies_backpressure_instead_of_buffering() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     device
@@ -321,11 +336,13 @@ async fn relay_half_close_closes_one_direction_only() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     device
@@ -362,11 +379,13 @@ async fn relay_idle_timeout_is_bounded() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     let started = Instant::now();
@@ -389,11 +408,13 @@ async fn relay_enforces_a_session_byte_budget() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let _client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     let small = envelope(&session_id, &[0u8; 16]);
@@ -419,11 +440,13 @@ async fn relay_close_interrupts_blocked_peers_immediately() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
 
     let waiting = tokio::spawn(async move { client.recv_frame().await });
@@ -447,11 +470,13 @@ async fn relay_persists_no_stream_payloads() {
         .state
         .relay
         .attach(&session_id, PeerRole::Device)
+        .await
         .expect("device attaches");
     let client = app
         .state
         .relay
         .attach(&session_id, PeerRole::Client)
+        .await
         .expect("client attaches");
     device
         .send_frame(&envelope(&session_id, PAYLOAD_MARKER))
@@ -533,8 +558,398 @@ async fn relay_prunes_expired_sessions_when_a_new_session_opens() {
         app.state
             .relay
             .attach(&expired_session, PeerRole::Device)
+            .await
             .err(),
         Some(RelayClose::UnknownSession),
         "expired relay state is dropped rather than retained forever"
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_stops_forwarding_when_the_session_expires() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // Forwarding works while the session is live.
+    device
+        .send_frame(&envelope(&session_id, b"live"))
+        .await
+        .expect("live frame accepted");
+    assert_eq!(
+        client
+            .recv_frame()
+            .await
+            .expect("live frame received")
+            .payload,
+        b"live"
+    );
+
+    // A receiver already blocked must be woken by expiry, not only by the next sender.
+    let waiting = tokio::spawn(async move { client.recv_bytes().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    app.clock.advance_ms(300_000);
+    let reason = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("blocked peer wakes when the session expires")
+        .expect("task completed");
+    assert_eq!(reason, Err(RelayClose::SessionExpired));
+
+    match device.send_frame(&envelope(&session_id, b"late")).await {
+        Err(RelayClose::SessionExpired) => {}
+        other => panic!("expected SessionExpired, got {other:?}"),
+    }
+    assert_eq!(
+        app.state
+            .relay
+            .attach(&session_id, PeerRole::Device)
+            .await
+            .err(),
+        Some(RelayClose::SessionExpired),
+        "an expired session is no longer attachable"
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_stops_forwarding_when_the_session_is_revoked() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let waiting = tokio::spawn(async move { client.recv_bytes().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let revoked_at = Instant::now();
+    let (status, body) = app
+        .revoke("sessions", &session_id, Some(common::ADMIN_TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("blocked peer wakes on revocation")
+        .expect("task completed");
+    assert!(
+        revoked_at.elapsed() < Duration::from_millis(200),
+        "revocation closes the relay now, not at the next liveness poll: {:?}",
+        revoked_at.elapsed()
+    );
+    assert_eq!(reason, Err(RelayClose::SessionRevoked));
+    // A synchronous check proves the handle was closed by the revocation request itself,
+    // rather than discovered by a later store lookup.
+    assert_eq!(
+        device.close_send().err(),
+        Some(RelayClose::SessionRevoked),
+        "the relay is already closed when revocation returns"
+    );
+    assert_eq!(
+        device
+            .send_frame(&envelope(&session_id, b"after-revoke"))
+            .await
+            .err(),
+        Some(RelayClose::SessionRevoked),
+        "a revoked session forwards nothing"
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_stops_when_the_owning_device_is_revoked() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    let (status, body) = app.relay_upgrade(&session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let waiting = tokio::spawn(async move { client.recv_bytes().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let revoked_at = Instant::now();
+    let (status, body) = app
+        .revoke("devices", &device_id, Some(common::ADMIN_TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("blocked peer wakes when the device is revoked")
+        .expect("task completed");
+    assert!(
+        revoked_at.elapsed() < Duration::from_millis(200),
+        "device revocation closes its relays now, not at the next poll: {:?}",
+        revoked_at.elapsed()
+    );
+    // Synchronous proof that the revocation request itself closed the handle.
+    assert!(
+        matches!(device.close_send(), Err(RelayClose::DeviceRevoked { .. })),
+        "the relay is already closed when device revocation returns"
+    );
+    assert!(
+        matches!(reason, Err(RelayClose::DeviceRevoked { .. })),
+        "expected DeviceRevoked, got {reason:?}"
+    );
+    let send = device
+        .send_frame(&envelope(&session_id, b"after-device-revoke"))
+        .await;
+    assert!(
+        matches!(send, Err(RelayClose::DeviceRevoked { .. })),
+        "expected DeviceRevoked, got {send:?}"
+    );
+}
+
+#[tokio::test]
+async fn attach_re_reads_the_live_session_record() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+
+    // The relay registered a snapshot at open; revocation after that must still be seen.
+    app.store
+        .revoke_session(&session_id, app.now())
+        .await
+        .expect("session revocation persists");
+
+    assert_eq!(
+        app.state
+            .relay
+            .attach(&session_id, PeerRole::Device)
+            .await
+            .err(),
+        Some(RelayClose::SessionRevoked),
+        "attach must consult the store, not the snapshot taken at open"
+    );
+}
+
+#[tokio::test]
+async fn relay_rejects_frames_with_trailing_bytes() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let mut frame = encode_frame(
+        &envelope(&session_id, b"declared-prefix"),
+        &FrameLimits::default(),
+    )
+    .expect("frame encodes");
+    let frame_len = frame.len();
+    let trailing = b"bytes the prefix does not describe";
+    frame.extend_from_slice(trailing);
+
+    match device.send_bytes(&frame).await {
+        Err(RelayClose::TrailingBytes { declared, extra }) => {
+            assert_eq!(declared, frame_len, "the declared frame length is reported");
+            assert_eq!(extra, trailing.len(), "the trailing bytes are counted");
+        }
+        other => panic!("expected TrailingBytes, got {other:?}"),
+    }
+
+    let nothing = tokio::time::timeout(Duration::from_millis(50), client.recv_bytes()).await;
+    assert!(
+        nothing.is_err(),
+        "a frame with trailing bytes is never forwarded"
+    );
+}
+
+#[tokio::test]
+async fn send_after_close_reports_the_close_reason() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    app.state
+        .relay
+        .close_session(&session_id, RelayClose::SessionClosed);
+
+    assert_eq!(
+        device
+            .send_frame(&envelope(&session_id, b"nobody-listens"))
+            .await
+            .err(),
+        Some(RelayClose::SessionClosed),
+        "a closed session never reports a successful send"
+    );
+    let frame = encode_frame(
+        &envelope(&session_id, b"nobody-listens"),
+        &FrameLimits::default(),
+    )
+    .expect("frame encodes");
+    assert_eq!(
+        device.send_bytes(&frame).await.err(),
+        Some(RelayClose::SessionClosed)
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_notices_out_of_band_session_revocation() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // Revocation that never goes through this process's admin surface, as another
+    // server instance or an operator tool would do it, must still stop the relay.
+    let waiting = tokio::spawn(async move { client.recv_bytes().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    app.store
+        .revoke_session(&session_id, app.now())
+        .await
+        .expect("session revocation persists");
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("blocked peer wakes on out-of-band revocation")
+        .expect("task completed");
+    assert_eq!(reason, Err(RelayClose::SessionRevoked));
+    assert_eq!(
+        device
+            .send_frame(&envelope(&session_id, b"after-revoke"))
+            .await
+            .err(),
+        Some(RelayClose::SessionRevoked)
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_notices_out_of_band_device_revocation() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    let (status, body) = app.relay_upgrade(&session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let waiting = tokio::spawn(async move { client.recv_bytes().await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    app.store
+        .revoke_device(&device_id, app.now())
+        .await
+        .expect("device revocation persists");
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("blocked peer wakes on out-of-band device revocation")
+        .expect("task completed");
+    assert!(
+        matches!(reason, Err(RelayClose::DeviceRevoked { .. })),
+        "expected DeviceRevoked, got {reason:?}"
+    );
+    let send = device
+        .send_frame(&envelope(&session_id, b"after-device-revoke"))
+        .await;
+    assert!(
+        matches!(send, Err(RelayClose::DeviceRevoked { .. })),
+        "expected DeviceRevoked, got {send:?}"
+    );
+    drop(credential);
+}
+
+#[tokio::test]
+async fn relay_forwards_a_valid_frame_byte_for_byte() {
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let frame = encode_frame(
+        &envelope(&session_id, b"exact-length"),
+        &FrameLimits::default(),
+    )
+    .expect("frame encodes");
+    device
+        .send_bytes(&frame)
+        .await
+        .expect("an exact-length frame is accepted");
+    assert_eq!(
+        client.recv_bytes().await.expect("frame received"),
+        frame,
+        "the relay forwards validated bytes unchanged"
     );
 }

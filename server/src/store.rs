@@ -85,6 +85,14 @@ impl DeviceRecord {
     }
 }
 
+/// Live authorization state for one relay session: the current session record and whether
+/// its device is revoked. One lookup, so the relay can re-check every frame cheaply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAuthorization {
+    pub session: SessionRecord,
+    pub device_revoked: bool,
+}
+
 /// A device waiting to be enrolled by a consumed token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDevice {
@@ -152,11 +160,14 @@ pub trait DeviceStore: Send + Sync {
         device: NewDevice,
     ) -> Result<DeviceRecord, StoreError>;
 
+    /// Revokes `token_hash` and returns the time revocation took effect. Idempotent:
+    /// revoking twice succeeds and keeps the first revocation time.
+    /// `UnknownEnrollmentToken` means no such token exists.
     async fn revoke_enrollment_token(
         &self,
         token_hash: &str,
         now_ms: UnixMs,
-    ) -> Result<(), StoreError>;
+    ) -> Result<UnixMs, StoreError>;
 
     async fn device(&self, device_id: &str) -> Result<DeviceRecord, StoreError>;
 
@@ -166,10 +177,18 @@ pub trait DeviceStore: Send + Sync {
         credential_hash: &str,
     ) -> Result<Option<DeviceRecord>, StoreError>;
 
-    /// Revokes the device and every live session it owns in one transaction.
-    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<(), StoreError>;
+    /// Revokes the device and every live session it owns in one transaction, returning
+    /// the time device revocation took effect. Idempotent: revoking twice succeeds and
+    /// keeps the first revocation time.
+    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
 
     async fn insert_session(&self, session: SessionRecord) -> Result<(), StoreError>;
+
+    /// Current authorization state for a relay session, read from the store rather than
+    /// from any snapshot the caller holds. `UnknownSession` means the session no longer
+    /// exists and must not be relayed.
+    async fn relay_authorization(&self, session_id: &str)
+    -> Result<RelayAuthorization, StoreError>;
 
     async fn session(&self, session_id: &str) -> Result<SessionRecord, StoreError>;
 
@@ -179,7 +198,10 @@ pub trait DeviceStore: Send + Sync {
         capability_hash: &str,
     ) -> Result<Option<SessionRecord>, StoreError>;
 
-    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<(), StoreError>;
+    /// Revokes one session and returns the time revocation took effect. Idempotent:
+    /// revoking twice succeeds and keeps the first revocation time. `UnknownSession`
+    /// means no such session exists.
+    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
 }
 
 const SCHEMA: &str = "
@@ -358,19 +380,29 @@ impl DeviceStore for SqliteStore {
         &self,
         token_hash: &str,
         now_ms: UnixMs,
-    ) -> Result<(), StoreError> {
+    ) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
-            let updated = connection
+            let revoked = connection
+                .query_row(
+                    "SELECT revoked_at_ms FROM enrollment_tokens WHERE token_hash = ?1",
+                    params![token_hash],
+                    |row| row.get::<_, Option<UnixMs>>(0),
+                )
+                .optional()
+                .map_err(backend_error)?;
+            let Some(revoked_at_ms) = revoked else {
+                return Err(StoreError::UnknownEnrollmentToken);
+            };
+            if let Some(revoked_at_ms) = revoked_at_ms {
+                return Ok(revoked_at_ms);
+            }
+            connection
                 .execute(
-                    "UPDATE enrollment_tokens SET revoked_at_ms = ?1
-                     WHERE token_hash = ?2 AND revoked_at_ms IS NULL",
+                    "UPDATE enrollment_tokens SET revoked_at_ms = ?1 WHERE token_hash = ?2",
                     params![now_ms, token_hash],
                 )
                 .map_err(backend_error)?;
-            if updated == 0 {
-                return Err(StoreError::UnknownEnrollmentToken);
-            }
-            Ok(())
+            Ok(now_ms)
         })
     }
 
@@ -408,21 +440,32 @@ impl DeviceStore for SqliteStore {
         })
     }
 
-    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<(), StoreError> {
+    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend_error)?;
-            let updated = transaction
-                .execute(
-                    "UPDATE devices SET revoked_at_ms = ?1
-                     WHERE device_id = ?2 AND revoked_at_ms IS NULL",
-                    params![now_ms, device_id],
+            let revoked = transaction
+                .query_row(
+                    "SELECT revoked_at_ms FROM devices WHERE device_id = ?1",
+                    params![device_id],
+                    |row| row.get::<_, Option<UnixMs>>(0),
                 )
+                .optional()
                 .map_err(backend_error)?;
-            if updated == 0 {
+            let Some(revoked_at_ms) = revoked else {
                 return Err(StoreError::UnknownDevice {
                     device_id: device_id.to_owned(),
                 });
+            };
+            let effective_ms = revoked_at_ms.unwrap_or(now_ms);
+            if revoked_at_ms.is_none() {
+                transaction
+                    .execute(
+                        "UPDATE devices SET revoked_at_ms = ?1 WHERE device_id = ?2",
+                        params![effective_ms, device_id],
+                    )
+                    .map_err(backend_error)?;
             }
+            // Cascade even on a repeat revocation, so no live session outlives its device.
             transaction
                 .execute(
                     "UPDATE sessions SET revoked_at_ms = ?1
@@ -431,7 +474,7 @@ impl DeviceStore for SqliteStore {
                 )
                 .map_err(backend_error)?;
             transaction.commit().map_err(backend_error)?;
-            Ok(())
+            Ok(effective_ms)
         })
     }
 
@@ -453,6 +496,42 @@ impl DeviceStore for SqliteStore {
                 )
                 .map_err(backend_error)?;
             Ok(())
+        })
+    }
+
+    async fn relay_authorization(
+        &self,
+        session_id: &str,
+    ) -> Result<RelayAuthorization, StoreError> {
+        let found = self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT s.session_id, s.device_id, s.owner_id, s.capability_hash,
+                            s.created_at_ms, s.expires_at_ms, s.revoked_at_ms,
+                            d.revoked_at_ms
+                     FROM sessions s JOIN devices d ON d.device_id = s.device_id
+                     WHERE s.session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok(RelayAuthorization {
+                            session: SessionRecord {
+                                session_id: row.get(0)?,
+                                device_id: row.get(1)?,
+                                owner_id: row.get(2)?,
+                                capability_hash: row.get(3)?,
+                                created_at_ms: row.get(4)?,
+                                expires_at_ms: row.get(5)?,
+                                revoked_at_ms: row.get(6)?,
+                            },
+                            device_revoked: row.get::<_, Option<UnixMs>>(7)?.is_some(),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(backend_error)
+        })?;
+        found.ok_or_else(|| StoreError::UnknownSession {
+            session_id: session_id.to_owned(),
         })
     }
 
@@ -492,21 +571,31 @@ impl DeviceStore for SqliteStore {
         })
     }
 
-    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<(), StoreError> {
+    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
-            let updated = connection
-                .execute(
-                    "UPDATE sessions SET revoked_at_ms = ?1
-                     WHERE session_id = ?2 AND revoked_at_ms IS NULL",
-                    params![now_ms, session_id],
+            let revoked = connection
+                .query_row(
+                    "SELECT revoked_at_ms FROM sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, Option<UnixMs>>(0),
                 )
+                .optional()
                 .map_err(backend_error)?;
-            if updated == 0 {
+            let Some(revoked_at_ms) = revoked else {
                 return Err(StoreError::UnknownSession {
                     session_id: session_id.to_owned(),
                 });
+            };
+            if let Some(revoked_at_ms) = revoked_at_ms {
+                return Ok(revoked_at_ms);
             }
-            Ok(())
+            connection
+                .execute(
+                    "UPDATE sessions SET revoked_at_ms = ?1 WHERE session_id = ?2",
+                    params![now_ms, session_id],
+                )
+                .map_err(backend_error)?;
+            Ok(now_ms)
         })
     }
 }
