@@ -1,0 +1,12 @@
+target/
+node_modules/
+.gradle/
+build/
+dist/
+.env
+.DS_Store
+*.apk
+*.keystore
+.idea/
+.vscode/
+.superpowers/
