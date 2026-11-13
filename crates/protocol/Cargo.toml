@@ -1,0 +1,18 @@
+[package]
+name = "phoneconnect-protocol"
+description = "PhoneConnect wire protocol: protobuf envelopes and the length-delimited frame codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "phoneconnect"
+path = "src/lib.rs"
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

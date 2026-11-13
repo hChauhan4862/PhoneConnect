@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package phoneconnect.v1;
+
+// Logical stream a PhoneConnect envelope belongs to. Numbers are never reused: a
+// replacement stream gets a new number so older peers reject what they cannot classify.
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  // Control RPC: commands, acknowledgements, errors, keepalive.
+  STREAM_KIND_CONTROL = 1;
+  // Device telemetry and lifecycle events.
+  STREAM_KIND_EVENTS = 2;
+  // File transfer chunks.
+  STREAM_KIND_FILE = 3;
+  // Display, audio, and camera media chunks.
+  STREAM_KIND_MEDIA = 4;
+  // Opaque proxy bytes for native localhost endpoints.
+  STREAM_KIND_PROXY = 5;
+}
+
+// Versioned frame carried by every PhoneConnect stream. Each frame is sent with a
+// four-byte big-endian length prefix that counts the encoded Envelope only.
+//
+// The relay forwards envelopes without interpreting `payload`; only the addressed
+// endpoints decode it after the session is authenticated.
+message Envelope {
+  // Wire version understood by the sender. Receivers reject versions they do not speak.
+  uint32 protocol_version = 1;
+  StreamKind stream_kind = 2;
+  // Correlates a request with its response or error. Empty when no response is expected.
+  string request_id = 3;
+  // Enrolled device the frame is addressed to or originated from.
+  string device_id = 4;
+  // Authorized session capability this frame is scoped to.
+  string session_id = 5;
+  // Monotonic per-stream counter; it never wraps. Exhaustion ends the stream.
+  uint32 sequence = 6;
+  // Absolute deadline in Unix milliseconds. Zero means "no deadline".
+  int64 deadline_unix_ms = 7;
+  // Stream-kind-specific bytes, opaque to relays.
+  bytes payload = 8;
+}

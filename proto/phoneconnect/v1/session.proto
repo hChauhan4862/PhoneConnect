@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package phoneconnect.v1;
+
+// Lifecycle of an authorized device session. Revocation is terminal.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  // Created and awaiting the device's authenticated control connection.
+  SESSION_STATE_PENDING = 1;
+  SESSION_STATE_ACTIVE = 2;
+  SESSION_STATE_CLOSED = 3;
+  SESSION_STATE_REVOKED = 4;
+}
+
+// Short-lived description of a device session handed to both peers during rendezvous.
+message SessionDescriptor {
+  string session_id = 1;
+  string device_id = 2;
+  uint32 protocol_version = 3;
+  SessionState state = 4;
+  int64 issued_unix_ms = 5;
+  // Session expiry in Unix milliseconds; expired sessions are rejected, not refreshed.
+  int64 expires_unix_ms = 6;
+  // Exactly the capabilities the server authorized for this session.
+  repeated string capabilities = 7;
+}

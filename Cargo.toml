@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/protocol"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+prost = "0.14.6"
+prost-build = "0.14.6"
+thiserror = "2.0.21"
