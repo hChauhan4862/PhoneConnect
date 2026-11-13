@@ -24,6 +24,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
+use phoneconnect::SealedHeader;
 use phoneconnect::v1::{
     Envelope, FrameLimits, STREAM_FRAME_LIMIT, StreamKind, decode_frame, encode_frame,
 };
@@ -121,6 +122,11 @@ pub enum RelayClose {
     LeaseRevoked { lease_id: String },
     #[error("session {session_id} is read-only and may not send control frames")]
     ControlNotAuthorized { session_id: String },
+    #[error("routing frame is labelled {outer:?} but its sealed header declares {sealed:?}")]
+    StreamKindMismatch {
+        outer: StreamKind,
+        sealed: StreamKind,
+    },
     #[error("peer closed its sending direction")]
     PeerClosed,
     #[error("malformed frame: {reason}")]
@@ -353,7 +359,7 @@ impl RelayPeer {
     /// Validates and enqueues an envelope for the other peer.
     pub async fn send_frame(&self, envelope: &Envelope) -> Result<(), RelayClose> {
         self.session.check_live().await?;
-        self.refuse_control_if_read_only(envelope)?;
+        self.check_frame(envelope)?;
         let frame = encode_frame(envelope, &self.session.frame_limits)
             .map_err(RelayClose::from_protocol)?;
         self.enqueue(frame)
@@ -373,16 +379,44 @@ impl RelayPeer {
                 extra: frame.len() - decoded.consumed,
             });
         }
-        self.refuse_control_if_read_only(&decoded.envelope)?;
+        self.check_frame(&decoded.envelope)?;
         self.enqueue(frame.to_vec())
     }
 
-    /// A read-only session's client peer may not send control frames. The refusal is one
-    /// frame, not the stream: a viewer that keeps receiving telemetry stays connected.
-    fn refuse_control_if_read_only(&self, envelope: &Envelope) -> Result<(), RelayClose> {
+    /// Pins the three facts the relay can check without decrypting anything: the payload is a
+    /// sealed frame, it fits the limit its sealed header declares, and the outer routing label
+    /// agrees with that header.
+    ///
+    /// The sealed header is authenticated as associated data, so a header changed in flight
+    /// fails the receiver's tag; what this closes is a sender that *consistently* lies, which
+    /// is what a read-only client would do to get a control frame past the relay.
+    fn check_frame(&self, envelope: &Envelope) -> Result<(), RelayClose> {
+        let sealed = SealedHeader::stream_kind(&envelope.payload).ok_or_else(|| {
+            RelayClose::MalformedFrame {
+                reason: "relay payload is not a sealed frame".to_owned(),
+            }
+        })?;
+        let outer =
+            StreamKind::try_from(envelope.stream_kind).map_err(|_| RelayClose::MalformedFrame {
+                reason: "routing frame has an unknown stream kind".to_owned(),
+            })?;
+        // Bound the payload by the kind the sealed header declares, so a larger outer label
+        // cannot buy a bigger cap for a control frame.
+        let limit = self.session.frame_limits.limit_for(sealed) as usize;
+        if envelope.payload.len() > limit {
+            return Err(RelayClose::OversizedFrame {
+                length: envelope.payload.len(),
+                limit,
+            });
+        }
+        if outer != sealed {
+            return Err(RelayClose::StreamKindMismatch { outer, sealed });
+        }
+        // A read-only session's client peer may not send control frames. The refusal is one
+        // frame, not the stream: a viewer that keeps receiving telemetry stays connected.
         if self.role == PeerRole::Client
             && !self.session.allows_control()
-            && envelope.stream_kind == i32::from(StreamKind::Control)
+            && sealed == StreamKind::Control
         {
             self.session.control_refusals.fetch_add(1, Ordering::SeqCst);
             return Err(RelayClose::ControlNotAuthorized {
@@ -801,6 +835,7 @@ fn close_code(reason: &RelayClose) -> &'static str {
         RelayClose::DeviceRevoked { .. } => "device_revoked",
         RelayClose::LeaseRevoked { .. } => "lease_revoked",
         RelayClose::ControlNotAuthorized { .. } => "control_not_authorized",
+        RelayClose::StreamKindMismatch { .. } => "stream_kind_mismatch",
         RelayClose::PeerClosed => "peer_closed",
         RelayClose::MalformedFrame { .. } => "malformed_frame",
         RelayClose::TrailingBytes { .. } => "trailing_bytes",

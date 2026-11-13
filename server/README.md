@@ -49,6 +49,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/lease` | admin | The owner grants control while the device is free; body is `{actor_id, expires_in_seconds?}`. |
 | `POST` | `/api/devices/{id}/lease/handoff` | admin | Explicit transfer of control; body is `{actor_id, to_user_id, expires_in_seconds?}`. Returns the new lease and the replaced one's revocation event. |
 | `POST` | `/api/leases/{id}/revoke` | admin | Immediate revocation; body is `{actor_id}`. Returns the revocation event, including the stream capabilities it invalidated. Idempotent. |
+| `GET` | `/api/devices/{id}/sessions/next` | device credential | The newest live session for this device, with a device ticket and a `control` flag; `204` when there is none. |
 | `POST` | `/api/devices/{id}/telemetry` | device credential matching `{id}` | One bounded telemetry report; the response is the bounded aggregate. |
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
@@ -190,7 +191,9 @@ the lease is a secondary viewer: status and telemetry read normally, and every c
 admission is refused `403 lease_read_only` instead of quietly succeeding.
 
 A control session (`POST /api/sessions` with `control: true` and a `user_id`) is authorized
-by the lease, linked to it, and never outlives it. Revoking a lease or handing it off
+by the lease, linked to it, and never outlives it. The device learns the flag from
+`/sessions/next`, so it refuses a control frame on a read-only session even if the frame
+reaches it. Revoking a lease or handing it off
 revokes those sessions in the store *and* closes their relay transports with the
 `lease_revoked` close reason **in the same request**, so an attached peer learns immediately
 rather than at the next liveness poll. Revocation returns the event naming every invalidated
@@ -204,6 +207,16 @@ dropped and the socket stays open (the transport has no per-frame error), and th
 counts the refusal in the status surface's `control_refusals`, which the UI shows. A control
 session's frames are accepted, and revocation ends the stream before the next frame can be
 sent.
+
+The relay decides all of that from the **sealed frame's own header**, never from the routing
+label the sender chooses. A relay payload must carry a readable sealed header
+(`SealedHeader::stream_kind`), the payload must fit the limit that header declares (so a
+larger routing label cannot buy a bigger cap for a control frame), and the routing label must
+equal the header's kind — otherwise the frame is refused `stream_kind_mismatch`. A receiver
+pins the same equality between the header and the envelope it decrypts, so a key holder that
+labels a control envelope as events is refused at the relay *and* at the peer. The device also
+learns whether its session is a control session from `/sessions/next` and refuses an inbound
+control frame locally when it is not.
 
 Leases are **not yet an authorization boundary in the security sense**: with no local password
 login or MFA, the admin-token holder asserts `actor_id`/`user_id` in the request. The lease

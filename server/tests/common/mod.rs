@@ -353,6 +353,21 @@ impl TestApp {
         .await
     }
 
+    /// `GET /api/devices/{id}/sessions/next` as the device itself.
+    pub async fn device_session(
+        &self,
+        device_id: &str,
+        device_credential: &str,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/api/devices/{device_id}/sessions/next"),
+            Some(device_credential),
+            None,
+        )
+        .await
+    }
+
     /// `POST /api/devices/{id}/telemetry` as the device itself.
     pub async fn ingest_telemetry(
         &self,

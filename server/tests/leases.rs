@@ -266,7 +266,7 @@ async fn a_expired_lease_grants_nothing_and_can_be_replaced() {
 #[tokio::test]
 async fn a_control_session_never_outlives_its_lease() {
     let app = TestApp::new();
-    let (device_id, _credential) = enrolled(&app).await;
+    let (device_id, credential) = enrolled(&app).await;
     let (status, granted) = app.acquire_lease(&device_id, "owner-1", 60).await;
     assert_eq!(status, StatusCode::CREATED, "{granted}");
     let lease_expires_at = granted["expires_at_ms"].as_i64().expect("expiry");
@@ -292,6 +292,15 @@ async fn a_control_session_never_outlives_its_lease() {
             .as_deref(),
         Some(lease_id(&granted).as_str()),
         "the session remembers which lease authorized it"
+    );
+
+    // The device learns from discovery that this session may carry control frames.
+    let (status, body) = app.device_session(&device_id, &credential).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["control"],
+        Value::from(true),
+        "the device must know the session it joins is a control session: {body}"
     );
 }
 

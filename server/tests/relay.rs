@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use common::TestApp;
+use phoneconnect::SealedHeader;
 use phoneconnect::v1::{
     DeviceId, Envelope, FrameLimits, RequestId, SessionId, StreamKind, encode_frame,
 };
@@ -23,8 +24,22 @@ fn envelope_of_kind(stream_kind: StreamKind, session_id: &str, payload: &[u8]) -
     let session = SessionId::new(session_id).expect("session id");
     let request = RequestId::new("req_1").expect("request id");
     let mut envelope = Envelope::new(stream_kind, &device_id, &session, &request);
-    envelope.payload = payload.to_vec();
+    envelope.payload = sealed_payload(stream_kind, payload);
     envelope
+}
+
+/// Bytes shaped like a sealed frame. The relay reads the header's kind byte without
+/// decrypting anything, so every test payload must carry one; the body is not ciphertext
+/// and is never interpreted by the relay.
+fn sealed_payload(stream_kind: StreamKind, payload: &[u8]) -> Vec<u8> {
+    let mut sealed = vec![0u8; SealedHeader::MIN_LEN];
+    sealed[SealedHeader::VERSION_OFFSET] = phoneconnect::SEALED_VERSION;
+    sealed[SealedHeader::DIRECTION_OFFSET] = 1;
+    sealed[SealedHeader::COUNTER_OFFSET..SealedHeader::STREAM_KIND_OFFSET]
+        .copy_from_slice(&1u64.to_be_bytes());
+    sealed[SealedHeader::STREAM_KIND_OFFSET] = stream_kind as u8;
+    sealed.extend_from_slice(payload);
+    sealed
 }
 
 async fn opened_session(app: &TestApp) -> (String, String) {
@@ -365,7 +380,10 @@ async fn relay_half_close_closes_one_direction_only() {
         .recv_frame()
         .await
         .expect("buffered frame still delivered");
-    assert_eq!(drained.payload, b"last");
+    assert_eq!(
+        drained.payload,
+        sealed_payload(StreamKind::Control, b"last")
+    );
     assert_eq!(client.recv_frame().await, Err(RelayClose::PeerClosed));
 
     // The opposite direction stays usable.
@@ -374,7 +392,10 @@ async fn relay_half_close_closes_one_direction_only() {
         .await
         .expect("client can still send");
     let received = device.recv_frame().await.expect("device still receives");
-    assert_eq!(received.payload, b"still-open");
+    assert_eq!(
+        received.payload,
+        sealed_payload(StreamKind::Control, b"still-open")
+    );
 }
 
 #[tokio::test]
@@ -494,7 +515,8 @@ async fn relay_persists_no_stream_payloads() {
         .expect("frame relayed");
     assert_eq!(
         client.recv_frame().await.expect("frame received").payload,
-        PAYLOAD_MARKER
+        sealed_payload(StreamKind::Control, PAYLOAD_MARKER),
+        "the relay forwards the sealed payload unchanged"
     );
 
     let tables = app.store.schema().expect("schema readable");
@@ -608,7 +630,7 @@ async fn attached_relay_stops_forwarding_when_the_session_expires() {
             .await
             .expect("live frame received")
             .payload,
-        b"live"
+        sealed_payload(StreamKind::Control, b"live")
     );
 
     // A receiver already blocked must be woken by expiry, not only by the next sender.
@@ -1172,7 +1194,7 @@ mod transport {
             &session,
             &request,
         );
-        envelope.payload = payload.to_vec();
+        envelope.payload = crate::sealed_payload(phoneconnect::v1::StreamKind::Control, payload);
         encode_frame(&envelope, &FrameLimits::control_only()).expect("frame")
     }
 
@@ -1550,6 +1572,88 @@ async fn a_read_only_session_cannot_send_control_frames() {
         client.recv_frame().await.expect("read-only peer receives"),
         telemetry,
         "a refused control frame must not tear down the read-only stream"
+    );
+}
+
+#[tokio::test]
+async fn a_relabelled_control_frame_is_refused_and_the_read_only_peer_still_receives() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    let (status, body) = app.relay_upgrade(&session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // A legitimate key holder seals a real CONTROL frame but labels the routing envelope
+    // EVENTS, hoping the relay only looks at the label it can read.
+    let mut relabelled = envelope_of_kind(StreamKind::Events, &session_id, b"command");
+    relabelled.payload = sealed_payload(StreamKind::Control, b"command");
+    assert_eq!(
+        client.send_frame(&relabelled).await.err(),
+        Some(RelayClose::StreamKindMismatch {
+            outer: StreamKind::Events,
+            sealed: StreamKind::Control,
+        })
+    );
+
+    // The refusal is one frame: the read-only stream keeps delivering device telemetry.
+    let telemetry = envelope_of_kind(StreamKind::Events, &session_id, b"battery=64");
+    device
+        .send_frame(&telemetry)
+        .await
+        .expect("device telemetry accepted");
+    assert_eq!(
+        client.recv_frame().await.expect("read-only peer receives"),
+        telemetry
+    );
+}
+
+#[tokio::test]
+async fn a_control_frame_relabelled_to_a_larger_kind_is_refused_by_the_cap() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    app.relay_upgrade(&session_id, Some(capability)).await;
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // The sealed header claims a control frame, so the 1 MiB control limit applies no matter
+    // what the outer label says; the body is padded past that limit.
+    let oversized = vec![0u8; FrameLimits::default().limit_for(StreamKind::Control) as usize + 1];
+    let mut relabelled = envelope_of_kind(StreamKind::File, &session_id, b"");
+    relabelled.payload = sealed_payload(StreamKind::Control, &oversized);
+
+    assert_eq!(
+        client.send_frame(&relabelled).await.err(),
+        Some(RelayClose::OversizedFrame {
+            length: relabelled.payload.len(),
+            limit: FrameLimits::default().limit_for(StreamKind::Control) as usize,
+        })
     );
 }
 

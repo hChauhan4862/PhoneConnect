@@ -69,7 +69,13 @@ fn phoneconnect_control_frame(session_id: &str) -> phoneconnect::v1::Envelope {
     let device = DeviceId::new("dev_status").expect("device id");
     let session = SessionId::new(session_id).expect("session id");
     let request = RequestId::new("req_status").expect("request id");
-    Envelope::new(StreamKind::Control, &device, &session, &request)
+    let mut envelope = Envelope::new(StreamKind::Control, &device, &session, &request);
+    // The relay reads the sealed header's kind byte, so a real frame carries one.
+    let mut sealed = vec![0u8; phoneconnect::SealedHeader::MIN_LEN];
+    sealed[phoneconnect::SealedHeader::VERSION_OFFSET] = phoneconnect::SEALED_VERSION;
+    sealed[phoneconnect::SealedHeader::STREAM_KIND_OFFSET] = StreamKind::Control as u8;
+    envelope.payload = sealed;
+    envelope
 }
 
 #[tokio::test]

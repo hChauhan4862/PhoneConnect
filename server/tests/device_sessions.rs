@@ -35,6 +35,11 @@ async fn a_device_learns_its_session_with_a_device_ticket() {
         .await;
 
     assert_eq!(status, StatusCode::OK, "discovery failed: {body}");
+    assert_eq!(
+        body["control"],
+        Value::from(false),
+        "a session created without a control lease is read-only: {body}"
+    );
     assert_eq!(body["session_id"], Value::from(session_id.clone()));
     assert_eq!(body["expires_at"], session["expires_at"]);
     assert_eq!(body["verification_key"], session["verification_key"]);

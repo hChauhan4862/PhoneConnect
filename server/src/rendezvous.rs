@@ -694,6 +694,9 @@ pub struct IssuedTicket {
 pub struct DeviceSession {
     pub session_id: String,
     pub expires_at: UnixMs,
+    /// Whether a control lease authorized this session. A read-only session may receive
+    /// events but must refuse control frames, so the device needs to know.
+    pub control: bool,
     pub ticket: RendezvousTicket,
     pub verification_key: String,
 }
@@ -892,6 +895,7 @@ pub async fn device_session(
     Ok(Json(DeviceSession {
         session_id: session.session_id,
         expires_at: session.expires_at_ms,
+        control: session.control,
         ticket,
         verification_key: state.rendezvous.tickets().verification_key().to_owned(),
     })

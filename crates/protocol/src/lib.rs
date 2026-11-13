@@ -183,6 +183,49 @@ impl FrameLimits {
     }
 }
 
+/// Wire version of the sealed-frame header.
+pub const SEALED_VERSION: u8 = 1;
+
+/// Layout of the authenticated sealed-frame header.
+///
+/// The sealed frame is the ciphertext of one envelope: a fixed header followed by the
+/// ChaCha20-Poly1305 body and tag. The header is not secret — it lets a receiver find the key
+/// and reject a replay before spending work on decryption — and every byte of it is
+/// authenticated as associated data, so a changed header is a failed tag.
+///
+/// It lives here because three independent implementations must agree on it: the relay reads
+/// the kind byte to bound and authorize a frame without decrypting it, and both transports
+/// (Rust and Kotlin) read it to bind the frame they open.
+pub struct SealedHeader;
+
+impl SealedHeader {
+    pub const VERSION_OFFSET: usize = 0;
+    pub const KEY_ID_OFFSET: usize = 1;
+    /// Bytes of key id carried in a sealed frame.
+    pub const KEY_ID_LEN: usize = 8;
+    pub const DIRECTION_OFFSET: usize = Self::KEY_ID_OFFSET + Self::KEY_ID_LEN;
+    pub const COUNTER_OFFSET: usize = Self::DIRECTION_OFFSET + 1;
+    pub const STREAM_KIND_OFFSET: usize = Self::COUNTER_OFFSET + 8;
+    pub const SEQUENCE_OFFSET: usize = Self::STREAM_KIND_OFFSET + 1;
+    /// version + key id + direction + counter + stream kind + sequence.
+    pub const LEN: usize = Self::SEQUENCE_OFFSET + 4;
+
+    /// Bytes of the Poly1305 tag appended to every sealed frame.
+    pub const TAG_LEN: usize = 16;
+
+    /// Smallest accepted sealed frame: a header plus a tag.
+    pub const MIN_LEN: usize = Self::LEN + Self::TAG_LEN;
+
+    /// Stream kind declared by a sealed frame's header. `None` when the frame is too short or
+    /// the byte is not a known kind: a frame no honest sender produces.
+    pub fn stream_kind(sealed: &[u8]) -> Option<StreamKind> {
+        if sealed.len() < Self::MIN_LEN {
+            return None;
+        }
+        StreamKind::try_from(i32::from(sealed[Self::STREAM_KIND_OFFSET])).ok()
+    }
+}
+
 /// A decoded frame plus the number of bytes it occupied in the input buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {

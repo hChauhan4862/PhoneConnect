@@ -44,43 +44,17 @@ use crate::hole_punch::TicketRole;
 pub const IDENTITY_KEY_LEN: usize = 32;
 
 /// Bytes of key id carried in a sealed frame and used for lookup.
-pub const KEY_ID_LEN: usize = 8;
+pub const KEY_ID_LEN: usize = SealedHeader::KEY_ID_LEN;
 
 /// Bytes of the Poly1305 tag appended to every sealed frame.
-pub const TAG_LEN: usize = 16;
+pub const TAG_LEN: usize = SealedHeader::TAG_LEN;
 
-const SEALED_VERSION: u8 = 1;
 const AEAD_LABEL: &[u8] = b"phoneconnect-aead-v1";
 const KEY_ID_LABEL: &[u8] = b"phoneconnect-key-id-v1";
 
-/// Layout of the authenticated sealed-frame header.
-///
-/// The header is not secret: it lets a receiver find the key and reject a replay before it
-/// spends work on decryption. Every byte of it is authenticated as associated data, so a
-/// changed header is a failed tag, never a different frame.
-pub struct SealedHeader;
-
-impl SealedHeader {
-    pub const VERSION_OFFSET: usize = 0;
-    pub const KEY_ID_OFFSET: usize = 1;
-    pub const DIRECTION_OFFSET: usize = Self::KEY_ID_OFFSET + KEY_ID_LEN;
-    pub const COUNTER_OFFSET: usize = Self::DIRECTION_OFFSET + 1;
-    pub const STREAM_KIND_OFFSET: usize = Self::COUNTER_OFFSET + 8;
-    pub const SEQUENCE_OFFSET: usize = Self::STREAM_KIND_OFFSET + 1;
-    /// version + key id + direction + counter + stream kind + sequence.
-    pub const LEN: usize = Self::SEQUENCE_OFFSET + 4;
-
-    /// Smallest accepted sealed frame: a header plus a tag.
-    pub const MIN_LEN: usize = Self::LEN + TAG_LEN;
-
-    /// Stream kind carried by a sealed frame, so a relay can apply the right frame limit.
-    pub fn stream_kind(sealed: &[u8]) -> Option<StreamKind> {
-        if sealed.len() < Self::MIN_LEN {
-            return None;
-        }
-        StreamKind::try_from(i32::from(sealed[Self::STREAM_KIND_OFFSET])).ok()
-    }
-}
+/// The header layout is a wire contract shared with the relay and the Kotlin port, so it is
+/// defined in `phoneconnect` and re-exported here.
+pub use phoneconnect::{SEALED_VERSION, SealedHeader};
 
 /// Explicit confidentiality failures. Nothing degrades into plaintext or a silent retry.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -111,6 +85,11 @@ pub enum AeadError {
     CounterExhausted,
     #[error("sealed frame does not contain a valid envelope: {reason}")]
     InvalidEnvelope { reason: String },
+    #[error("sealed header declares {header:?} but the envelope it delivers is {envelope:?}")]
+    StreamKindMismatch {
+        header: StreamKind,
+        envelope: StreamKind,
+    },
 }
 
 impl From<ProtocolError> for AeadError {
@@ -431,6 +410,18 @@ impl SessionCipher {
     /// describes the frame's contents.
     pub fn seal(&self, envelope: &Envelope) -> Result<Vec<u8>, AeadError> {
         let stream_kind = envelope.validate()?;
+        self.seal_with_kind(envelope, stream_kind)
+    }
+
+    /// Seals `envelope` with a header label that must equal the envelope's own kind.
+    ///
+    /// The relay and the receiver both pin that equality, so a sender that labels a frame
+    /// differently produces a frame every hop refuses.
+    fn seal_with_kind(
+        &self,
+        envelope: &Envelope,
+        stream_kind: StreamKind,
+    ) -> Result<Vec<u8>, AeadError> {
         let counter = self.next_counter()?;
 
         let mut header = [0u8; SealedHeader::LEN];
@@ -552,7 +543,19 @@ impl SessionCipher {
             Envelope::decode(plaintext.as_slice()).map_err(|error| AeadError::InvalidEnvelope {
                 reason: error.to_string(),
             })?;
-        envelope.validate()?;
+        let envelope_kind = envelope.validate()?;
+        // The header is authenticated too, but authentication alone does not tie it to the
+        // envelope it delivers: a peer that holds the key controls both. Pin the kind so a
+        // control envelope cannot arrive inside a frame labelled as events, or the reverse.
+        let header_kind = SealedHeader::stream_kind(sealed).ok_or(AeadError::Malformed {
+            reason: "sealed frame has no readable stream kind".to_owned(),
+        })?;
+        if header_kind != envelope_kind {
+            return Err(AeadError::StreamKindMismatch {
+                header: header_kind,
+                envelope: envelope_kind,
+            });
+        }
         Ok(envelope)
     }
 
@@ -657,4 +660,61 @@ fn key_id(
     let mut id = [0u8; KEY_ID_LEN];
     id.copy_from_slice(&digest[..KEY_ID_LEN]);
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoneconnect::v1::{DeviceId, RequestId, SessionId};
+
+    fn cipher_pair() -> (SessionCipher, SessionCipher) {
+        let client_identity = IdentityKey::from_bytes([0x11; IDENTITY_KEY_LEN]);
+        let device_identity = IdentityKey::from_bytes([0x22; IDENTITY_KEY_LEN]);
+        let epoch = Epoch::new("client-kind-nonce", "device-kind-nonce").expect("epoch");
+        let client = SessionCipher::new(
+            &client_identity,
+            device_identity.public_key(),
+            "sess_kind",
+            TicketRole::Client,
+            &epoch,
+        )
+        .expect("client cipher");
+        let device = SessionCipher::new(
+            &device_identity,
+            client_identity.public_key(),
+            "sess_kind",
+            TicketRole::Device,
+            &epoch,
+        )
+        .expect("device cipher");
+        (client, device)
+    }
+
+    fn control_envelope() -> Envelope {
+        let device = DeviceId::new("dev_kind").expect("device id");
+        let session = SessionId::new("sess_kind").expect("session id");
+        let request = RequestId::new("req-kind").expect("request id");
+        let mut envelope = Envelope::new(StreamKind::Control, &device, &session, &request);
+        envelope.sequence = 1;
+        envelope
+    }
+
+    /// A sealed frame whose header says one kind and whose plaintext envelope says another is
+    /// exactly how a read-only client could smuggle a control command past a relay that only
+    /// sees the routing label. The receiver must refuse it, not dispatch the envelope.
+    #[test]
+    fn a_sealed_header_kind_must_match_the_envelope_it_delivers() {
+        let (client, device) = cipher_pair();
+        let sealed = client
+            .seal_with_kind(&control_envelope(), StreamKind::Events)
+            .expect("seal with a relabelled header");
+
+        assert_eq!(
+            device.open(&sealed).err(),
+            Some(AeadError::StreamKindMismatch {
+                header: StreamKind::Events,
+                envelope: StreamKind::Control,
+            })
+        );
+    }
 }
