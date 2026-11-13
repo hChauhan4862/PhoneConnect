@@ -105,9 +105,17 @@ class NotificationController(
             "Stopped: the server rejected this device's credential (${failure.code}). " +
                 "Check the server configuration, then enroll this device again if the credential was rotated."
 
+        // The server's own answer for a ticket with no pinned identity is that the device must
+        // be enrolled again; a new session would not fix it. Every other refusal here is a
+        // scope mismatch, which a new session does fix.
         is ConnectionFailure.SessionRefused ->
-            "Stopped: the server refused this session (${failure.code}). The device stays " +
-                "enrolled; create a new session from the PhoneConnect server."
+            if (failure.code == "ticket_identity_missing") {
+                "Stopped: the server has no identity pinned for this device's ticket. " +
+                    "Enroll this device again from the PhoneConnect server."
+            } else {
+                "Stopped: the server refused this session (${failure.code}). The device stays " +
+                    "enrolled; create a new session from the PhoneConnect server."
+            }
 
         is ConnectionFailure.Retryable -> "Stopped: ${describe(failure.reason)}."
     }

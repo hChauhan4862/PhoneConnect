@@ -19,6 +19,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import java.io.IOException
 
+// Hub operations whose unknown authentication refusals are counted separately.
+private const val OP_DISCOVERY = "session.discovery"
+private const val OP_TICKET = "session.ticket"
+private const val OP_NONCE = "session.nonce"
+private const val OP_CANDIDATES = "session.candidates"
+private const val OP_RELAY = "session.relay"
+
 /**
  * Establishes and runs one real session against the hub.
  *
@@ -45,15 +52,19 @@ class TransportSessionRunner(
     /** A session id whose relay was refused; polling skips it until a new session appears. */
     private var abandonedSessionId: String? = null
 
-    /** Consecutive authentication refusals this build cannot classify. Reset by a healthy session. */
-    private var unknownAuthRefusals = 0
+    /**
+     * Consecutive authentication refusals this build cannot classify, counted per hub
+     * operation. A success on one endpoint must not mask repeated refusals on another: a proxy
+     * that only 403s `/ticket` still has to become visible.
+     */
+    private val unknownAuthRefusals = mutableMapOf<String, Int>()
 
     override suspend fun run(store: EnrollmentStore, onConnected: (ConnectionPath) -> Unit): SessionEnd {
         val identity = store.openIdentity() ?: return SessionEnd.Failed(ConnectionFailure.NotEnrolled)
         try {
             return runSession(identity) { path ->
-                // A session that became healthy proves the credential is accepted.
-                unknownAuthRefusals = 0
+                // A session that became healthy proves every call works.
+                unknownAuthRefusals.clear()
                 onConnected(path)
             }
         } finally {
@@ -75,8 +86,10 @@ class TransportSessionRunner(
             is SessionWait.Ended -> return waitForSession.end
         }
 
-        val ticketResult = hub.ticket(credential, session.sessionId).acceptedByHub()
-        val (ticket, _) = ticketResult.getOrElse { error -> return SessionEnd.Failed(error.toFailure()) }
+        val ticketResult = hub.ticket(credential, session.sessionId).acceptedByHub(OP_TICKET)
+        val (ticket, _) = ticketResult.getOrElse { error ->
+            return SessionEnd.Failed(error.toFailure(OP_TICKET))
+        }
         if (ticket.sessionId != session.sessionId || ticket.deviceId != deviceId) {
             return SessionEnd.Failed(ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR))
         }
@@ -84,8 +97,8 @@ class TransportSessionRunner(
         // so it publishes its nonce exactly once without an endpoint, then reads the opposite
         // peer's nonce. Polling never redeems a ticket: a nonce is single-use, and a device
         // that is up before the client must not burn it and stop for good.
-        val registered = hub.registerNonce(credential, session.sessionId, ticket).acceptedByHub()
-            .getOrElse { error -> return SessionEnd.Failed(error.toFailure()) }
+        val registered = hub.registerNonce(credential, session.sessionId, ticket).acceptedByHub(OP_NONCE)
+            .getOrElse { error -> return SessionEnd.Failed(error.toFailure(OP_NONCE)) }
         val candidates = if (registered.peerNonce != null) {
             registered
         } else {
@@ -128,11 +141,11 @@ class TransportSessionRunner(
             val url = try {
                 hub.relayUrl(session.sessionId, candidates)
             } catch (error: HubFailure) {
-                return SessionEnd.Failed(error.toFailure())
+                return SessionEnd.Failed(error.toFailure(OP_RELAY))
             }
             val channel = openChannel(url, credential)
                 .getOrElse { error ->
-                    val failure = error.toFailure()
+                    val failure = error.toFailure(OP_RELAY)
                     if (failure == ConnectionFailure.RelayUnavailable) {
                         abandonedSessionId = session.sessionId
                     }
@@ -178,8 +191,10 @@ class TransportSessionRunner(
             currentCoroutineContext().ensureActive()
             // Any accepted response proves the credential works: only consecutive refusals
             // may reach the terminal.
-            val result = hub.assignedSession(credential, deviceId).acceptedByHub()
-            val session = result.getOrElse { error -> return SessionWait.Ended(SessionEnd.Failed(error.toFailure())) }
+            val result = hub.assignedSession(credential, deviceId).acceptedByHub(OP_DISCOVERY)
+            val session = result.getOrElse { error ->
+                return SessionWait.Ended(SessionEnd.Failed(error.toFailure(OP_DISCOVERY)))
+            }
             // A session whose relay was refused stays "active" until it expires. Waiting for
             // a different id honors "never retry the same session" without stopping the agent.
             if (session != null && session.sessionId != abandonedSessionId) {
@@ -194,8 +209,10 @@ class TransportSessionRunner(
         var pause = pollIntervalMs
         while (true) {
             currentCoroutineContext().ensureActive()
-            val result = hub.candidates(credential, sessionId).acceptedByHub()
-            val candidates = result.getOrElse { error -> return RendezvousWait.Ended(SessionEnd.Failed(error.toFailure())) }
+            val result = hub.candidates(credential, sessionId).acceptedByHub(OP_CANDIDATES)
+            val candidates = result.getOrElse { error ->
+                return RendezvousWait.Ended(SessionEnd.Failed(error.toFailure(OP_CANDIDATES)))
+            }
             if (candidates.peerNonce != null) {
                 return RendezvousWait.Rendezvous(candidates)
             }
@@ -212,7 +229,7 @@ class TransportSessionRunner(
      * would delete a perfectly good credential when a 30-second ticket expires, and the user
      * cannot mint a new one-time enrollment token from the device.
      */
-    private fun Throwable.toFailure(): ConnectionFailure = when (this) {
+    private fun Throwable.toFailure(operation: String): ConnectionFailure = when (this) {
         is HubFailure.Rejected -> when (code) {
             // Only these two mean the stored device credential is unusable.
             "invalid_credential", "device_unknown" -> ConnectionFailure.NotEnrolled
@@ -240,8 +257,9 @@ class TransportSessionRunner(
                 // An auth failure with an unknown code must never wipe the credential, but it
                 // must not retry forever with no operator-visible outcome either.
                 status == 401 || status == 403 -> {
-                    unknownAuthRefusals += 1
-                    if (unknownAuthRefusals >= MAX_UNKNOWN_AUTH_REFUSALS) {
+                    val count = (unknownAuthRefusals[operation] ?: 0) + 1
+                    unknownAuthRefusals[operation] = count
+                    if (count >= MAX_UNKNOWN_AUTH_REFUSALS) {
                         ConnectionFailure.CredentialRejected(code)
                     } else {
                         ConnectionFailure.SessionEnded
@@ -259,8 +277,12 @@ class TransportSessionRunner(
         else -> ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR)
     }
 
-    /** Records that the hub accepted this credential, so only consecutive refusals count. */
-    private fun <T> Result<T>.acceptedByHub(): Result<T> = onSuccess { unknownAuthRefusals = 0 }
+    /**
+     * Records that the hub accepted this credential for one operation. Only consecutive
+     * refusals on the same call reach the terminal, and a success elsewhere cannot reset them.
+     */
+    private fun <T> Result<T>.acceptedByHub(operation: String): Result<T> =
+        onSuccess { unknownAuthRefusals.remove(operation) }
 
     private sealed interface SessionWait {
         data class Assigned(val session: AssignedSession) : SessionWait

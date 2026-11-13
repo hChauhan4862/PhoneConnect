@@ -209,6 +209,34 @@ class HubSessionTest {
     }
 
     @Test
+    fun `a path-scoped auth refusal still terminates after consecutive failures`() = runBlocking {
+        // Discovery succeeds every attempt, so a count that reset on *any* success would let a
+        // proxy that only 403s /ticket retry forever. Counting per call site keeps it terminal.
+        val runner = TransportSessionRunner(hub, pollIntervalMs = 0)
+        val attempts = TransportSessionRunner.MAX_UNKNOWN_AUTH_REFUSALS
+        val ends = mutableListOf<SessionEnd>()
+        for (attempt in 1..attempts) {
+            server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000,"control":true}"""))
+            server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"proxy_denied"}"""))
+            ends += withTimeout(20_000) { runner.run(store) { } }
+        }
+
+        for (attempt in 1 until attempts) {
+            assertEquals(
+                "attempt $attempt is still retried",
+                SessionEnd.Failed(ConnectionFailure.SessionEnded),
+                ends[attempt - 1],
+            )
+        }
+        assertEquals(
+            "a refusal isolated to one endpoint must still become terminal",
+            SessionEnd.Failed(ConnectionFailure.CredentialRejected("proxy_denied")),
+            ends.last(),
+        )
+        assertEquals("stopping never deletes the credential", null, store.cleared)
+    }
+
+    @Test
     fun `a successful poll between refusals resets the unknown-auth count`() = runBlocking {
         // A 204 proves the credential is accepted. Without this reset, MAX-1 sporadic
         // unknown-code refusals spread over hours would let one more stop an idle agent

@@ -45,6 +45,23 @@ class NotificationControllerTest {
     }
 
     @Test
+    fun `a refused session names the action the operator can take`() {
+        val scope = controller
+            .text(ConnectionStatus.Terminal(ConnectionFailure.SessionRefused("session_scope_mismatch")))
+            .lowercase()
+        assertTrue("a scope refusal needs a new session: $scope", scope.contains("new session"))
+        assertFalse("a scope refusal must not claim the device needs re-enrolling", scope.contains("enroll again"))
+
+        // The server's own answer for a ticket with no pinned identity is that the device must
+        // be re-enrolled; telling the operator to create a new session would be wrong.
+        val identity = controller
+            .text(ConnectionStatus.Terminal(ConnectionFailure.SessionRefused("ticket_identity_missing")))
+            .lowercase()
+        assertTrue("a missing identity needs re-enrollment: $identity", identity.contains("enroll this device again"))
+        assertFalse("a missing identity is not fixed by a new session: $identity", identity.contains("new session"))
+    }
+
+    @Test
     fun `the connection notification is ongoing and quiet`() {
         val notification = controller.build(ConnectionStatus.Connected(ConnectionPath.RELAY, sinceMs = 0))
 
