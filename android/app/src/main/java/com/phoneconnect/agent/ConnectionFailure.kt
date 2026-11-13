@@ -30,7 +30,10 @@ sealed interface ConnectionFailure {
      */
     data object RelayUnavailable : ConnectionFailure
 
-    /** The session expired, closed, or was revoked server-side. Enroll again is not needed. */
+    /**
+     * The session expired, closed, or was revoked server-side, or the control lease that
+     * authorized it was revoked. The enrollment stays valid; a new session is needed.
+     */
     data object SessionEnded : ConnectionFailure
 
     data class Retryable(val reason: ReconnectReason) : ConnectionFailure

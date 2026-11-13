@@ -186,7 +186,14 @@ class AgentTransportTest {
 
     @Test
     fun `revoked, expired, and closed sessions are terminal for the session`() = runTest {
-        for (reason in listOf("session_revoked", "session_expired", "session_closed", "session_unknown")) {
+        for (reason in listOf(
+            "session_revoked",
+            "session_expired",
+            "session_closed",
+            "session_unknown",
+            // A revoked control lease invalidates the stream capability it authorized.
+            "lease_revoked",
+        )) {
             assertEquals(
                 "close reason $reason must end the session",
                 Inbound.End(ConnectionFailure.SessionEnded),

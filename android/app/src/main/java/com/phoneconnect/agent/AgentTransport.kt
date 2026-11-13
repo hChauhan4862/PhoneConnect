@@ -174,8 +174,11 @@ class AgentTransport(
         // The device is revoked: retrying cannot authenticate again.
         "device_revoked" -> ConnectionFailure.DeviceRevoked
         // The session is gone. The enrollment is still valid, but this session id is done.
-        "session_revoked", "session_expired", "session_closed", "session_unknown" ->
-            ConnectionFailure.SessionEnded
+        // `lease_revoked` is the same outcome for the stream: the control lease that
+        // authorized it ended, so this capability must not be reused.
+        "session_revoked", "session_expired", "session_closed", "session_unknown",
+        "lease_revoked",
+        -> ConnectionFailure.SessionEnded
         // A relay lease refused for this session id is terminal for that id only.
         "relay_unavailable" -> ConnectionFailure.RelayUnavailable
         // Ordinary transport faults: retry with backoff.
