@@ -3,6 +3,16 @@
 This is the **only** UI implementation. The server serves it at `/` and the native shell
 loads that same URL in a webview; screens are never forked per host.
 
+**The UI is not live.** There is no server-to-client push channel yet: a screen renders the
+snapshot it last read, so another user's handoff, a lease revocation, a new session, or a
+fresh telemetry report appears only after a refresh. The status and telemetry screens say
+this next to their refresh controls, and no screen claims otherwise.
+
+**Leases are not yet an authentication boundary.** Access uses the admin bearer token and an
+asserted user id; the lease rules constrain what an accepted user may do, but they do not
+authenticate that user. Local password login and MFA replace the access gate without changing
+the screens.
+
 ```sh
 npm ci
 npm test          # Vitest + Testing Library
@@ -20,12 +30,15 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   server's SPA fallback serves the same document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
-  fallback and no second domain model.
+  fallback and no second domain model. The client is same-origin, so the native shell's
+  embedded page makes exactly the calls a browser makes.
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
-  `DeviceStatusRoute`, `LiveTelemetryRoute`, `NotFoundRoute`.
+  `DeviceStatusRoute`, `TelemetryRoute`, `NotFoundRoute`.
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface) and
-  `TelemetryPanel` (bounded aggregates and explicit freshness).
+  `TelemetryPanel` (bounded aggregates and explicit freshness). `LeasePanel` offers revoke and
+  handoff to the owner *or* the holder, because the server lets the owner revoke a lease they
+  do not hold; "Read-only access" is reserved for a user who is neither.
 - `src/data/useResource.ts` — one load/retry primitive; `src/session.ts` — the browser
   session (admin token + acting user id) used until local password login and MFA land.
 

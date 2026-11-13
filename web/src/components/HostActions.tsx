@@ -12,18 +12,18 @@ export function HostActions({ deviceId }: { deviceId: string }) {
     <section className="panel actions" aria-labelledby="views-heading">
       <h2 id="views-heading">Views</h2>
       <p className="muted">
-        The live telemetry view is a long-lived screen. The native shell can host it in a
-        separate window; a browser keeps it in this tab.
+        The telemetry view is a long-lived screen that refreshes on demand. The native shell
+        can host it in a separate window; a browser keeps it in this tab.
       </p>
       <button type="button" onClick={() => void host.openView(route, { detached: false })}>
-        Open live telemetry
+        Open telemetry view
       </button>
       {host.kind === "native" ? (
         <button
           type="button"
           onClick={() => void host.openView(route, { detached: true })}
         >
-          Open live telemetry in a detached window
+          Open telemetry view in a detached window
         </button>
       ) : null}
     </section>

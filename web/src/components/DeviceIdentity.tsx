@@ -15,7 +15,7 @@ export function DeviceIdentity({ device }: { device: DeviceView }) {
           {formatTime(device.enrolled_at_ms)}
         </StatusField>
         {device.revoked_at_ms !== null ? (
-          <StatusField label="Revoked">
+          <StatusField label="Revoked at">
             {formatTime(device.revoked_at_ms)}
           </StatusField>
         ) : null}

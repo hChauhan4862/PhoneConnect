@@ -9,7 +9,7 @@ import { createHttpApi, type ApiClient } from "./api";
 import { AccessGateRoute } from "./routes/AccessGateRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
 import { DeviceStatusRoute } from "./routes/DeviceStatusRoute";
-import { LiveTelemetryRoute } from "./routes/LiveTelemetryRoute";
+import { TelemetryRoute } from "./routes/TelemetryRoute";
 import { NotFoundRoute } from "./routes/NotFoundRoute";
 import { createHostAdapter, HostAdapterContext } from "./host/HostAdapter";
 import { readHostContext } from "./host/hostContext";
@@ -96,8 +96,8 @@ function AuthenticatedShell({
           userId={session.userId}
         />
       ) : null}
-      {route.name === "liveTelemetry" ? (
-        <LiveTelemetryRoute
+      {route.name === "telemetry" ? (
+        <TelemetryRoute
           api={api}
           deviceId={route.deviceId}
           userId={session.userId}

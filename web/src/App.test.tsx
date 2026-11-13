@@ -158,6 +158,8 @@ describe("the status screen", () => {
       expect(screen.getByText(/Controlled by user-b/)).toBeInTheDocument();
       expect(screen.getByText(/Telemetry stale/)).toBeInTheDocument();
       expect(screen.getByText(/5m ago/)).toBeInTheDocument();
+      // The screen does not stream: it reads a snapshot and must say so.
+      expect(screen.getByText(/not live/i)).toBeInTheDocument();
       // A stale reading is shown, but never labelled fresh.
       expect(screen.queryByText(/Telemetry fresh/)).not.toBeInTheDocument();
     },
@@ -261,11 +263,11 @@ describe("the host adapter in the screen", () => {
     renderApp(createFakeApi(statusFixture()));
 
     const inPage = await screen.findByRole("button", {
-      name: "Open live telemetry",
+      name: "Open telemetry view",
     });
     expect(
       screen.queryByRole("button", {
-        name: "Open live telemetry in a detached window",
+        name: "Open telemetry view in a detached window",
       }),
     ).not.toBeInTheDocument();
 
@@ -282,7 +284,7 @@ describe("the host adapter in the screen", () => {
 
     await userEvent.click(
       await screen.findByRole("button", {
-        name: "Open live telemetry in a detached window",
+        name: "Open telemetry view in a detached window",
       }),
     );
 
@@ -291,7 +293,7 @@ describe("the host adapter in the screen", () => {
     expect(window.location.pathname).toBe("/devices/dev_1");
     // The additive control does not replace the in-page one.
     expect(
-      screen.getByRole("button", { name: "Open live telemetry" }),
+      screen.getByRole("button", { name: "Open telemetry view" }),
     ).toBeInTheDocument();
   });
 });
@@ -324,6 +326,114 @@ describe("the lease surface", () => {
     await waitFor(() => expect(api.acquireLease).toHaveBeenCalledTimes(1));
     expect(api.acquireLease).toHaveBeenCalledWith("dev_1", "owner-1");
     expect(await screen.findByText(/Controlled by user-b/)).toBeInTheDocument();
+  });
+
+  it("lets the owner revoke a handoff and take control back", async () => {
+    installHost("browser");
+    let served = statusFixture();
+    served.lease = {
+      lease: activeLease,
+      access: {
+        user_id: "owner-1",
+        is_owner: true,
+        role: "viewer",
+        can_control: false,
+      },
+    };
+    const api = createFakeApi(async () => served);
+    api.revokeLease = vi.fn(async () => {
+      served = statusFixture();
+      served.lease = {
+        lease: null,
+        access: {
+          user_id: "owner-1",
+          is_owner: true,
+          role: "viewer",
+          can_control: false,
+        },
+      };
+      return {
+        lease_id: activeLease.lease_id,
+        device_id: activeLease.device_id,
+        actor_id: "owner-1",
+        revoked_at_ms: NOW,
+        reason: "revoked" as const,
+        invalidated_sessions: [],
+      };
+    });
+    api.acquireLease = vi.fn(async () => {
+      served = statusFixture();
+      served.lease = {
+        lease: { ...activeLease, holder_id: "owner-1" },
+        access: {
+          user_id: "owner-1",
+          is_owner: true,
+          role: "controller",
+          can_control: true,
+        },
+      };
+      return served.lease.lease as LeaseView;
+    });
+    renderApp(api);
+
+    // The owner does not hold the lease, but is not read-only: the server lets the owner
+    // revoke, so the panel must offer it.
+    expect(
+      await screen.findByText("Owner — you can revoke this lease"),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Release control" }),
+    );
+    await waitFor(() => expect(api.revokeLease).toHaveBeenCalledTimes(1));
+    expect(api.revokeLease).toHaveBeenCalledWith("lease_1", "owner-1");
+
+    // Once the lease is gone, the owner can take control again.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Take control" }),
+    );
+    await waitFor(() => expect(api.acquireLease).toHaveBeenCalledTimes(1));
+    expect(api.acquireLease).toHaveBeenCalledWith("dev_1", "owner-1");
+    expect(
+      await screen.findByText("You control this device"),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no control action for a revoked device", async () => {
+    installHost("browser");
+    const fixture = statusFixture();
+    fixture.device = {
+      ...fixture.device,
+      state: "revoked",
+      revoked_at_ms: NOW,
+    };
+    fixture.session = {
+      session_id: null,
+      created_at_ms: null,
+      expires_at_ms: null,
+      revoked_at_ms: null,
+      state: "none",
+      path: { state: "none", relay_attached: false, direct_candidates: false },
+    };
+    fixture.lease = {
+      lease: null,
+      access: {
+        user_id: "owner-1",
+        is_owner: true,
+        role: "viewer",
+        can_control: false,
+      },
+    };
+    renderApp(createFakeApi(fixture));
+
+    expect(
+      await screen.findByText("Revoked", { selector: "strong" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Control cannot be granted for a revoked device/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Take control" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows read-only access and no control action for a secondary viewer", async () => {

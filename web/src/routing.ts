@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 export type Route =
   | { name: "devices" }
   | { name: "device"; deviceId: string }
-  | { name: "liveTelemetry"; deviceId: string }
+  | { name: "telemetry"; deviceId: string }
   | { name: "unknown"; path: string };
 
 export function devicePath(deviceId: string): string {
@@ -35,7 +35,7 @@ export function matchRoute(pathname: string): Route {
   if (!deviceId) return { name: "unknown", path: pathname };
   if (segments.length === 2) return { name: "device", deviceId };
   if (segments.length === 3 && segments[2] === "telemetry") {
-    return { name: "liveTelemetry", deviceId };
+    return { name: "telemetry", deviceId };
   }
   return { name: "unknown", path: pathname };
 }

@@ -47,11 +47,14 @@ export function DeviceStatusRoute({
         <button type="button" onClick={resource.reload}>
           Refresh status
         </button>
+        <span className="muted">
+          Not live: the server has no push channel, so refresh to see changes.
+        </span>
       </div>
       <SessionPanel session={status.session} />
       <LeasePanel
         api={api}
-        deviceId={status.device.device_id}
+        device={status.device}
         userId={userId}
         status={status.lease}
         onChanged={resource.reload}

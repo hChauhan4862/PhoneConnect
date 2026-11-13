@@ -1,21 +1,24 @@
-/// The lease surface: who controls the device, what this user may do, and the two explicit
-/// ways control changes hands (handoff and revocation).
+/// The lease surface: who controls the device, what this user may do, and the explicit ways
+/// control changes hands (handoff and revocation).
+///
+/// The owner may revoke a lease they do not hold, so revoke is offered to the owner *and* the
+/// holder. "Read-only access" is reserved for a user who is neither.
 
 import { useState } from "react";
 
-import type { ApiClient, LeaseStatusView } from "../api";
+import type { ApiClient, DeviceView, LeaseStatusView } from "../api";
 import { ErrorNotice } from "./ErrorNotice";
 import { StatusField } from "./StatusField";
 
 export function LeasePanel({
   api,
-  deviceId,
+  device,
   userId,
   status,
   onChanged,
 }: {
   api: ApiClient;
-  deviceId: string;
+  device: DeviceView;
   userId: string;
   status: LeaseStatusView;
   onChanged: () => void;
@@ -23,6 +26,14 @@ export function LeasePanel({
   const [handoffTo, setHandoffTo] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<unknown>(null);
+
+  const revoked = device.state === "revoked";
+  const lease = status.lease;
+  const isOwner = status.access.is_owner;
+  const canControl = status.access.can_control;
+  // The server authorizes the owner or the current holder to revoke and hand off.
+  const mayManageLease = !revoked && lease !== null && (isOwner || canControl);
+  const mayTakeControl = !revoked && lease === null && isOwner && !canControl;
 
   async function run(action: () => Promise<unknown>): Promise<void> {
     setPending(true);
@@ -43,27 +54,27 @@ export function LeasePanel({
       <dl>
         <StatusField label="Controller">
           <strong>
-            {status.lease
-              ? `Controlled by ${status.lease.holder_id}`
-              : "No active controller"}
+            {lease ? `Controlled by ${lease.holder_id}` : "No active controller"}
           </strong>
         </StatusField>
         <StatusField label="Your access">
-          <strong>
-            {status.access.can_control ? "You control this device" : "Read-only access"}
-          </strong>
+          <strong>{describeAccess(revoked, isOwner, canControl, lease !== null)}</strong>
         </StatusField>
       </dl>
 
-      {status.access.can_control && status.lease ? (
+      {revoked ? (
+        <p className="muted">
+          Control cannot be granted for a revoked device. Enroll it again to control it.
+        </p>
+      ) : null}
+
+      {mayManageLease ? (
         <div className="actions">
           <button
             type="button"
             disabled={pending}
             onClick={() =>
-              void run(() =>
-                api.revokeLease(status.lease?.lease_id ?? "", userId),
-              )
+              void run(() => api.revokeLease(lease?.lease_id ?? "", userId))
             }
           >
             Release control
@@ -78,9 +89,7 @@ export function LeasePanel({
             type="button"
             disabled={pending || handoffTo.trim().length === 0}
             onClick={() =>
-              void run(() =>
-                api.handoffLease(deviceId, userId, handoffTo.trim()),
-              )
+              void run(() => api.handoffLease(device.device_id, userId, handoffTo.trim()))
             }
           >
             Hand off control
@@ -88,12 +97,12 @@ export function LeasePanel({
         </div>
       ) : null}
 
-      {!status.access.can_control && status.access.is_owner && !status.lease ? (
+      {mayTakeControl ? (
         <div className="actions">
           <button
             type="button"
             disabled={pending}
-            onClick={() => void run(() => api.acquireLease(deviceId, userId))}
+            onClick={() => void run(() => api.acquireLease(device.device_id, userId))}
           >
             Take control
           </button>
@@ -103,4 +112,17 @@ export function LeasePanel({
       {error ? <ErrorNotice error={error} /> : null}
     </section>
   );
+}
+
+function describeAccess(
+  revoked: boolean,
+  isOwner: boolean,
+  canControl: boolean,
+  hasLease: boolean,
+): string {
+  if (revoked) return "Device revoked — no control is possible";
+  if (canControl) return "You control this device";
+  if (isOwner && hasLease) return "Owner — you can revoke this lease";
+  if (isOwner) return "Owner — you can take control";
+  return "Read-only access";
 }
