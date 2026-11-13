@@ -16,6 +16,14 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
   redemption, and candidate exchange.
 - `src/relay.rs` — bounded relay sessions, limits, explicit close reasons, and the framed
   relay transport route.
+- `src/leases.rs` — control leases: one holder per device, explicit grant and handoff,
+  read-only secondary access, and revocation that closes the lease's streams.
+- `src/telemetry.rs` — bounded per-device telemetry aggregation, explicit freshness, and
+  30-day aggregate deletion.
+- `src/status.rs` — the status surface the web UI renders: device, session, path evidence,
+  lease, and telemetry.
+- `src/retention.rs` — the callable 30-day retention job (startup + interval hook).
+- `src/web.rs` — serves the built web app at `/` with SPA fallback and a strict CSP.
 - `src/admin.rs` — admin-guarded revocation of tokens, devices, and sessions.
 - `src/main.rs` — environment-driven configuration and process startup.
 
@@ -35,6 +43,23 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/enrollment-tokens/{token}/revoke` | admin | Revokes one unused enrollment token; idempotent. |
 | `POST` | `/api/devices/{id}/revoke` | admin | Revokes a device and its live sessions; closes their relays. |
 | `POST` | `/api/sessions/{id}/revoke` | admin | Revokes one session; closes its relay. |
+| `GET` | `/api/devices` | admin | Enrolled devices, oldest first. No credential is ever returned. |
+| `GET` | `/api/devices/{id}/status?user_id=` | admin | The status surface: enrollment, newest session and path evidence, lease, telemetry freshness. |
+| `GET` | `/api/devices/{id}/lease?user_id=` | admin | The active lease and one user's access (`is_owner`, `role`, `can_control`). |
+| `POST` | `/api/devices/{id}/lease` | admin | The owner grants control while the device is free; body is `{actor_id, expires_in_seconds?}`. |
+| `POST` | `/api/devices/{id}/lease/handoff` | admin | Explicit transfer of control; body is `{actor_id, to_user_id, expires_in_seconds?}`. Returns the new lease and the replaced one's revocation event. |
+| `POST` | `/api/leases/{id}/revoke` | admin | Immediate revocation; body is `{actor_id}`. Returns the revocation event, including the stream capabilities it invalidated. Idempotent. |
+| `POST` | `/api/devices/{id}/telemetry` | device credential matching `{id}` | One bounded telemetry report; the response is the bounded aggregate. |
+| `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
+
+An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA
+document. A path that names a file but does not resolve is a 404 too, so a missing asset is
+never served as HTML labelled as JavaScript. Every web response carries
+`Content-Security-Policy: default-src 'self'; ... object-src 'none'; base-uri 'none';
+frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy:
+no-referrer`. Assets are immutable-cached; the app shell is `no-cache`. The built app is
+served from `PHONECONNECT_WEB_ROOT` (default `web/dist`), read once at startup; a missing
+build is reported on stderr and the API is served without it.
 
 Errors are always `{"error": "<code>"}` with a non-2xx status; there are no
 success-shaped fallbacks. Revocation returns `{"revoked": true, "revoked_at": <unix ms>}`
@@ -150,6 +175,42 @@ needs it, and never as the result of an otherwise idle read. Reserve "create a n
 `409 relay_unavailable` on a *new* lease, or for a `device_revoked`, `session_revoked`, or
 `session_expired` close.
 
+## Control leases
+
+A device has at most one active control lease. The owner grants it while the device is free
+(`POST /api/devices/{id}/lease`) and may hand it to another user explicitly
+(`.../lease/handoff`); a held lease is never displaced silently, not even by the owner, and
+handoff is atomic in the store. The holder may pass control on or revoke it. A user without
+the lease is a secondary viewer: status and telemetry read normally, and every control
+admission is refused `403 lease_read_only` instead of quietly succeeding.
+
+A control session (`POST /api/sessions` with `control: true` and a `user_id`) is authorized
+by the lease, linked to it, and never outlives it. Revoking a lease or handing it off
+revokes those sessions in the store *and* closes their relay transports with the
+`lease_revoked` close reason **in the same request**, so an attached peer learns immediately
+rather than at the next liveness poll. Revocation returns the event naming every invalidated
+session.
+
+## Telemetry
+
+`POST /api/devices/{id}/telemetry` accepts one report and keeps a bounded window per device:
+at most 16 retained samples and one small aggregate (min/max/mean plus the latest value), for
+at most 200 devices. A 201st device is refused `429 telemetry_capacity` rather than evicting a
+tracked device. A non-finite CPU reading, a battery outside 0-100, or memory usage above the
+reported total is refused `400 invalid_sample`. Aggregates live in memory; no raw sample log,
+file, or media byte is persisted, and unknown JSON fields are dropped rather than retained.
+
+Freshness is explicit: `fresh` inside 90 seconds (three missed 30-second reports), `stale`
+after that, `missing` when no report has ever arrived. The status surface reports the state
+it knows; a stale reading keeps its value and is labelled stale.
+
+## Retention
+
+`RetentionJob::run(now_ms)` is deterministic and deletes session records, control leases,
+lease links, and telemetry aggregates that ended more than 30 days earlier. `main` runs it
+once at startup and then every six hours through `spawn_interval`; there is no separate
+scheduler daemon. A failed run is logged and retried on the next tick.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -158,6 +219,7 @@ needs it, and never as the result of an otherwise idle read. Reserve "create a n
 | `PHONECONNECT_LISTEN_ADDR` | `0.0.0.0:8080` | Listen address. |
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
 | `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/sessions` | Relay route base advertised to peers; one session appends `/{session_id}/relay`. |
+| `PHONECONNECT_WEB_ROOT` | `web/dist` | Directory of the built web app, served at `/` (the image uses `/app/web`). |
 
 A peer that reconnects fetches a fresh ticket and re-reads its candidates: each ticket's
 single-use nonce is half of that connection's key epoch, and the transport refuses to open a
@@ -171,10 +233,11 @@ Terminate TLS at a reverse proxy; all public endpoints require TLS in production
 
 ## Persistence and retention
 
-The store keeps enrollment tokens, devices, and sessions: identifiers, credential hashes,
-expiry, and revocation only. Stream payloads, files, and media are never persisted and
-never queued beyond the bounded relay limits. Relay state is dropped as sessions expire, so
-memory stays proportional to live sessions.
+The store keeps enrollment tokens, devices, sessions, control leases, and the lease-to-session
+links: identifiers, credential hashes, expiry, revocation, and who may control what. Stream
+payloads, files, and media are never persisted and never queued beyond the bounded relay
+limits. Relay state is dropped as sessions expire, so memory stays proportional to live
+sessions. Telemetry aggregates are bounded in memory, not stored per sample.
 
 The SQLite adapter serializes writes on one connection. That concurrency limit is
 intentional for single-node deployments; a PostgreSQL adapter can implement the same

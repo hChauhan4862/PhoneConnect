@@ -490,11 +490,13 @@ async fn relay_persists_no_stream_payloads() {
     assert_eq!(
         tables,
         vec![
+            "control_leases".to_owned(),
             "devices".to_owned(),
             "enrollment_tokens".to_owned(),
+            "lease_sessions".to_owned(),
             "sessions".to_owned()
         ],
-        "the store holds credentials and session metadata only"
+        "the store holds credentials, session metadata, and lease authorization only"
     );
 
     // Payload bytes live in bounded in-memory queues, never in the durable records.

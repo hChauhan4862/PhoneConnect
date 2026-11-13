@@ -8,16 +8,20 @@ use std::sync::Arc;
 
 use phoneconnect_server::auth::{ADMIN_TOKEN_ENV, admin_token_from_env};
 use phoneconnect_server::relay::RelayLimits;
+use phoneconnect_server::retention::{DEFAULT_RETENTION_INTERVAL, RetentionJob};
 use phoneconnect_server::store::{DeviceStore, SqliteStore, SystemClock};
+use phoneconnect_server::web::{WebUi, router_with_web_ui};
 use phoneconnect_server::{AppState, build_router};
 
 const LISTEN_ADDR_ENV: &str = "PHONECONNECT_LISTEN_ADDR";
 const DATABASE_PATH_ENV: &str = "PHONECONNECT_DATABASE_PATH";
 const RELAY_ENDPOINT_ENV: &str = "PHONECONNECT_RELAY_ENDPOINT";
+const WEB_ROOT_ENV: &str = "PHONECONNECT_WEB_ROOT";
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DATABASE_PATH: &str = "/data/phoneconnect.sqlite3";
 const DEFAULT_RELAY_ENDPOINT: &str = "http://localhost:8080/api/sessions";
+const DEFAULT_WEB_ROOT: &str = "web/dist";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = environment_or(LISTEN_ADDR_ENV, DEFAULT_LISTEN_ADDR);
     let database_path = environment_or(DATABASE_PATH_ENV, DEFAULT_DATABASE_PATH);
     let relay_endpoint = environment_or(RELAY_ENDPOINT_ENV, DEFAULT_RELAY_ENDPOINT);
+    let web_root = environment_or(WEB_ROOT_ENV, DEFAULT_WEB_ROOT);
 
     let store: Arc<dyn DeviceStore> = Arc::new(SqliteStore::open(&database_path)?);
     let state = Arc::new(AppState::new(
@@ -36,9 +41,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(SystemClock),
     )?);
 
+    // The browser and the native shell load the same server URL; there is no second bundle.
+    let router = match WebUi::load(&web_root) {
+        Ok(ui) => {
+            println!("phoneconnect-server serving the web UI from {web_root}");
+            router_with_web_ui(Arc::clone(&state), ui)
+        }
+        Err(error) => {
+            eprintln!("phoneconnect: web UI unavailable ({error}); serving the API only");
+            build_router(state.clone())
+        }
+    };
+
+    // 30-day retention: once at startup, then on the interval. No scheduler daemon.
+    let retention = Arc::new(RetentionJob::new(
+        Arc::clone(&state.store),
+        Arc::clone(&state.telemetry),
+        Arc::clone(&state.clock),
+    ));
+    let _retention = retention.spawn_interval(DEFAULT_RETENTION_INTERVAL);
+
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     println!("phoneconnect-server listening on {listen_addr}");
-    axum::serve(listener, build_router(state))
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

@@ -9,9 +9,14 @@
 pub mod admin;
 pub mod auth;
 pub mod enrollment;
+pub mod leases;
 pub mod relay;
 pub mod rendezvous;
+pub mod retention;
+pub mod status;
 pub mod store;
+pub mod telemetry;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -27,9 +32,11 @@ use serde_json::json;
 pub use relay::PeerRole;
 
 use auth::{AuthError, Authenticator};
+use leases::LeaseStore;
 use relay::{Relay, RelayLimits};
 use rendezvous::{Rendezvous, TicketAuthority, TicketError};
 use store::{Clock, DeviceStore};
+use telemetry::TelemetryAggregator;
 
 /// Server-wide dependencies shared by the HTTP handlers.
 pub struct AppState {
@@ -37,6 +44,8 @@ pub struct AppState {
     pub auth: Arc<Authenticator>,
     pub rendezvous: Arc<Rendezvous>,
     pub relay: Arc<Relay>,
+    pub leases: Arc<LeaseStore>,
+    pub telemetry: Arc<TelemetryAggregator>,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -74,11 +83,19 @@ impl AppState {
             Arc::clone(&clock),
         ));
         let tickets = Arc::new(TicketAuthority::new()?);
+        let leases = Arc::new(LeaseStore::new(
+            Arc::clone(&store),
+            Arc::clone(&relay),
+            Arc::clone(&clock),
+        ));
+        let telemetry = Arc::new(TelemetryAggregator::new(Arc::clone(&clock)));
         Ok(Self {
             store,
             auth,
             rendezvous: Arc::new(Rendezvous::new(relay_endpoint, tickets)),
             relay,
+            leases,
+            telemetry,
             clock,
         })
     }
@@ -145,6 +162,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(admin::revoke_enrollment_token),
         )
         .route("/api/devices/enroll", post(enrollment::enroll_device))
+        .route("/api/devices", get(status::list_devices))
+        .route(
+            "/api/devices/{device_id}/status",
+            get(status::device_status),
+        )
+        .route(
+            "/api/devices/{device_id}/telemetry",
+            post(telemetry::ingest_telemetry),
+        )
+        .route(
+            "/api/devices/{device_id}/lease",
+            post(leases::acquire_lease).get(leases::lease_status),
+        )
+        .route(
+            "/api/devices/{device_id}/lease/handoff",
+            post(leases::handoff_lease),
+        )
+        .route("/api/leases/{lease_id}/revoke", post(leases::revoke_lease))
         .route(
             "/api/devices/{device_id}/revoke",
             post(admin::revoke_device),

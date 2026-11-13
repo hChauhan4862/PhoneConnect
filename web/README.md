@@ -1,0 +1,80 @@
+# PhoneConnect web UI
+
+This is the **only** UI implementation. The server serves it at `/` and the native shell
+loads that same URL in a webview; screens are never forked per host.
+
+```sh
+npm ci
+npm test          # Vitest + Testing Library
+npm run typecheck
+npm run lint
+npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_ROOT
+```
+
+## Layout
+
+- `src/App.tsx` — the shell: selects one host adapter, holds the session, and renders the
+  current route. It contains no screen logic.
+- `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
+  `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry). The
+  server's SPA fallback serves the same document for each, so a reload or deep link works.
+- `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
+  `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
+  fallback and no second domain model.
+- `src/host/` — the single place host differences live (see below).
+- `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
+  `DeviceStatusRoute`, `LiveTelemetryRoute`, `NotFoundRoute`.
+- `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface) and
+  `TelemetryPanel` (bounded aggregates and explicit freshness).
+- `src/data/useResource.ts` — one load/retry primitive; `src/session.ts` — the browser
+  session (admin token + acting user id) used until local password login and MFA land.
+
+## The host adapter contract
+
+`HostAdapter` is the only abstraction that knows whether the page is in a browser or a
+native shell:
+
+```ts
+interface HostAdapter {
+  readonly kind: "browser" | "native";
+  openView(route: string, options: { detached: boolean }): Promise<void>;
+  setTrayStatus(status: TrayStatus): Promise<void>;
+  localEndpoints(): Promise<LocalEndpoint[]>;
+  notify(input: { title: string; body: string }): Promise<void>;
+}
+```
+
+- `createHostAdapter(context?)` returns the native adapter only when `context.kind ===
+  "native"`; otherwise it returns the browser adapter. `App` calls
+  `createHostAdapter(readHostContext())`, so selection is explicit and failure to inject a
+  context simply means "browser".
+- `browserHost` navigates in the SPA (ignoring `detached`), has no tray or OS window, returns
+  no local endpoints, and turns a notification into an in-page event.
+- `nativeHost` opens a detached OS window when the shell bridge provides `openWindow`, and
+  otherwise navigates the embedded webview to the same route. Every bridge capability is
+  optional; a missing one degrades to the browser behavior for that operation.
+- Native-only affordances are additive: `HostActions` always renders the in-page action and
+  only adds the detached-window action when `kind === "native"`, so a web user never sees a
+  control that cannot work.
+
+### What the native shell injects
+
+Before the app loads, the shell sets two globals (see `src/host/hostContext.ts`):
+
+```js
+window.__PHONECONNECT_HOST__ = {
+  kind: "native",
+  serverUrl: "https://phoneconnect.example", // the URL the shell loaded
+  proxyCapabilities: [{ deviceId, stream, url }],
+};
+window.__PHONECONNECT_BRIDGE__ = {
+  openWindow(route) {},        // optional: separate OS window
+  setTrayStatus(status) {},    // optional: tray label/health/detail
+  localEndpoints() {},         // optional: loopback endpoints currently exposed
+  notify({ title, body }) {},  // optional: OS notification
+};
+```
+
+The bridge is read at call time, so a shell may install it after page load. The page never
+reads a privileged credential from this object: server authentication is the same cookie or
+token a browser uses.

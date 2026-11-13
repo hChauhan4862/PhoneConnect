@@ -1,0 +1,63 @@
+import type { ApiClient } from "../api";
+import { useResource } from "../data/useResource";
+import { DeviceIdentity } from "../components/DeviceIdentity";
+import { ErrorNotice } from "../components/ErrorNotice";
+import { HostActions } from "../components/HostActions";
+import { LeasePanel } from "../components/LeasePanel";
+import { RouteLink } from "../components/RouteLink";
+import { SessionPanel } from "../components/SessionPanel";
+import { TelemetryPanel } from "../components/TelemetryPanel";
+
+export function DeviceStatusRoute({
+  api,
+  deviceId,
+  userId,
+}: {
+  api: ApiClient;
+  deviceId: string;
+  userId: string;
+}) {
+  const resource = useResource(`status:${deviceId}:${userId}`, () =>
+    api.deviceStatus(deviceId, userId),
+  );
+
+  if (resource.error) {
+    return (
+      <>
+        <nav>
+          <RouteLink to="/">Devices</RouteLink>
+        </nav>
+        <ErrorNotice error={resource.error} onRetry={resource.reload} />
+      </>
+    );
+  }
+  if (resource.loading && !resource.data) {
+    return <p>Loading device status…</p>;
+  }
+  const status = resource.data;
+  if (!status) return null;
+
+  return (
+    <>
+      <nav>
+        <RouteLink to="/">Devices</RouteLink>
+      </nav>
+      <DeviceIdentity device={status.device} />
+      <div className="actions">
+        <button type="button" onClick={resource.reload}>
+          Refresh status
+        </button>
+      </div>
+      <SessionPanel session={status.session} />
+      <LeasePanel
+        api={api}
+        deviceId={status.device.device_id}
+        userId={userId}
+        status={status.lease}
+        onChanged={resource.reload}
+      />
+      <TelemetryPanel telemetry={status.telemetry} />
+      <HostActions deviceId={status.device.device_id} />
+    </>
+  );
+}

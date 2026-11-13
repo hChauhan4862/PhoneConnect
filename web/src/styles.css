@@ -1,0 +1,151 @@
+/* A small, readable status surface. The UI stays deliberately plain: this milestone is the
+   status/lease/telemetry surface plus the host adapter foundation, not the full dashboard. */
+
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  --border: #d8dbe0;
+  --muted: #5f6673;
+  --error-bg: #fdecec;
+  --error-border: #e4a3a3;
+}
+
+body {
+  margin: 0;
+  background: canvas;
+  color: canvastext;
+}
+
+.app {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.shell-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+}
+
+.shell-header strong {
+  flex: 1;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.panel h1,
+.panel h2 {
+  margin-top: 0;
+}
+
+dl {
+  margin: 0;
+}
+
+.field {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.125rem 0;
+}
+
+.field dt {
+  min-width: 9rem;
+  color: var(--muted);
+}
+
+.field dd {
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: transparent;
+  color: inherit;
+}
+
+label {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+form {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 24rem;
+}
+
+.device-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.device-list li {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.notice {
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+}
+
+.notice-error {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+}
+
+nav {
+  margin-bottom: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --border: #3a3f47;
+    --muted: #a5acb8;
+    --error-bg: #3a1f1f;
+    --error-border: #7a3b3b;
+  }
+}

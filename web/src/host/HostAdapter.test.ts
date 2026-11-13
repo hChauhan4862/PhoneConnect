@@ -1,0 +1,156 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { createHostAdapter } from "./HostAdapter";
+import {
+  HOST_BRIDGE_GLOBAL,
+  HOST_CONTEXT_GLOBAL,
+  IN_PAGE_NOTIFICATION_EVENT,
+  readHostContext,
+  type NativeHostContext,
+} from "./hostContext";
+
+type HostGlobals = Record<string, unknown>;
+const globalsWindow = window as unknown as HostGlobals;
+
+const nativeContext: NativeHostContext = {
+  kind: "native",
+  serverUrl: "https://phoneconnect.example",
+  proxyCapabilities: [
+    { deviceId: "dev_1", stream: "proxy", url: "http://127.0.0.1:49152" },
+  ],
+};
+
+function installBridge(bridge: HostGlobals): void {
+  globalsWindow[HOST_BRIDGE_GLOBAL] = bridge;
+}
+
+afterEach(() => {
+  delete globalsWindow[HOST_CONTEXT_GLOBAL];
+  delete globalsWindow[HOST_BRIDGE_GLOBAL];
+  window.history.replaceState({}, "", "/");
+});
+
+describe("createHostAdapter", () => {
+  it("is a browser host when the shell injected nothing", () => {
+    expect(createHostAdapter().kind).toBe("browser");
+    expect(createHostAdapter(undefined).kind).toBe("browser");
+  });
+
+  it("is a native host when the shell injected a host context", () => {
+    expect(createHostAdapter(nativeContext).kind).toBe("native");
+  });
+
+  it("reads the injected context from the window and ignores a malformed one", () => {
+    globalsWindow[HOST_CONTEXT_GLOBAL] = {
+      kind: "native",
+      serverUrl: "https://phoneconnect.example",
+      proxyCapabilities: [],
+    };
+    expect(readHostContext()).toEqual({
+      kind: "native",
+      serverUrl: "https://phoneconnect.example",
+      proxyCapabilities: [],
+    });
+    expect(createHostAdapter(readHostContext()).kind).toBe("native");
+
+    globalsWindow[HOST_CONTEXT_GLOBAL] = { kind: "native" };
+    expect(readHostContext()).toBeUndefined();
+    expect(createHostAdapter(readHostContext()).kind).toBe("browser");
+  });
+});
+
+describe("browserHost", () => {
+  it("navigates in the SPA and ignores detached", async () => {
+    const openWindow = vi.fn();
+    installBridge({ openWindow });
+    const host = createHostAdapter();
+
+    await host.openView("/devices/dev_1", { detached: true });
+    await host.openView("/devices/dev_1/telemetry", { detached: false });
+
+    expect(window.location.pathname).toBe("/devices/dev_1/telemetry");
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it("shows a notification in the page because a browser has no OS tray", async () => {
+    const host = createHostAdapter();
+    const received = vi.fn();
+    window.addEventListener(IN_PAGE_NOTIFICATION_EVENT, received);
+
+    await host.notify({ title: "Lease revoked", body: "Control returned to the owner" });
+
+    expect(received).toHaveBeenCalledTimes(1);
+    const event = received.mock.calls[0][0] as CustomEvent;
+    expect(event.detail).toEqual({
+      title: "Lease revoked",
+      body: "Control returned to the owner",
+    });
+    window.removeEventListener(IN_PAGE_NOTIFICATION_EVENT, received);
+  });
+
+  it("degrades tray state and local endpoints to explicit no-ops", async () => {
+    const host = createHostAdapter();
+    await expect(
+      host.setTrayStatus({ label: "PhoneConnect", health: "connected" }),
+    ).resolves.toBeUndefined();
+    await expect(host.localEndpoints()).resolves.toEqual([]);
+  });
+});
+
+describe("nativeHost", () => {
+  it("opens exactly one detached OS window for a long-lived view", async () => {
+    const openWindow = vi.fn(async () => {});
+    installBridge({ openWindow });
+    const host = createHostAdapter(nativeContext);
+
+    await host.openView("/devices/dev_1/telemetry", { detached: true });
+
+    expect(openWindow).toHaveBeenCalledTimes(1);
+    expect(openWindow).toHaveBeenCalledWith("/devices/dev_1/telemetry");
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("navigates the embedded webview for an in-page view", async () => {
+    const openWindow = vi.fn();
+    installBridge({ openWindow });
+    const host = createHostAdapter(nativeContext);
+
+    await host.openView("/devices/dev_1", { detached: false });
+
+    expect(window.location.pathname).toBe("/devices/dev_1");
+    expect(openWindow).not.toHaveBeenCalled();
+  });
+
+  it("degrades a detached view to in-page navigation when the bridge lacks it", async () => {
+    const host = createHostAdapter(nativeContext);
+
+    await host.openView("/devices/dev_1", { detached: true });
+
+    expect(window.location.pathname).toBe("/devices/dev_1");
+  });
+
+  it("forwards tray state, notifications, and local endpoints", async () => {
+    const setTrayStatus = vi.fn(async () => {});
+    const notify = vi.fn(async () => {});
+    installBridge({ setTrayStatus, notify });
+    const host = createHostAdapter(nativeContext);
+
+    await host.setTrayStatus({ label: "dev_1", health: "degraded", detail: "relay" });
+    await host.notify({ title: "Stale", body: "No telemetry for 5 minutes" });
+
+    expect(setTrayStatus).toHaveBeenCalledTimes(1);
+    expect(setTrayStatus).toHaveBeenCalledWith({
+      label: "dev_1",
+      health: "degraded",
+      detail: "relay",
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith({
+      title: "Stale",
+      body: "No telemetry for 5 minutes",
+    });
+    await expect(host.localEndpoints()).resolves.toEqual(
+      nativeContext.proxyCapabilities,
+    );
+  });
+});

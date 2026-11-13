@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Milliseconds since the Unix epoch.
@@ -133,6 +134,80 @@ impl SessionRecord {
     }
 }
 
+/// Why a control lease stopped being active. Recorded so a revoked lease keeps the reason
+/// the holder and every affected client see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseRevocationReason {
+    /// The owner or holder revoked it explicitly.
+    Revoked,
+    /// The owner or holder handed control to another user.
+    Handoff,
+}
+
+impl LeaseRevocationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Revoked => "revoked",
+            Self::Handoff => "handoff",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "revoked" => Some(Self::Revoked),
+            "handoff" => Some(Self::Handoff),
+            _ => None,
+        }
+    }
+}
+
+/// One user's control of one device. A device has at most one active lease, and an active
+/// lease is the only thing that authorizes control commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlLease {
+    pub lease_id: String,
+    pub device_id: String,
+    /// The device owner, who is the authority that grants and revokes control.
+    pub owner_id: String,
+    /// The user who currently controls the device.
+    pub holder_id: String,
+    /// The owner or holder that made this grant.
+    pub granted_by: String,
+    pub acquired_at_ms: UnixMs,
+    pub expires_at_ms: UnixMs,
+    pub revoked_at_ms: Option<UnixMs>,
+    pub revoked_reason: Option<LeaseRevocationReason>,
+}
+
+impl ControlLease {
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at_ms.is_some()
+    }
+
+    pub fn is_expired(&self, now_ms: UnixMs) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+
+    pub fn is_active(&self, now_ms: UnixMs) -> bool {
+        !self.is_revoked() && !self.is_expired(now_ms)
+    }
+}
+
+/// How many stale records one retention run deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RetentionCounts {
+    pub sessions_deleted: usize,
+    pub leases_deleted: usize,
+    pub lease_links_deleted: usize,
+}
+
+impl RetentionCounts {
+    pub fn total(&self) -> usize {
+        self.sessions_deleted + self.leases_deleted + self.lease_links_deleted
+    }
+}
+
 /// Explicit persistence failures. Uniqueness, expiry, and one-time use are store-level
 /// decisions so callers cannot skip them.
 #[derive(Debug, Error)]
@@ -151,6 +226,10 @@ pub enum StoreError {
     DeviceRevoked { device_id: String },
     #[error("session {session_id} is unknown")]
     UnknownSession { session_id: String },
+    #[error("control lease {lease_id} is unknown")]
+    UnknownLease { lease_id: String },
+    #[error("device {device_id} already has an active control lease")]
+    LeaseHeld { device_id: String },
     #[error("storage backend failed: {0}")]
     Backend(String),
 }
@@ -213,6 +292,13 @@ pub trait DeviceStore: Send + Sync {
         now_ms: UnixMs,
     ) -> Result<Option<SessionRecord>, StoreError>;
 
+    /// Newest session for `device_id`, whatever its state. The status surface uses it to
+    /// report an expired or revoked session explicitly instead of claiming there was none.
+    async fn newest_session_for_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<SessionRecord>, StoreError>;
+
     /// Looks a session up by capability hash. `Ok(None)` means no session holds that hash.
     async fn session_by_capability(
         &self,
@@ -220,6 +306,72 @@ pub trait DeviceStore: Send + Sync {
     ) -> Result<Option<SessionRecord>, StoreError>;
 
     async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
+
+    /// Every enrolled device, oldest first. The status surface lists devices; it never
+    /// exposes credentials.
+    async fn devices(&self) -> Result<Vec<DeviceRecord>, StoreError>;
+
+    /// Inserts `lease` only if its device has no active lease at `lease.acquired_at_ms`.
+    /// The check and the insert are one transaction, so two concurrent grants cannot both
+    /// win.
+    async fn insert_lease_if_free(&self, lease: ControlLease) -> Result<(), StoreError>;
+
+    async fn lease(&self, lease_id: &str) -> Result<ControlLease, StoreError>;
+
+    /// The lease that is neither revoked nor expired at `now_ms`, if any.
+    async fn active_lease(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Option<ControlLease>, StoreError>;
+
+    /// The newest lease for `device_id`, active or not. This is how an expired grant is
+    /// told apart from one that never existed.
+    async fn latest_lease(&self, device_id: &str) -> Result<Option<ControlLease>, StoreError>;
+
+    /// Revokes one lease and returns when revocation took effect. Idempotent: revoking
+    /// twice keeps the first time and the first reason.
+    async fn revoke_lease(
+        &self,
+        lease_id: &str,
+        now_ms: UnixMs,
+        reason: LeaseRevocationReason,
+    ) -> Result<UnixMs, StoreError>;
+
+    /// Revokes the device's active lease, if any, and inserts `lease` in one transaction,
+    /// returning the replaced lease. Handoff is atomic, so control is never unowned.
+    async fn replace_lease(
+        &self,
+        lease: ControlLease,
+        now_ms: UnixMs,
+        reason: LeaseRevocationReason,
+    ) -> Result<Option<ControlLease>, StoreError>;
+
+    /// Associates a session with the lease that authorized it. A control session's
+    /// capability is exactly this link, which is what revocation invalidates.
+    async fn link_session_to_lease(
+        &self,
+        lease_id: &str,
+        session_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<(), StoreError>;
+
+    /// The lease that authorized `session_id`, if it is a control session.
+    async fn lease_for_session(&self, session_id: &str) -> Result<Option<String>, StoreError>;
+
+    /// Revokes every live session linked to `lease_id` and returns their ids.
+    async fn revoke_sessions_for_lease(
+        &self,
+        lease_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Deletes session records, leases, and lease links that ended before `cutoff_ms`.
+    /// This is the retention primitive; it decides nothing about the retention window.
+    async fn delete_records_older_than(
+        &self,
+        cutoff_ms: UnixMs,
+    ) -> Result<RetentionCounts, StoreError>;
 }
 
 const SCHEMA: &str = "
@@ -248,6 +400,25 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
     revoked_at_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS control_leases (
+    lease_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    owner_id TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    acquired_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    revoked_at_ms INTEGER,
+    revoked_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS control_leases_by_device
+    ON control_leases(device_id, revoked_at_ms, expires_at_ms);
+CREATE TABLE IF NOT EXISTS lease_sessions (
+    lease_id TEXT NOT NULL REFERENCES control_leases(lease_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    linked_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (lease_id, session_id)
 );
 ";
 
@@ -589,6 +760,25 @@ impl DeviceStore for SqliteStore {
         })
     }
 
+    async fn newest_session_for_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<SessionRecord>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "{SESSION_SELECT} WHERE s.device_id = ?1
+                         ORDER BY s.created_at_ms DESC, s.session_id DESC LIMIT 1"
+                    ),
+                    params![device_id],
+                    session_from_row,
+                )
+                .optional()
+                .map_err(backend_error)
+        })
+    }
+
     async fn session_by_capability(
         &self,
         capability_hash: &str,
@@ -632,6 +822,298 @@ impl DeviceStore for SqliteStore {
             Ok(now_ms)
         })
     }
+
+    async fn devices(&self) -> Result<Vec<DeviceRecord>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT device_id, owner_id, credential_hash, identity_public_key,
+                            enrolled_at_ms, revoked_at_ms
+                     FROM devices ORDER BY enrolled_at_ms, device_id",
+                )
+                .map_err(backend_error)?;
+            let devices = statement
+                .query_map([], device_from_row)
+                .map_err(backend_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend_error)?;
+            Ok(devices)
+        })
+    }
+
+    async fn insert_lease_if_free(&self, lease: ControlLease) -> Result<(), StoreError> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let held = active_lease_row(&transaction, &lease.device_id, lease.acquired_at_ms)?;
+            if held.is_some() {
+                return Err(StoreError::LeaseHeld {
+                    device_id: lease.device_id,
+                });
+            }
+            insert_lease_row(&transaction, &lease)?;
+            transaction.commit().map_err(backend_error)?;
+            Ok(())
+        })
+    }
+
+    async fn lease(&self, lease_id: &str) -> Result<ControlLease, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!("{LEASE_SELECT} WHERE lease_id = ?1"),
+                    params![lease_id],
+                    lease_from_row,
+                )
+                .optional()
+                .map_err(backend_error)?
+                .ok_or_else(|| StoreError::UnknownLease {
+                    lease_id: lease_id.to_owned(),
+                })
+        })
+    }
+
+    async fn active_lease(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Option<ControlLease>, StoreError> {
+        self.with_connection(|connection| active_lease_row(connection, device_id, now_ms))
+    }
+
+    async fn latest_lease(&self, device_id: &str) -> Result<Option<ControlLease>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "{LEASE_SELECT} WHERE device_id = ?1
+                         ORDER BY acquired_at_ms DESC, lease_id DESC LIMIT 1"
+                    ),
+                    params![device_id],
+                    lease_from_row,
+                )
+                .optional()
+                .map_err(backend_error)
+        })
+    }
+
+    async fn revoke_lease(
+        &self,
+        lease_id: &str,
+        now_ms: UnixMs,
+        reason: LeaseRevocationReason,
+    ) -> Result<UnixMs, StoreError> {
+        self.with_connection(|connection| {
+            let existing = connection
+                .query_row(
+                    "SELECT revoked_at_ms FROM control_leases WHERE lease_id = ?1",
+                    params![lease_id],
+                    |row| row.get::<_, Option<UnixMs>>(0),
+                )
+                .optional()
+                .map_err(backend_error)?;
+            let Some(revoked_at_ms) = existing else {
+                return Err(StoreError::UnknownLease {
+                    lease_id: lease_id.to_owned(),
+                });
+            };
+            if let Some(revoked_at_ms) = revoked_at_ms {
+                return Ok(revoked_at_ms);
+            }
+            connection
+                .execute(
+                    "UPDATE control_leases SET revoked_at_ms = ?1, revoked_reason = ?2
+                     WHERE lease_id = ?3",
+                    params![now_ms, reason.as_str(), lease_id],
+                )
+                .map_err(backend_error)?;
+            Ok(now_ms)
+        })
+    }
+
+    async fn replace_lease(
+        &self,
+        lease: ControlLease,
+        now_ms: UnixMs,
+        reason: LeaseRevocationReason,
+    ) -> Result<Option<ControlLease>, StoreError> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let previous = active_lease_row(&transaction, &lease.device_id, now_ms)?;
+            if let Some(previous) = previous.as_ref() {
+                transaction
+                    .execute(
+                        "UPDATE control_leases SET revoked_at_ms = ?1, revoked_reason = ?2
+                         WHERE lease_id = ?3",
+                        params![now_ms, reason.as_str(), previous.lease_id],
+                    )
+                    .map_err(backend_error)?;
+            }
+            insert_lease_row(&transaction, &lease)?;
+            transaction.commit().map_err(backend_error)?;
+            Ok(previous)
+        })
+    }
+
+    async fn link_session_to_lease(
+        &self,
+        lease_id: &str,
+        session_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<(), StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO lease_sessions (lease_id, session_id, linked_at_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![lease_id, session_id, now_ms],
+                )
+                .map_err(backend_error)?;
+            Ok(())
+        })
+    }
+
+    async fn lease_for_session(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT lease_id FROM lease_sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(backend_error)
+        })
+    }
+
+    async fn revoke_sessions_for_lease(
+        &self,
+        lease_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let session_ids = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT s.session_id FROM sessions s
+                         JOIN lease_sessions l ON l.session_id = s.session_id
+                         WHERE l.lease_id = ?1 AND s.revoked_at_ms IS NULL",
+                    )
+                    .map_err(backend_error)?;
+                statement
+                    .query_map(params![lease_id], |row| row.get::<_, String>(0))
+                    .map_err(backend_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(backend_error)?
+            };
+            for session_id in &session_ids {
+                transaction
+                    .execute(
+                        "UPDATE sessions SET revoked_at_ms = ?1 WHERE session_id = ?2",
+                        params![now_ms, session_id],
+                    )
+                    .map_err(backend_error)?;
+            }
+            transaction.commit().map_err(backend_error)?;
+            Ok(session_ids)
+        })
+    }
+
+    async fn delete_records_older_than(
+        &self,
+        cutoff_ms: UnixMs,
+    ) -> Result<RetentionCounts, StoreError> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let lease_links_deleted = transaction
+                .execute(
+                    "DELETE FROM lease_sessions
+                     WHERE session_id IN (SELECT session_id FROM sessions WHERE expires_at_ms < ?1)
+                        OR lease_id IN (SELECT lease_id FROM control_leases WHERE expires_at_ms < ?1)",
+                    params![cutoff_ms],
+                )
+                .map_err(backend_error)?;
+            let sessions_deleted = transaction
+                .execute(
+                    "DELETE FROM sessions WHERE expires_at_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(backend_error)?;
+            let leases_deleted = transaction
+                .execute(
+                    "DELETE FROM control_leases WHERE expires_at_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(backend_error)?;
+            transaction.commit().map_err(backend_error)?;
+            Ok(RetentionCounts {
+                sessions_deleted,
+                leases_deleted,
+                lease_links_deleted,
+            })
+        })
+    }
+}
+
+const LEASE_SELECT: &str = "SELECT lease_id, device_id, owner_id, holder_id, granted_by,
+                                   acquired_at_ms, expires_at_ms, revoked_at_ms, revoked_reason
+                            FROM control_leases";
+
+fn lease_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlLease> {
+    let reason: Option<String> = row.get(8)?;
+    Ok(ControlLease {
+        lease_id: row.get(0)?,
+        device_id: row.get(1)?,
+        owner_id: row.get(2)?,
+        holder_id: row.get(3)?,
+        granted_by: row.get(4)?,
+        acquired_at_ms: row.get(5)?,
+        expires_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+        revoked_reason: reason.as_deref().and_then(LeaseRevocationReason::parse),
+    })
+}
+
+fn active_lease_row(
+    connection: &Connection,
+    device_id: &str,
+    now_ms: UnixMs,
+) -> Result<Option<ControlLease>, StoreError> {
+    connection
+        .query_row(
+            &format!(
+                "{LEASE_SELECT} WHERE device_id = ?1 AND revoked_at_ms IS NULL
+                 AND expires_at_ms > ?2
+                 ORDER BY acquired_at_ms DESC, lease_id DESC LIMIT 1"
+            ),
+            params![device_id, now_ms],
+            lease_from_row,
+        )
+        .optional()
+        .map_err(backend_error)
+}
+
+fn insert_lease_row(connection: &Connection, lease: &ControlLease) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "INSERT INTO control_leases
+             (lease_id, device_id, owner_id, holder_id, granted_by, acquired_at_ms,
+              expires_at_ms, revoked_at_ms, revoked_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                lease.lease_id,
+                lease.device_id,
+                lease.owner_id,
+                lease.holder_id,
+                lease.granted_by,
+                lease.acquired_at_ms,
+                lease.expires_at_ms,
+                lease.revoked_at_ms,
+                lease.revoked_reason.map(LeaseRevocationReason::as_str),
+            ],
+        )
+        .map_err(backend_error)?;
+    Ok(())
 }
 
 fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {

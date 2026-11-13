@@ -30,6 +30,7 @@ use crate::auth::{
     AuthError, IdentityKeyError, SESSION_CAPABILITY_PREFIX, bearer_token, generate_secret,
     hash_secret, normalize_identity_key,
 };
+use crate::leases::{ControlLease, LeaseError};
 use crate::relay::PeerRole;
 use crate::store::{SessionRecord, StoreError, UnixMs};
 use crate::{ApiJson, AppState};
@@ -447,6 +448,21 @@ pub struct ObservedEndpoint {
     pub nonce: String,
 }
 
+/// What the server can honestly say about a session's path: whether each peer published a
+/// probe target, and whether the relay is carrying peers. The peers themselves choose the
+/// lowest-latency validated path, so the server reports evidence, never a guessed choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PathEvidence {
+    pub device_endpoint: bool,
+    pub client_endpoint: bool,
+}
+
+impl PathEvidence {
+    pub fn supports_direct(self) -> bool {
+        self.device_endpoint && self.client_endpoint
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RendezvousError {
     #[error("random source failed: {0}")]
@@ -545,11 +561,13 @@ impl Rendezvous {
             .redeem(ticket, &session.session_id, role, now_ms)?;
         let normalized = match endpoint.map(str::trim).filter(|value| !value.is_empty()) {
             None => None,
-            Some(endpoint) => Some(normalize_endpoint(endpoint).ok_or_else(|| {
-                TicketError::InvalidNonce {
-                    nonce: ticket.nonce.clone(),
-                }
-            })?),
+            Some(endpoint) => {
+                Some(
+                    normalize_endpoint(endpoint).ok_or_else(|| TicketError::InvalidNonce {
+                        nonce: ticket.nonce.clone(),
+                    })?,
+                )
+            }
         };
         {
             let mut entries = self.observed();
@@ -566,6 +584,19 @@ impl Rendezvous {
             );
         }
         Ok(self.candidates(session, role, now_ms))
+    }
+
+    /// Whether each peer of `session_id` published an endpoint to probe directly.
+    pub fn path_evidence(&self, session_id: &str, now_ms: UnixMs) -> PathEvidence {
+        let published = |role: PeerRole| {
+            self.observed_endpoint(session_id, role, now_ms)
+                .and_then(|observed| observed.endpoint)
+                .is_some()
+        };
+        PathEvidence {
+            device_endpoint: published(PeerRole::Device),
+            client_endpoint: published(PeerRole::Client),
+        }
     }
 
     fn observed_endpoint(
@@ -616,6 +647,13 @@ pub struct CreateSessionRequest {
     /// pin for this milestone. The private half never leaves the client.
     #[serde(default)]
     pub client_identity_key: String,
+    /// Requests a control stream. Control needs an active lease held by `user_id`; the
+    /// default read-only session does not.
+    #[serde(default)]
+    pub control: bool,
+    /// The user the client acts as. Required when `control` is true.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// Capability and rendezvous ticket handed to the peer that created the session.
@@ -678,6 +716,10 @@ pub enum SessionError {
     IdentityKeyInvalid,
     #[error("device {device_id} has no identity key; it must be re-enrolled")]
     DeviceIdentityMissing { device_id: String },
+    #[error("a control session requires user_id")]
+    UserIdRequired,
+    #[error(transparent)]
+    Lease(#[from] LeaseError),
     #[error("credential is not for device {device_id}")]
     DeviceScopeMismatch { device_id: String },
     #[error(transparent)]
@@ -697,6 +739,8 @@ impl IntoResponse for SessionError {
             Self::IdentityKeyMissing => (StatusCode::BAD_REQUEST, "identity_key_required"),
             Self::IdentityKeyInvalid => (StatusCode::BAD_REQUEST, "invalid_identity_key"),
             Self::DeviceIdentityMissing { .. } => (StatusCode::CONFLICT, "device_identity_missing"),
+            Self::UserIdRequired => (StatusCode::BAD_REQUEST, "user_id_required"),
+            Self::Lease(error) => return error.clone().into_response(),
             Self::DeviceScopeMismatch { .. } => (StatusCode::FORBIDDEN, "device_scope_mismatch"),
             Self::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store_failure"),
             Self::Rendezvous(_) => (StatusCode::INTERNAL_SERVER_ERROR, "random_source_failed"),
@@ -743,6 +787,29 @@ pub async fn create_session(
     )?;
 
     let now = state.now_ms();
+    // A control stream is authorized by the control lease, not by the admin token alone:
+    // a secondary viewer may read but never command.
+    let control_lease: Option<ControlLease> = if request.control {
+        let user_id = request
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(SessionError::UserIdRequired)?;
+        Some(
+            state
+                .leases
+                .authorize_control(&device.device_id, user_id)
+                .await?,
+        )
+    } else {
+        None
+    };
+    // A control session never outlives the lease that authorized it.
+    let expires_at_ms = match control_lease.as_ref() {
+        Some(lease) => (now + SESSION_TTL_MS).min(lease.expires_at_ms),
+        None => now + SESSION_TTL_MS,
+    };
     let session_id = format!("{SESSION_ID_PREFIX}{}", random_component()?);
     // The capability is returned to the caller but only its hash is persisted.
     let capability = generate_secret(SESSION_CAPABILITY_PREFIX)?;
@@ -754,10 +821,16 @@ pub async fn create_session(
         client_identity_key,
         device_identity_key: device.identity_public_key.clone(),
         created_at_ms: now,
-        expires_at_ms: now + SESSION_TTL_MS,
+        expires_at_ms,
         revoked_at_ms: None,
     };
     state.store.insert_session(session.clone()).await?;
+    if let Some(lease) = control_lease {
+        state
+            .store
+            .link_session_to_lease(&lease.lease_id, &session.session_id, now)
+            .await?;
+    }
 
     let ticket = state.rendezvous.ticket(&session, PeerRole::Client, now)?;
     Ok((
@@ -813,9 +886,7 @@ pub async fn device_session(
     else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let ticket = state
-        .rendezvous
-        .ticket(&session, PeerRole::Device, now)?;
+    let ticket = state.rendezvous.ticket(&session, PeerRole::Device, now)?;
     Ok(Json(DeviceSession {
         session_id: session.session_id,
         expires_at: session.expires_at_ms,

@@ -272,4 +272,119 @@ impl TestApp {
         )
         .await
     }
+
+    /// `POST /api/devices/{id}/lease`: the owner (or a grantee) acquires control.
+    pub async fn acquire_lease(
+        &self,
+        device_id: &str,
+        actor_id: &str,
+        expires_in_seconds: i64,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/lease"),
+            Some(ADMIN_TOKEN),
+            Some(json!({ "actor_id": actor_id, "expires_in_seconds": expires_in_seconds })),
+        )
+        .await
+    }
+
+    /// `POST /api/devices/{id}/lease/handoff`: explicit transfer of control.
+    pub async fn handoff_lease(
+        &self,
+        device_id: &str,
+        actor_id: &str,
+        to_user_id: &str,
+        expires_in_seconds: i64,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/lease/handoff"),
+            Some(ADMIN_TOKEN),
+            Some(json!({
+                "actor_id": actor_id,
+                "to_user_id": to_user_id,
+                "expires_in_seconds": expires_in_seconds
+            })),
+        )
+        .await
+    }
+
+    /// `POST /api/leases/{id}/revoke`: immediate revocation of one lease.
+    pub async fn revoke_lease(&self, lease_id: &str, actor_id: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/leases/{lease_id}/revoke"),
+            Some(ADMIN_TOKEN),
+            Some(json!({ "actor_id": actor_id })),
+        )
+        .await
+    }
+
+    /// `GET /api/devices/{id}/lease?user_id=...`: the active lease and one user's access.
+    pub async fn lease_status(&self, device_id: &str, user_id: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/api/devices/{device_id}/lease?user_id={user_id}"),
+            Some(ADMIN_TOKEN),
+            None,
+        )
+        .await
+    }
+
+    /// `POST /api/sessions` with `control: true`: a control stream needs a live lease.
+    pub async fn create_control_session(
+        &self,
+        device_id: &str,
+        user_id: &str,
+        client_identity_key: &str,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            "/api/sessions",
+            Some(ADMIN_TOKEN),
+            Some(json!({
+                "device_id": device_id,
+                "client_identity_key": client_identity_key,
+                "control": true,
+                "user_id": user_id
+            })),
+        )
+        .await
+    }
+
+    /// `POST /api/devices/{id}/telemetry` as the device itself.
+    pub async fn ingest_telemetry(
+        &self,
+        device_id: &str,
+        device_credential: &str,
+        battery_percent: u8,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/telemetry"),
+            Some(device_credential),
+            Some(json!({
+                "sampled_at_ms": self.now(),
+                "battery_percent": battery_percent,
+                "cpu_percent": 12.5,
+                "memory_used_bytes": 1_048_576,
+                "memory_total_bytes": 8_388_608,
+                "battery_charging": true,
+                "connectivity": "wifi"
+            })),
+        )
+        .await
+    }
+
+    /// `GET /api/devices/{id}/status?user_id=...`: the status surface the web UI renders.
+    pub async fn device_status(&self, device_id: &str, user_id: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/api/devices/{device_id}/status?user_id={user_id}"),
+            Some(ADMIN_TOKEN),
+            None,
+        )
+        .await
+    }
 }

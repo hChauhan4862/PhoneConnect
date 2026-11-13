@@ -14,7 +14,7 @@
 //! later direct-path work can reuse them without weakening either.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -117,6 +117,8 @@ pub enum RelayClose {
     SessionRevoked,
     #[error("the device that owns the session was revoked: {device_id}")]
     DeviceRevoked { device_id: String },
+    #[error("the control lease that authorized the session was revoked: {lease_id}")]
+    LeaseRevoked { lease_id: String },
     #[error("peer closed its sending direction")]
     PeerClosed,
     #[error("malformed frame: {reason}")]
@@ -267,6 +269,7 @@ impl Relay {
             Arc::clone(sessions.get(session_id).ok_or(RelayClose::UnknownSession)?)
         };
         session.check_live().await?;
+        session.attach_peer();
         Ok(RelayPeer { session, role })
     }
 
@@ -298,6 +301,14 @@ impl Relay {
         }
     }
 
+    /// Whether any peer has attached to `session_id`, i.e. the session is carrying (or
+    /// waiting to carry) relay traffic rather than only direct-path candidates.
+    pub fn has_attached_session(&self, session_id: &str) -> bool {
+        self.sessions()
+            .get(session_id)
+            .is_some_and(|session| session.has_peers())
+    }
+
     fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<RelaySession>>> {
         self.sessions
             .lock()
@@ -309,6 +320,12 @@ impl Relay {
 pub struct RelayPeer {
     session: Arc<RelaySession>,
     role: PeerRole,
+}
+
+impl Drop for RelayPeer {
+    fn drop(&mut self) {
+        self.session.detach_peer();
+    }
 }
 
 impl std::fmt::Debug for RelayPeer {
@@ -442,6 +459,7 @@ struct RelaySession {
     to_device: Arc<Direction>,
     to_client: Arc<Direction>,
     used_bytes: AtomicU64,
+    attached_peers: AtomicUsize,
     closed: watch::Sender<Option<RelayClose>>,
     authorization: Mutex<Option<CachedAuthorization>>,
 }
@@ -471,9 +489,22 @@ impl RelaySession {
             to_device: Arc::new(Direction::new(limits)),
             to_client: Arc::new(Direction::new(limits)),
             used_bytes: AtomicU64::new(0),
+            attached_peers: AtomicUsize::new(0),
             closed,
             authorization: Mutex::new(None),
         }
+    }
+
+    fn attach_peer(&self) {
+        self.attached_peers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn detach_peer(&self) {
+        self.attached_peers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn has_peers(&self) -> bool {
+        self.attached_peers.load(Ordering::SeqCst) > 0
     }
 
     fn refresh_expiry(&self, expires_at_ms: UnixMs) {
@@ -682,6 +713,7 @@ impl IntoResponse for RelayUpgradeError {
                     RelayClose::UnknownSession => (StatusCode::NOT_FOUND, "session_unknown"),
                     RelayClose::SessionExpired => (StatusCode::UNAUTHORIZED, "session_expired"),
                     RelayClose::SessionRevoked => (StatusCode::UNAUTHORIZED, "session_revoked"),
+                    RelayClose::LeaseRevoked { .. } => (StatusCode::UNAUTHORIZED, "lease_revoked"),
                     _ => (StatusCode::CONFLICT, "relay_unavailable"),
                 };
                 (status, Json(json!({ "error": code }))).into_response()
@@ -728,6 +760,7 @@ fn close_code(reason: &RelayClose) -> &'static str {
         RelayClose::SessionExpired => "session_expired",
         RelayClose::SessionRevoked => "session_revoked",
         RelayClose::DeviceRevoked { .. } => "device_revoked",
+        RelayClose::LeaseRevoked { .. } => "lease_revoked",
         RelayClose::PeerClosed => "peer_closed",
         RelayClose::MalformedFrame { .. } => "malformed_frame",
         RelayClose::TrailingBytes { .. } => "trailing_bytes",

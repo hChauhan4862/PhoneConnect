@@ -5,7 +5,8 @@ and Linux.
 
 Its intended responsibility is to open the server-served web UI URL in a webview, inject a
 documented host-context bridge (separate OS windows, tray state, notifications, local
-endpoints, external links), carry native transport when a peer is directly reachable,
+endpoints, external links) — the page-side contract is `web/README.md` and
+`web/src/host/hostContext.ts` — carry native transport when a peer is directly reachable,
 otherwise fall back to the authenticated server relay, allocate collision-safe loopback
 proxy ports per mapped stream, and verify/roll back its own updates.
 
