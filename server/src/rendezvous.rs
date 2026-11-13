@@ -627,6 +627,19 @@ pub struct IssuedTicket {
     pub verification_key: String,
 }
 
+/// The session a device should join, as `GET /api/devices/{id}/sessions/next` returns it.
+///
+/// The device credential proves which device is asking; the ticket is minted for the device
+/// role, so the peer identity and epoch nonces the device needs come from the server, and
+/// the device never has to know a client identifier or hold client privileges.
+#[derive(Debug, Serialize)]
+pub struct DeviceSession {
+    pub session_id: String,
+    pub expires_at: UnixMs,
+    pub ticket: RendezvousTicket,
+    pub verification_key: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
@@ -645,6 +658,8 @@ pub enum SessionError {
     IdentityKeyInvalid,
     #[error("device {device_id} has no identity key; it must be re-enrolled")]
     DeviceIdentityMissing { device_id: String },
+    #[error("credential is not for device {device_id}")]
+    DeviceScopeMismatch { device_id: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -662,6 +677,7 @@ impl IntoResponse for SessionError {
             Self::IdentityKeyMissing => (StatusCode::BAD_REQUEST, "identity_key_required"),
             Self::IdentityKeyInvalid => (StatusCode::BAD_REQUEST, "invalid_identity_key"),
             Self::DeviceIdentityMissing { .. } => (StatusCode::CONFLICT, "device_identity_missing"),
+            Self::DeviceScopeMismatch { .. } => (StatusCode::FORBIDDEN, "device_scope_mismatch"),
             Self::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store_failure"),
             Self::Rendezvous(_) => (StatusCode::INTERNAL_SERVER_ERROR, "random_source_failed"),
         };
@@ -752,6 +768,41 @@ pub async fn session_ticket(
         ticket,
         verification_key: state.rendezvous.tickets().verification_key().to_owned(),
     }))
+}
+
+/// `GET /api/devices/{id}/sessions/next`: the newest session a client authorized for this
+/// device, with a device-role ticket, or `204` when there is nothing to join.
+///
+/// Sessions are authorized by a user or client, never by the device itself; this route is
+/// how the enrolled device learns that one exists without holding any credential beyond its
+/// own. A device can only ever see its own sessions.
+pub async fn device_session(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, SessionError> {
+    let device = state.auth.require_device(&headers).await?;
+    if device.device_id != device_id {
+        return Err(SessionError::DeviceScopeMismatch { device_id });
+    }
+    let now = state.now_ms();
+    let Some(session) = state
+        .store
+        .latest_session_for_device(&device.device_id, now)
+        .await?
+    else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let ticket = state
+        .rendezvous
+        .ticket(&session, PeerRole::Device, now)?;
+    Ok(Json(DeviceSession {
+        session_id: session.session_id,
+        expires_at: session.expires_at_ms,
+        ticket,
+        verification_key: state.rendezvous.tickets().verification_key().to_owned(),
+    })
+    .into_response())
 }
 
 /// `GET /api/sessions/{id}/candidates`: authenticated endpoint candidates for one session.

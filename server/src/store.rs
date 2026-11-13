@@ -202,6 +202,17 @@ pub trait DeviceStore: Send + Sync {
 
     async fn session(&self, session_id: &str) -> Result<SessionRecord, StoreError>;
 
+    /// Newest session for `device_id` that is neither revoked nor expired at `now_ms`.
+    ///
+    /// This is how an enrolled device learns which session a client authorized for it: the
+    /// device credential authorizes only its own device, and a device never sees another
+    /// device's sessions. `Ok(None)` means there is nothing to join yet.
+    async fn latest_session_for_device(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Option<SessionRecord>, StoreError>;
+
     /// Looks a session up by capability hash. `Ok(None)` means no session holds that hash.
     async fn session_by_capability(
         &self,
@@ -553,6 +564,28 @@ impl DeviceStore for SqliteStore {
         })?;
         found.ok_or_else(|| StoreError::UnknownSession {
             session_id: session_id.to_owned(),
+        })
+    }
+
+    async fn latest_session_for_device(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+    ) -> Result<Option<SessionRecord>, StoreError> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!(
+                        "{SESSION_SELECT}
+                         WHERE s.device_id = ?1 AND s.revoked_at_ms IS NULL AND s.expires_at_ms > ?2
+                         ORDER BY s.created_at_ms DESC, s.session_id DESC
+                         LIMIT 1"
+                    ),
+                    params![device_id, now_ms],
+                    session_from_row,
+                )
+                .optional()
+                .map_err(backend_error)
         })
     }
 

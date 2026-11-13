@@ -149,6 +149,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/devices/{device_id}/revoke",
             post(admin::revoke_device),
         )
+        // A device credential learns which session a client authorized for it, with a
+        // device-role ticket. A device never sees another device's sessions.
+        .route(
+            "/api/devices/{device_id}/sessions/next",
+            get(rendezvous::device_session),
+        )
         .route("/api/sessions", post(rendezvous::create_session))
         .route(
             "/api/sessions/{session_id}/revoke",
