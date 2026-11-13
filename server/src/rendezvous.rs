@@ -433,12 +433,17 @@ impl RedeemedNonces {
     }
 }
 
-/// An endpoint the server observed for one peer of a session.
+/// What the server remembers about one peer's rendezvous registration.
+///
+/// The nonce and the endpoint are deliberately separate: a peer that only needs to publish
+/// its half of the connection epoch registers a nonce with no endpoint, and then no
+/// `server_observed` candidate is advertised to the opposite peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedEndpoint {
-    pub endpoint: String,
+    /// The endpoint the peer reported, if it reported one. `None` means "nonce only".
+    pub endpoint: Option<String>,
     pub observed_at_ms: UnixMs,
-    /// The redemption nonce of the ticket that registered this endpoint.
+    /// The redemption nonce of the ticket that registered this peer.
     pub nonce: String,
 }
 
@@ -497,10 +502,12 @@ impl Rendezvous {
     ) -> SessionCandidates {
         let mut candidates = Vec::new();
         let peer = self.observed_endpoint(&session.session_id, role.opposite(), now_ms);
-        if let Some(observed) = &peer {
+        // Only a peer that published an endpoint becomes a probe target. A nonce-only
+        // registration still supplies the epoch, which is all a relay-only session needs.
+        if let Some(endpoint) = peer.as_ref().and_then(|observed| observed.endpoint.clone()) {
             candidates.push(EndpointCandidate {
                 kind: CandidateKind::ServerObserved,
-                endpoint: observed.endpoint.clone(),
+                endpoint,
                 priority: 150,
             });
         }
@@ -518,24 +525,32 @@ impl Rendezvous {
         }
     }
 
-    /// Records the endpoint `role` reported for itself and returns that peer's view.
+    /// Records `role`'s redemption nonce, and its endpoint when it has one, then returns
+    /// that peer's view.
     ///
-    /// The ticket must redeem successfully first, so an unauthenticated or replayed
-    /// registration never becomes a candidate another peer is told to probe.
+    /// The ticket must redeem successfully first, so an unauthenticated, expired, revoked, or
+    /// replayed registration never publishes a nonce another peer would derive keys from. An
+    /// absent endpoint is valid: it publishes the nonce for the epoch without advertising a
+    /// probe target that does not exist.
     pub fn observe(
         &self,
         session: &SessionRecord,
         role: PeerRole,
         ticket: &RendezvousTicket,
-        endpoint: &str,
+        endpoint: Option<&str>,
         now_ms: UnixMs,
     ) -> Result<SessionCandidates, TicketError> {
         let verified = self
             .tickets
             .redeem(ticket, &session.session_id, role, now_ms)?;
-        let normalized = normalize_endpoint(endpoint).ok_or_else(|| TicketError::InvalidNonce {
-            nonce: ticket.nonce.clone(),
-        })?;
+        let normalized = match endpoint.map(str::trim).filter(|value| !value.is_empty()) {
+            None => None,
+            Some(endpoint) => Some(normalize_endpoint(endpoint).ok_or_else(|| {
+                TicketError::InvalidNonce {
+                    nonce: ticket.nonce.clone(),
+                }
+            })?),
+        };
         {
             let mut entries = self.observed();
             entries.retain(|(session_id, _), value| {
@@ -614,10 +629,15 @@ pub struct IssuedSession {
 }
 
 /// Body of `POST /api/sessions/{id}/candidates`.
+///
+/// `endpoint` is optional: a peer with no direct path publishes its redemption nonce only, so
+/// the opposite peer still learns its half of the epoch but is never told to probe an address
+/// that cannot answer.
 #[derive(Debug, Deserialize)]
 pub struct ObserveRequest {
     pub ticket: RendezvousTicket,
-    pub endpoint: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// One peer's ticket, for the device that did not create the session.
@@ -819,8 +839,10 @@ pub async fn session_candidates(
     )))
 }
 
-/// `POST /api/sessions/{id}/candidates`: report the endpoint this peer observed for
-/// itself, redeeming a ticket, and receive the candidates for the opposite peer.
+/// `POST /api/sessions/{id}/candidates`: redeem a ticket and publish this peer's redemption
+/// nonce, with an endpoint when it has one, returning the candidates for the opposite peer.
+///
+/// The ticket is single-use here, never on the read-only `GET`, so a poll never burns it.
 pub async fn register_candidate(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -828,19 +850,22 @@ pub async fn register_candidate(
     ApiJson(request): ApiJson<ObserveRequest>,
 ) -> Result<Json<SessionCandidates>, SessionError> {
     let (session, role) = authorize_peer(&state, &headers, &session_id).await?;
-    let endpoint = request.endpoint.trim();
-    if endpoint.parse::<SocketAddr>().is_err() {
-        return Err(SessionError::InvalidEndpoint {
-            endpoint: endpoint.to_owned(),
-        });
+    let endpoint = request
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(endpoint) = endpoint {
+        if endpoint.parse::<SocketAddr>().is_err() {
+            return Err(SessionError::InvalidEndpoint {
+                endpoint: endpoint.to_owned(),
+            });
+        }
     }
-    let candidates = state.rendezvous.observe(
-        &session,
-        role,
-        &request.ticket,
-        &request.endpoint,
-        state.now_ms(),
-    )?;
+    let candidates =
+        state
+            .rendezvous
+            .observe(&session, role, &request.ticket, endpoint, state.now_ms())?;
     Ok(Json(candidates))
 }
 

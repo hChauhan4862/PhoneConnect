@@ -215,6 +215,22 @@ impl TestApp {
         .await
     }
 
+    /// Redeems a ticket to publish a redemption nonce without advertising an endpoint.
+    pub async fn register_nonce_only(
+        &self,
+        session_id: &str,
+        bearer: &str,
+        ticket: &Value,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/sessions/{session_id}/candidates"),
+            Some(bearer),
+            Some(json!({ "ticket": ticket })),
+        )
+        .await
+    }
+
     pub async fn register_candidate(
         &self,
         session_id: &str,
