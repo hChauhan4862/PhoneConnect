@@ -1,0 +1,11 @@
+.git
+.superpowers
+docs
+target
+node_modules
+android
+native
+web
+*.apk
+*.keystore
+.DS_Store

@@ -1,0 +1,29 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: phoneconnect-server:dev
+    environment:
+      # A deployment must supply its own bootstrap admin token; this default exists only
+      # so `docker compose up` works for a local health check.
+      PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:-local-development-admin-token}
+      PHONECONNECT_RELAY_ENDPOINT: http://localhost:8080/api/relay
+    ports:
+      - "8080:8080"
+    volumes:
+      - phoneconnect-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  phoneconnect-data:

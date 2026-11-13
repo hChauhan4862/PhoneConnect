@@ -1,0 +1,41 @@
+[package]
+name = "phoneconnect-server"
+description = "PhoneConnect control plane: enrollment, rendezvous, and encrypted relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "phoneconnect_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoneconnect-server"
+path = "src/main.rs"
+
+[dependencies]
+phoneconnect-protocol = { path = "../crates/protocol" }
+async-trait = "0.1.92"
+axum = { version = "0.8.9", features = ["json", "http1", "tokio"] }
+base64 = "0.22.1"
+getrandom = "0.3.4"
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+subtle = "2.6.1"
+thiserror.workspace = true
+tokio = { version = "1.54.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "signal",
+] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tokio = { version = "1.54.1", features = ["test-util", "macros", "rt"] }
+tower = { version = "0.5.3", features = ["util"] }
