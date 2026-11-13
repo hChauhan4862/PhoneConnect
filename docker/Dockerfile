@@ -3,6 +3,16 @@
 # PhoneConnect server image: the control plane, rendezvous service, and relay in one
 # process. Runtime traffic is PhoneConnect framing only; nothing here exposes ADB.
 
+# The one UI is built here and served by the server, so the image ships exactly the bundle a
+# browser and the native shell load from `<server>/`.
+FROM node:24-bookworm-slim AS web
+
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web ./
+RUN npm run build
+
 FROM rust:1.100-bookworm AS builder
 
 RUN apt-get update \
@@ -27,13 +37,15 @@ RUN apt-get update \
     && chown phoneconnect:phoneconnect /data
 
 COPY --from=builder /build/target/release/phoneconnect-server /usr/local/bin/phoneconnect-server
+COPY --from=web /build/web/dist /app/web
 
 USER phoneconnect
 WORKDIR /data
 
 ENV PHONECONNECT_LISTEN_ADDR=0.0.0.0:8080 \
     PHONECONNECT_DATABASE_PATH=/data/phoneconnect.sqlite3 \
-    PHONECONNECT_RELAY_ENDPOINT=http://localhost:8080/api/sessions
+    PHONECONNECT_RELAY_ENDPOINT=http://localhost:8080/api/sessions \
+    PHONECONNECT_WEB_ROOT=/app/web
 
 EXPOSE 8080
 VOLUME ["/data"]

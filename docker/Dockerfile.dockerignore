@@ -5,7 +5,9 @@ target
 node_modules
 android
 native
-web
+web/node_modules
+web/dist
+web/coverage
 *.apk
 *.keystore
 .DS_Store
