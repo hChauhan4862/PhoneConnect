@@ -20,10 +20,11 @@ use phoneconnect_server::store::{
     DeviceStore, EnrollmentTokenRecord, ManualClock, NewDevice, SessionRecord, SqliteStore,
 };
 use phoneconnect_transport::{
-    CandidateKind, CandidateSet, ConnectedPath, HolePunchError, IdentityKey, IdentityPublicKey,
-    PathConfig, PathController, PathError, PathKind, PathSetup, ProbeAuthenticator, ProbeConfig,
-    ProbeCredentials, ProbePacket, RelayChannel, RelayError, RendezvousCandidates, SessionCipher,
-    SwitchConfig, Ticket, TicketError, TicketRole,
+    CandidateKind, CandidateSet, ConnectedPath, Epoch, HolePunchError, IdentityKey,
+    IdentityPublicKey, PathConfig, PathController, PathError, PathKind, PathSetup,
+    ProbeAuthenticator, ProbeConfig, ProbeCredentials, ProbePacket, RelayChannel, RelayError,
+    RelayOnlyPath, RendezvousCandidates, SessionCipher, SwitchConfig, Ticket, TicketError,
+    TicketRole,
 };
 use serde_json::json;
 use tokio::net::UdpSocket;
@@ -136,6 +137,12 @@ impl Harness {
 
     fn ticket(&self, role: PeerRole) -> Ticket {
         self.ticket_at(role, NOW_MS)
+    }
+
+    /// One ticket per role, whose nonces form the connection epoch each peer receives as its
+    /// `peer_nonce`.
+    fn peer_tickets(&self) -> (Ticket, Ticket) {
+        (self.ticket(PeerRole::Client), self.ticket(PeerRole::Device))
     }
 
     fn credentials(&self, role: PeerRole) -> ProbeCredentials {
@@ -253,11 +260,13 @@ fn rendezvous(
     verification_key: &str,
     peer: SocketAddr,
     relay: &str,
+    peer_nonce: &str,
 ) -> RendezvousCandidates {
     serde_json::from_value(json!({
         "session_id": session_id,
         "expires_at": NOW_MS + 300_000,
         "verification_key": verification_key,
+        "peer_nonce": peer_nonce,
         "candidates": [
             { "kind": "server_observed", "endpoint": peer.to_string(), "priority": 150 },
             { "kind": "relay", "endpoint": relay, "priority": 100 }
@@ -266,14 +275,35 @@ fn rendezvous(
     .expect("server candidate shape")
 }
 
-fn rendezvous_only(session_id: &str, verification_key: &str, relay: &str) -> RendezvousCandidates {
+fn rendezvous_only(
+    session_id: &str,
+    verification_key: &str,
+    relay: &str,
+    peer_nonce: &str,
+) -> RendezvousCandidates {
     serde_json::from_value(json!({
         "session_id": session_id,
         "expires_at": NOW_MS + 300_000,
         "verification_key": verification_key,
+        "peer_nonce": peer_nonce,
         "candidates": [{ "kind": "relay", "endpoint": relay, "priority": 100 }]
     }))
     .expect("server candidate shape")
+}
+
+/// The epoch both peers of one connection derive: each side's single-use ticket nonce,
+/// ordered by role.
+fn epoch_of(client_nonce: &str, device_nonce: &str) -> Epoch {
+    Epoch::new(client_nonce, device_nonce).expect("epoch")
+}
+
+/// A fresh epoch for a path that is not backed by tickets, as a caller would build from a
+/// rendezvous round it just read.
+fn unique_epoch() -> Epoch {
+    epoch_of(
+        &IdentityKey::generate().expect("nonce").to_secret_string(),
+        &IdentityKey::generate().expect("nonce").to_secret_string(),
+    )
 }
 
 fn fast_probes() -> ProbeConfig {
@@ -287,6 +317,7 @@ fn fast_switch() -> SwitchConfig {
     SwitchConfig {
         retries: 4,
         timeout: Duration::from_millis(100),
+        confirmation_timeout: Duration::from_millis(600),
     }
 }
 
@@ -337,7 +368,7 @@ fn discovery_covers_local_server_observed_and_relay_candidates() {
     let observed: SocketAddr = "203.0.113.9:62000".parse().expect("addr");
 
     let set = CandidateSet::discover(
-        rendezvous(SESSION, "key", observed, RELAY_ENDPOINT),
+        rendezvous(SESSION, "key", observed, RELAY_ENDPOINT, "peer-nonce"),
         vec![local_one, local_two],
     )
     .expect("candidates discovered");
@@ -370,6 +401,7 @@ fn discovery_refuses_an_expired_or_malformed_rendezvous_view() {
         "session_id": SESSION,
         "expires_at": NOW_MS - 1,
         "verification_key": "key",
+        "peer_nonce": "peer-nonce",
         "candidates": [{ "kind": "relay", "endpoint": RELAY_ENDPOINT, "priority": 100 }]
     }))
     .expect("shape");
@@ -383,6 +415,7 @@ fn discovery_refuses_an_expired_or_malformed_rendezvous_view() {
         "session_id": SESSION,
         "expires_at": NOW_MS + 1000,
         "verification_key": "key",
+        "peer_nonce": "peer-nonce",
         "candidates": [{ "kind": "server_observed", "endpoint": "not-an-address", "priority": 150 }]
     }))
     .expect("shape");
@@ -463,8 +496,11 @@ fn ticket_signature_binds_session_role_identity_and_nonce() {
 async fn a_ticket_for_another_identity_is_refused_at_connect() {
     let harness = Harness::new(SESSION).await;
     let key = harness.verification_key();
-    let candidates = CandidateSet::discover(rendezvous_only(SESSION, &key, RELAY_ENDPOINT), vec![])
-        .expect("candidates");
+    let candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, "peer-nonce"),
+        vec![],
+    )
+    .expect("candidates");
     let (relay, _probe) = harness
         .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
         .await;
@@ -503,8 +539,12 @@ fn replayed_probes_are_rejected_before_a_path_is_established() {
     let client = harness.ticket(PeerRole::Client);
     let device = harness.ticket(PeerRole::Device);
     assert_eq!(
+        client.probe_key, device.probe_key,
+        "both peers probe with the same rendezvous round key"
+    );
+    assert_ne!(
         client.nonce, device.nonce,
-        "both peers share one rendezvous nonce for the session"
+        "each ticket has its own single-use redemption nonce"
     );
 
     let device_credentials = device
@@ -567,13 +607,26 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
     let client_addr = client_socket.local_addr().expect("client addr");
     let device_addr = device_socket.local_addr().expect("device addr");
 
+    let (client_ticket, device_ticket) = harness.peer_tickets();
     let client_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, device_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
         vec![client_addr],
     )
     .expect("client candidates");
     let device_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, client_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
         vec![device_addr],
     )
     .expect("device candidates");
@@ -587,7 +640,7 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
 
     let (client_path, device_path) = tokio::join!(
         PathController::connect(
-            harness.ticket(PeerRole::Client),
+            client_ticket,
             client_candidates,
             client_setup(client_socket, &harness)
                 .with_relay(client_relay)
@@ -595,7 +648,7 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
                 .at(NOW_MS)
         ),
         PathController::connect(
-            harness.ticket(PeerRole::Device),
+            device_ticket,
             device_candidates,
             device_setup(device_socket, &harness)
                 .with_relay(device_relay)
@@ -650,14 +703,23 @@ async fn relay_path_is_used_transparently_when_direct_negotiation_fails() {
     let device_addr = silent_device.local_addr().expect("device addr");
     let client_addr = client_socket.local_addr().expect("client addr");
 
+    let (client_ticket, device_ticket) = harness.peer_tickets();
     let client_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, device_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
         vec![client_addr],
     )
     .expect("client candidates");
-    let device_candidates =
-        CandidateSet::discover(rendezvous_only(SESSION, &key, RELAY_ENDPOINT), vec![])
-            .expect("device candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, &client_ticket.nonce),
+        vec![],
+    )
+    .expect("device candidates");
 
     let (client_relay, client_probe) = harness
         .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
@@ -667,7 +729,7 @@ async fn relay_path_is_used_transparently_when_direct_negotiation_fails() {
         .await;
 
     let client_path = PathController::connect(
-        harness.ticket(PeerRole::Client),
+        client_ticket,
         client_candidates,
         client_setup(client_socket, &harness)
             .with_relay(client_relay)
@@ -680,7 +742,7 @@ async fn relay_path_is_used_transparently_when_direct_negotiation_fails() {
     .await
     .expect("relay fallback");
     let device_path = PathController::connect(
-        harness.ticket(PeerRole::Device),
+        device_ticket,
         device_candidates,
         device_setup(socket().await, &harness)
             .with_relay(device_relay)
@@ -732,8 +794,11 @@ async fn direct_negotiation_fails_explicitly_without_a_relay() {
     let client_socket = socket().await;
 
     // No peer-reported endpoint and no local discovery: there is nothing direct to try.
-    let candidates = CandidateSet::discover(rendezvous_only(SESSION, &key, RELAY_ENDPOINT), vec![])
-        .expect("candidates");
+    let candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, "peer-nonce"),
+        vec![],
+    )
+    .expect("candidates");
 
     let started = Instant::now();
     let error = PathController::connect(
@@ -767,12 +832,14 @@ async fn probe_timeouts_are_bounded_and_reported() {
     let client_socket = socket().await;
     let silent = UdpSocket::bind("127.0.0.1:0").await.expect("device socket");
 
+    let ticket = harness.ticket(PeerRole::Client);
     let candidates = CandidateSet::discover(
         rendezvous(
             SESSION,
             &key,
             silent.local_addr().expect("device addr"),
             RELAY_ENDPOINT,
+            "peer-nonce",
         ),
         vec![],
     )
@@ -784,7 +851,7 @@ async fn probe_timeouts_are_bounded_and_reported() {
     };
     let started = Instant::now();
     let error = PathController::connect(
-        harness.ticket(PeerRole::Client),
+        ticket,
         candidates,
         client_setup(client_socket, &harness)
             .with_config(config(probes))
@@ -817,8 +884,17 @@ async fn a_relay_session_migrates_to_a_direct_path_and_keeps_relay_fallback() {
     let device_addr = device_socket.local_addr().expect("device addr");
 
     // Phase one: each peer only knows the relay, so both start there deterministically.
-    let relay_only =
-        || CandidateSet::discover(rendezvous_only(SESSION, &key, RELAY_ENDPOINT), vec![]);
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_relay_only = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, &device_ticket.nonce),
+        vec![],
+    )
+    .expect("candidates");
+    let device_relay_only = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, &client_ticket.nonce),
+        vec![],
+    )
+    .expect("candidates");
     let (client_relay, client_probe) = harness
         .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
         .await;
@@ -827,8 +903,8 @@ async fn a_relay_session_migrates_to_a_direct_path_and_keeps_relay_fallback() {
         .await;
 
     let client_path = PathController::connect(
-        harness.ticket(PeerRole::Client),
-        relay_only().expect("candidates"),
+        client_ticket,
+        client_relay_only,
         client_setup(Arc::clone(&client_socket), &harness)
             .with_relay(client_relay)
             .with_config(config(fast_probes()))
@@ -837,8 +913,8 @@ async fn a_relay_session_migrates_to_a_direct_path_and_keeps_relay_fallback() {
     .await
     .expect("relay path");
     let device_path = PathController::connect(
-        harness.ticket(PeerRole::Device),
-        relay_only().expect("candidates"),
+        device_ticket,
+        device_relay_only,
         device_setup(Arc::clone(&device_socket), &harness)
             .with_relay(device_relay)
             .with_config(config(fast_probes()))
@@ -855,21 +931,32 @@ async fn a_relay_session_migrates_to_a_direct_path_and_keeps_relay_fallback() {
 
     // Phase two: candidate discovery finds the direct addresses and both peers repeat
     // negotiation with the same session and ticket round — no new session, no new key.
+    let (client_upgrade_ticket, device_upgrade_ticket) = harness.peer_tickets();
     let client_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, device_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_upgrade_ticket.nonce,
+        ),
         vec![client_addr],
     )
     .expect("client candidates");
     let device_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, client_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_upgrade_ticket.nonce,
+        ),
         vec![device_addr],
     )
     .expect("device candidates");
-    let client_ticket = harness.ticket(PeerRole::Client);
-    let device_ticket = harness.ticket(PeerRole::Device);
     let (client_upgrade, device_upgrade) = tokio::join!(
-        client_path.upgrade_with(&client_ticket, &client_candidates, NOW_MS),
-        device_path.upgrade_with(&device_ticket, &device_candidates, NOW_MS),
+        client_path.upgrade_with(&client_upgrade_ticket, &client_candidates, NOW_MS),
+        device_path.upgrade_with(&device_upgrade_ticket, &device_candidates, NOW_MS),
     );
     assert_eq!(client_upgrade.expect("client upgrades"), PathKind::Direct);
     assert_eq!(device_upgrade.expect("device upgrades"), PathKind::Direct);
@@ -920,16 +1007,21 @@ struct SpyPeer {
 }
 
 impl SpyPeer {
-    async fn new(harness: &Harness, role: TicketRole) -> Self {
+    async fn new(harness: &Harness, role: TicketRole, epoch: &Epoch) -> Self {
         let server_role = match role {
             TicketRole::Client => PeerRole::Client,
             TicketRole::Device => PeerRole::Device,
         };
         let identity = harness.identity(server_role);
         let credentials = harness.credentials(server_role);
-        let cipher =
-            SessionCipher::new(&identity, harness.peer_identity(server_role), SESSION, role)
-                .expect("spy cipher");
+        let cipher = SessionCipher::new(
+            &identity,
+            harness.peer_identity(server_role),
+            SESSION,
+            role,
+            epoch,
+        )
+        .expect("spy cipher");
         Self {
             socket: UdpSocket::bind("127.0.0.1:0").await.expect("spy socket"),
             credentials,
@@ -969,6 +1061,11 @@ impl SpyPeer {
                     let ack =
                         ProbePacket::switch_ack(self.next_seq(), seq).encode(&self.credentials);
                     let _ = self.socket.send_to(&ack, from).await;
+                    // A validated peer confirms that it reads the path, which is what lets
+                    // the other side commit.
+                    self.peer = Some(from);
+                    let confirm = ProbePacket::confirm(self.next_seq()).encode(&self.credentials);
+                    let _ = self.socket.send_to(&confirm, from).await;
                 }
                 _ => {}
             }
@@ -996,21 +1093,16 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
     let key = harness.verification_key();
     let device_socket = socket().await;
     let device_addr = device_socket.local_addr().expect("device addr");
-    let mut spy = SpyPeer::new(&harness, TicketRole::Client).await;
+    let device_ticket = harness.ticket(PeerRole::Device);
+    // The spy stands in for the client, and its ticket nonce is the one the device learned
+    // from rendezvous, so both derive the same connection epoch.
+    let spy_nonce = "spy-client-nonce";
+    let epoch = epoch_of(spy_nonce, &device_ticket.nonce);
+    let mut spy = SpyPeer::new(&harness, TicketRole::Client, &epoch).await;
     let spy_addr = spy.address();
 
-    // The device validates a path to the spy and commits to it.
-    let (spy_task_socket, mut server_side) = (spy_addr, ());
-    let _ = spy_task_socket;
-    let _ = &mut server_side;
-    let serving = async {
-        // Serve the handshake in the background while the device connects.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    };
-    serving.await;
-
     let candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, spy_addr, RELAY_ENDPOINT),
+        rendezvous(SESSION, &key, spy_addr, RELAY_ENDPOINT, spy_nonce),
         vec![device_addr],
     )
     .expect("candidates");
@@ -1024,7 +1116,7 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
         spy
     });
     let device_path = PathController::connect(
-        harness.ticket(PeerRole::Device),
+        device_ticket,
         candidates.clone(),
         device_setup(device_socket, &harness)
             .with_relay(relay)
@@ -1086,13 +1178,26 @@ async fn frames_crossing_a_concurrent_upgrade_are_not_lost() {
     let client_addr = client_socket.local_addr().expect("client addr");
     let device_addr = device_socket.local_addr().expect("device addr");
 
+    let (client_ticket, device_ticket) = harness.peer_tickets();
     let client_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, device_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
         vec![client_addr],
     )
     .expect("client candidates");
     let device_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, client_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
         vec![device_addr],
     )
     .expect("device candidates");
@@ -1105,7 +1210,7 @@ async fn frames_crossing_a_concurrent_upgrade_are_not_lost() {
         .await;
     let (client_path, device_path) = tokio::join!(
         PathController::connect(
-            harness.ticket(PeerRole::Client),
+            client_ticket,
             client_candidates.clone(),
             client_setup(client_socket, &harness)
                 .with_relay(client_relay)
@@ -1113,7 +1218,7 @@ async fn frames_crossing_a_concurrent_upgrade_are_not_lost() {
                 .at(NOW_MS)
         ),
         PathController::connect(
-            harness.ticket(PeerRole::Device),
+            device_ticket,
             device_candidates.clone(),
             device_setup(device_socket, &harness)
                 .with_relay(device_relay)
@@ -1188,11 +1293,20 @@ async fn a_one_sided_punch_stays_on_the_relay() {
 
     // The device can reach the client, but the client's only candidate is dead, so only
     // the device validates the path. The client must not confirm the switch.
-    let client_candidates =
-        CandidateSet::discover(rendezvous(SESSION, &key, dead, RELAY_ENDPOINT), vec![dead])
-            .expect("client candidates");
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(SESSION, &key, dead, RELAY_ENDPOINT, &device_ticket.nonce),
+        vec![dead],
+    )
+    .expect("client candidates");
     let device_candidates = CandidateSet::discover(
-        rendezvous(SESSION, &key, client_addr, RELAY_ENDPOINT),
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
         vec![device_addr],
     )
     .expect("device candidates");
@@ -1206,7 +1320,7 @@ async fn a_one_sided_punch_stays_on_the_relay() {
 
     let (client_path, device_path) = tokio::join!(
         PathController::connect(
-            harness.ticket(PeerRole::Client),
+            client_ticket,
             client_candidates,
             client_setup(client_socket, &harness)
                 .with_relay(client_relay)
@@ -1217,7 +1331,7 @@ async fn a_one_sided_punch_stays_on_the_relay() {
                 .at(NOW_MS)
         ),
         PathController::connect(
-            harness.ticket(PeerRole::Device),
+            device_ticket,
             device_candidates,
             device_setup(device_socket, &harness)
                 .with_relay(device_relay)
@@ -1277,15 +1391,17 @@ async fn relay_unavailable_is_terminal_and_never_retried() {
     let harness = Harness::new(SESSION).await;
     let relay = Arc::new(UnavailableRelay::default());
     let identity = harness.identity(PeerRole::Client);
-    let path = ConnectedPath::relay_only(
-        relay.clone(),
-        &identity,
-        harness.device_identity.public_key(),
-        SESSION,
-        DEVICE_ID,
-        TicketRole::Client,
-        PathConfig::default(),
-    )
+    let epoch = unique_epoch();
+    let path = ConnectedPath::relay_only(RelayOnlyPath {
+        relay: relay.clone(),
+        identity: &identity,
+        peer_identity: harness.device_identity.public_key(),
+        session_id: SESSION,
+        device_id: DEVICE_ID,
+        role: TicketRole::Client,
+        epoch: &epoch,
+        config: PathConfig::default(),
+    })
     .expect("relay path");
 
     let error = path
@@ -1337,15 +1453,17 @@ async fn control_paths_are_bounded_by_the_control_only_frame_profile() {
         .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
         .await;
     let identity = harness.identity(PeerRole::Client);
-    let path = ConnectedPath::relay_only(
+    let epoch = unique_epoch();
+    let path = ConnectedPath::relay_only(RelayOnlyPath {
         relay,
-        &identity,
-        harness.device_identity.public_key(),
-        SESSION,
-        DEVICE_ID,
-        TicketRole::Client,
-        PathConfig::default(),
-    )
+        identity: &identity,
+        peer_identity: harness.device_identity.public_key(),
+        session_id: SESSION,
+        device_id: DEVICE_ID,
+        role: TicketRole::Client,
+        epoch: &epoch,
+        config: PathConfig::default(),
+    })
     .expect("relay path");
 
     let mut too_large = envelope("req-oversized", &[]);
@@ -1366,19 +1484,21 @@ async fn a_path_configuration_without_a_usable_direct_limit_is_refused() {
         .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
         .await;
     let identity = harness.identity(PeerRole::Client);
+    let epoch = unique_epoch();
     for limit in [0, 60_001] {
-        let error = ConnectedPath::relay_only(
-            Arc::clone(&relay),
-            &identity,
-            harness.device_identity.public_key(),
-            SESSION,
-            DEVICE_ID,
-            TicketRole::Client,
-            PathConfig {
+        let error = ConnectedPath::relay_only(RelayOnlyPath {
+            relay: Arc::clone(&relay),
+            identity: &identity,
+            peer_identity: harness.device_identity.public_key(),
+            session_id: SESSION,
+            device_id: DEVICE_ID,
+            role: TicketRole::Client,
+            epoch: &epoch,
+            config: PathConfig {
                 direct_frame_limit: limit,
                 ..PathConfig::default()
             },
-        )
+        })
         .expect_err("an unusable direct limit is refused");
         assert!(matches!(error, PathError::InvalidConfig { .. }), "{error}");
     }
@@ -1504,18 +1624,510 @@ async fn the_websocket_relay_measures_its_own_round_trip() {
 
     // The configured estimate is only the fallback: a measured value replaces it.
     let identity = client_identity.clone();
-    let path = ConnectedPath::relay_only(
+    let epoch = unique_epoch();
+    let path = ConnectedPath::relay_only(RelayOnlyPath {
         relay,
-        &identity,
-        device_identity.public_key(),
-        SESSION,
-        DEVICE_ID,
-        TicketRole::Client,
-        PathConfig::default(),
-    )
+        identity: &identity,
+        peer_identity: device_identity.public_key(),
+        session_id: SESSION,
+        device_id: DEVICE_ID,
+        role: TicketRole::Client,
+        epoch: &epoch,
+        config: PathConfig::default(),
+    })
     .expect("relay path");
     assert_eq!(path.path_kind(), PathKind::Relay);
 
     path.shutdown().await.expect("shutdown");
     server.abort();
+}
+
+#[tokio::test]
+async fn a_round_rotation_during_upgrade_keeps_one_reader_and_loses_no_frames() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(60)))
+        .await;
+    let (device_relay, _probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(60)))
+        .await;
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates.clone(),
+            client_setup(client_socket, &harness)
+                .with_relay(client_relay)
+                .with_config(config(fast_probes()))
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates.clone(),
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config(fast_probes()))
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = Arc::new(client_path.expect("client connects"));
+    let device_path = Arc::new(device_path.expect("device connects"));
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+    let first_round = client_path
+        .probe_round_id()
+        .await
+        .expect("the direct socket reports its round");
+
+    // A redeemed ticket makes the next `GET /ticket` start a new rendezvous round, which is
+    // the normal production path. Rotating the key must not start a second reader on the
+    // same socket: a second reader would consume the new round's packets with the old
+    // authenticator and drop frames.
+    // Both peers register (which redeems their tickets, exactly as `POST /candidates`
+    // does); the next round then serves fresh nonces and a fresh probe key.
+    for role in [PeerRole::Client, PeerRole::Device] {
+        let registered = harness
+            .authority
+            .issue(&harness.record, role, NOW_MS)
+            .expect("ticket issued");
+        harness
+            .authority
+            .redeem(&registered, SESSION, role, NOW_MS)
+            .expect("ticket redeems");
+    }
+    harness
+        .authority
+        .start_round(&harness.record.session_id)
+        .expect("round rotates");
+    let (client_ticket2, device_ticket2) = harness.peer_tickets();
+    let client_candidates2 = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket2.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates2 = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket2.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+
+    let sender = tokio::spawn({
+        let client_path = Arc::clone(&client_path);
+        async move {
+            let mut sent = Vec::new();
+            for index in 0..8 {
+                let frame = envelope(&format!("req-rotate-{index}"), b"during rotation");
+                client_path
+                    .send_frame(&frame)
+                    .await
+                    .expect("send during rotation");
+                sent.push(frame);
+                tokio::time::sleep(Duration::from_millis(12)).await;
+            }
+            sent
+        }
+    });
+    let receiver = tokio::spawn({
+        let device_path = Arc::clone(&device_path);
+        async move {
+            let mut received = Vec::new();
+            for _ in 0..8 {
+                received.push(recv(&device_path).await);
+            }
+            received
+        }
+    });
+    let upgrades = async {
+        let (client, device) = tokio::join!(
+            client_path.upgrade_with(&client_ticket2, &client_candidates2, NOW_MS),
+            device_path.upgrade_with(&device_ticket2, &device_candidates2, NOW_MS),
+        );
+        (
+            client.expect("client upgrades"),
+            device.expect("device upgrades"),
+        )
+    };
+
+    let (sent, received, upgraded) = tokio::join!(sender, receiver, upgrades);
+    assert_eq!(upgraded, (PathKind::Direct, PathKind::Direct));
+    assert_eq!(
+        received.expect("receiver"),
+        sent.expect("sender"),
+        "no frame may be lost while the probe key rotates"
+    );
+    let second_round = client_path
+        .probe_round_id()
+        .await
+        .expect("the direct socket still exists");
+    assert_ne!(
+        first_round, second_round,
+        "the socket was re-keyed to the new round in place"
+    );
+    assert_eq!(
+        second_round,
+        device_path.probe_round_id().await.expect("device round id"),
+        "both peers rotated to the same round key"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_peer_identity_fails_closed_before_any_frame() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, "peer-nonce"),
+        vec![],
+    )
+    .expect("candidates");
+    let (relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .await;
+
+    // Peer identity otherwise arrives through the server-signed ticket, so a compromised
+    // rendezvous server could substitute it. A caller that pinned the identity out of band
+    // must fail closed.
+    let impostor = IdentityKey::generate().expect("impostor identity");
+    let error = PathController::connect(
+        harness.ticket(PeerRole::Client),
+        candidates.clone(),
+        client_setup(socket().await, &harness)
+            .with_expected_peer_identity(impostor.public_key())
+            .with_relay(Arc::clone(&relay))
+            .at(NOW_MS),
+    )
+    .await
+    .expect_err("a substituted peer identity is refused");
+    assert!(
+        matches!(
+            error,
+            PathError::Ticket(TicketError::PeerIdentityMismatch { .. })
+        ),
+        "{error}"
+    );
+
+    // The pinned identity that matches the ticket is accepted.
+    let path = PathController::connect(
+        harness.ticket(PeerRole::Client),
+        candidates,
+        client_setup(socket().await, &harness)
+            .with_expected_peer_identity(harness.device_identity.public_key())
+            .with_relay(relay)
+            .at(NOW_MS),
+    )
+    .await
+    .expect("the pinned identity matches");
+    assert_eq!(path.path_kind(), PathKind::Relay);
+}
+
+/// Forwards direct-path datagrams between two peers and drops every switch acknowledgement
+/// travelling from the device to the client, which is what asymmetric loss looks like.
+struct AckLossProxy {
+    socket: UdpSocket,
+    client: SocketAddr,
+    device: SocketAddr,
+    client_credentials: ProbeCredentials,
+    dropped: Arc<AtomicUsize>,
+    /// Drop every switch acknowledgement from the device to the client.
+    drop_switch_acks: bool,
+}
+
+impl AckLossProxy {
+    async fn run(self, stop: Arc<AtomicBool>) {
+        let mut buffer = vec![0u8; 65_535];
+        while !stop.load(Ordering::SeqCst) {
+            let received = tokio::time::timeout(
+                Duration::from_millis(50),
+                self.socket.recv_from(&mut buffer),
+            )
+            .await;
+            let Ok(Ok((length, from))) = received else {
+                continue;
+            };
+            let to = if from == self.client {
+                self.device
+            } else if from == self.device {
+                self.client
+            } else {
+                continue;
+            };
+            if self.drop_switch_acks
+                && from == self.device
+                && matches!(
+                    ProbePacket::decode(&buffer[..length], &self.client_credentials),
+                    Ok(ProbePacket::SwitchAck { .. })
+                )
+            {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let _ = self.socket.send_to(&buffer[..length], to).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn asymmetric_ack_loss_never_commits_one_peer_and_keeps_delivering() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            dropped: Arc::clone(&dropped),
+            drop_switch_acks: true,
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let (device_relay, _probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+
+    let switch = SwitchConfig {
+        retries: 3,
+        timeout: Duration::from_millis(60),
+        confirmation_timeout: Duration::from_millis(300),
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(client_relay)
+                .with_config(PathConfig {
+                    probe: fast_probes(),
+                    switch,
+                    ..PathConfig::default()
+                })
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(PathConfig {
+                    probe: fast_probes(),
+                    switch,
+                    ..PathConfig::default()
+                })
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+
+    assert!(
+        dropped.load(Ordering::SeqCst) > 0,
+        "the proxy really dropped the device's acknowledgements"
+    );
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "a side whose acknowledgement was lost never commits"
+    );
+    assert_eq!(
+        device_path.path_kind(),
+        PathKind::Relay,
+        "and neither does the side that never got the peer's confirmation"
+    );
+
+    // Delivery continues over the relay: no frame is black-holed on a path only one side
+    // would have used.
+    let frame = envelope("req-asymmetric", b"still delivered");
+    client_path.send_frame(&frame).await.expect("relay send");
+    assert_eq!(recv(&device_path).await, frame);
+
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+#[tokio::test]
+async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    // The direct path runs through a proxy, so the test can cut it without touching the
+    // relay.
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            drop_switch_acks: false,
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let (device_relay, _probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(150),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(client_relay)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    let first = envelope("req-health-1", b"on direct");
+    client_path.send_frame(&first).await.expect("direct send");
+    assert_eq!(recv(&device_path).await, first);
+
+    // Cut the direct path: no datagram reaches either side any more.
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "the kind is only demoted when the next frame is sent or received"
+    );
+    let second = envelope("req-health-2", b"after the path died");
+    client_path
+        .send_frame(&second)
+        .await
+        .expect("a dead direct path must not black-hole");
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "the path demoted itself to the relay"
+    );
+    assert_eq!(
+        recv(&device_path).await,
+        second,
+        "the peer received it over the relay"
+    );
 }

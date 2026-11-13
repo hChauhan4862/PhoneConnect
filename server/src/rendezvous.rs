@@ -79,6 +79,11 @@ pub struct SessionCandidates {
     pub expires_at: UnixMs,
     /// Hex-encoded Ed25519 key that verifies this session's tickets.
     pub verification_key: String,
+    /// Redemption nonce of the opposite peer's ticket, once that peer has registered. The two
+    /// nonces are the per-connection epoch the peers mix into their traffic-key derivation,
+    /// so a reconnecting peer that re-registers with fresh tickets never reuses a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_nonce: Option<String>,
     pub candidates: Vec<EndpointCandidate>,
 }
 
@@ -180,24 +185,24 @@ pub struct TicketAuthority {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
     verification_key: String,
-    rounds: Mutex<HashMap<String, SharedNonce>>,
+    rounds: Mutex<HashMap<String, RoundKey>>,
     redeemed: Mutex<RedeemedNonces>,
 }
 
-/// The nonce and probe key both peers of one rendezvous round receive. It is signed into
-/// each ticket, so neither peer can choose them.
-struct SharedNonce {
-    nonce: String,
+/// The probe key both peers of one rendezvous round receive. It is signed into each ticket,
+/// so neither peer can choose it. The redemption nonce is minted per ticket instead: a peer
+/// that re-requests a ticket inside the window needs a nonce it has not redeemed, while both
+/// peers must still probe with the same key.
+struct RoundKey {
     probe_key: String,
     expires_at: UnixMs,
 }
 
 #[derive(Default)]
 struct RedeemedNonces {
-    /// (nonce, role) -> expiry. Bounded by [`MAX_REMEMBERED_NONCES`]; expired entries are
-    /// pruned. One role redeeming a nonce does not block the opposite role, which is how
-    /// both peers of the same round redeem the same nonce exactly once each.
-    entries: HashMap<(String, PeerRole), UnixMs>,
+    /// nonce -> expiry. Bounded by [`MAX_REMEMBERED_NONCES`]; expired entries are pruned.
+    /// Every ticket gets its own nonce, so a replay is exactly a nonce seen before.
+    entries: HashMap<String, UnixMs>,
 }
 
 impl std::fmt::Debug for TicketAuthority {
@@ -257,10 +262,11 @@ impl TicketAuthority {
 
     /// Signs a ticket for one peer role. The expiry never outlives the session.
     ///
-    /// Both roles of one rendezvous round share a nonce and probe key: that shared value
-    /// is what authenticates direct-path probes. The per-role redemption guard, not the
-    /// nonce value, is what rejects a replay, so this is idempotent while the round is
-    /// live. [`Self::start_round`] begins a new round after a network change.
+    /// Both roles of one rendezvous round share the probe key: that shared value is what
+    /// authenticates direct-path probes. Each ticket carries its own single-use nonce, so a
+    /// peer that re-requests a ticket inside the window can always redeem the new one while
+    /// still probing with the round key. [`Self::start_round`] begins a new round after a
+    /// network change.
     pub fn issue(
         &self,
         session: &SessionRecord,
@@ -269,7 +275,8 @@ impl TicketAuthority {
     ) -> Result<RendezvousTicket, TicketError> {
         let expires_at = session.expires_at_ms.min(now_ms + TICKET_TTL_MS);
         let (own_identity_key, peer_identity_key) = identity_keys(session, role)?;
-        let (nonce, probe_key) = self.round(&session.session_id, role, expires_at, now_ms)?;
+        let nonce = generate_secret("").map_err(|error| TicketError::Random(error.to_string()))?;
+        let probe_key = self.round(&session.session_id, expires_at, now_ms)?;
         let mut ticket = RendezvousTicket {
             session_id: session.session_id.clone(),
             device_id: session.device_id.clone(),
@@ -294,41 +301,32 @@ impl TicketAuthority {
         Ok(())
     }
 
+    /// The probe key for the session's current round, minting one when the round is new or
+    /// expired. Stable across ticket re-requests, so both peers always probe with the same
+    /// key; [`Self::start_round`] rotates it explicitly.
     fn round(
         &self,
         session_id: &str,
-        role: PeerRole,
         ticket_expires_at: UnixMs,
         now_ms: UnixMs,
-    ) -> Result<(String, String), TicketError> {
+    ) -> Result<String, TicketError> {
         let mut rounds = self.rounds();
         rounds.retain(|_, round| round.expires_at > now_ms);
         if let Some(round) = rounds.get(session_id) {
             if round.expires_at >= now_ms {
-                // Re-requesting a ticket inside one round must not hand back a nonce this
-                // role already redeemed: that would make the documented recovery path fail
-                // with `ticket_replayed`. A redeemed nonce starts a new round instead.
-                let already_redeemed = self
-                    .redeemed()
-                    .entries
-                    .contains_key(&(round.nonce.clone(), role));
-                if !already_redeemed {
-                    return Ok((round.nonce.clone(), round.probe_key.clone()));
-                }
+                return Ok(round.probe_key.clone());
             }
         }
-        let nonce = generate_secret("").map_err(|error| TicketError::Random(error.to_string()))?;
         let probe_key =
             generate_secret("").map_err(|error| TicketError::Random(error.to_string()))?;
         rounds.insert(
             session_id.to_owned(),
-            SharedNonce {
-                nonce: nonce.clone(),
+            RoundKey {
                 probe_key: probe_key.clone(),
                 expires_at: ticket_expires_at,
             },
         );
-        Ok((nonce, probe_key))
+        Ok(probe_key)
     }
 
     /// Verifies signature, expiry, session, and role. Replay is not considered here;
@@ -391,20 +389,21 @@ impl TicketAuthority {
         now_ms: UnixMs,
     ) -> Result<VerifiedTicket, TicketError> {
         let verified = self.verify(ticket, session_id, role, now_ms)?;
-        let key = (verified.nonce.clone(), role);
         let mut redeemed = self.redeemed();
         redeemed.prune(now_ms);
-        if redeemed.entries.contains_key(&key) {
+        if redeemed.entries.contains_key(&verified.nonce) {
             return Err(TicketError::Replayed);
         }
-        redeemed.entries.insert(key, verified.expires_at);
+        redeemed
+            .entries
+            .insert(verified.nonce.clone(), verified.expires_at);
         if redeemed.entries.len() > MAX_REMEMBERED_NONCES {
             redeemed.evict_earliest();
         }
         Ok(verified)
     }
 
-    fn rounds(&self) -> MutexGuard<'_, HashMap<String, SharedNonce>> {
+    fn rounds(&self) -> MutexGuard<'_, HashMap<String, RoundKey>> {
         self.rounds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -427,7 +426,7 @@ impl RedeemedNonces {
             .entries
             .iter()
             .min_by_key(|(_, expires_at)| **expires_at)
-            .map(|(key, _)| key.clone())
+            .map(|(nonce, _)| nonce.clone())
         {
             self.entries.remove(&earliest);
         }
@@ -439,6 +438,8 @@ impl RedeemedNonces {
 pub struct ObservedEndpoint {
     pub endpoint: String,
     pub observed_at_ms: UnixMs,
+    /// The redemption nonce of the ticket that registered this endpoint.
+    pub nonce: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -495,11 +496,11 @@ impl Rendezvous {
         now_ms: UnixMs,
     ) -> SessionCandidates {
         let mut candidates = Vec::new();
-        if let Some(observed) = self.observed_endpoint(&session.session_id, role.opposite(), now_ms)
-        {
+        let peer = self.observed_endpoint(&session.session_id, role.opposite(), now_ms);
+        if let Some(observed) = &peer {
             candidates.push(EndpointCandidate {
                 kind: CandidateKind::ServerObserved,
-                endpoint: observed.endpoint,
+                endpoint: observed.endpoint.clone(),
                 priority: 150,
             });
         }
@@ -512,6 +513,7 @@ impl Rendezvous {
             session_id: session.session_id.clone(),
             expires_at: session.expires_at_ms,
             verification_key: self.tickets.verification_key().to_owned(),
+            peer_nonce: peer.map(|observed| observed.nonce),
             candidates,
         }
     }
@@ -528,7 +530,8 @@ impl Rendezvous {
         endpoint: &str,
         now_ms: UnixMs,
     ) -> Result<SessionCandidates, TicketError> {
-        self.tickets
+        let verified = self
+            .tickets
             .redeem(ticket, &session.session_id, role, now_ms)?;
         let normalized = normalize_endpoint(endpoint).ok_or_else(|| TicketError::InvalidNonce {
             nonce: ticket.nonce.clone(),
@@ -543,6 +546,7 @@ impl Rendezvous {
                 ObservedEndpoint {
                     endpoint: normalized,
                     observed_at_ms: now_ms,
+                    nonce: verified.nonce.clone(),
                 },
             );
         }

@@ -579,8 +579,12 @@ async fn tickets_are_signed_and_bound_to_the_session_device_and_role() {
     assert_eq!(issued["verification_key"], verification_key);
     assert_eq!(issued["ticket"]["role"], "device");
     assert_eq!(
+        issued["ticket"]["probe_key"], session["ticket"]["probe_key"],
+        "both peers must probe with the shared round key"
+    );
+    assert_ne!(
         issued["ticket"]["nonce"], session["ticket"]["nonce"],
-        "both peers must derive probes from one nonce"
+        "each ticket carries its own single-use redemption nonce"
     );
     let device_ticket: RendezvousTicket =
         serde_json::from_value(issued["ticket"].clone()).expect("device ticket");

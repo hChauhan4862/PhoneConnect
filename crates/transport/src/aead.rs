@@ -5,10 +5,17 @@
 //!
 //! Trust model: two static identity keys — the device's, registered at enrollment, and the
 //! client's, registered when the session is authorized — agree on a shared secret with
-//! X25519. HKDF-SHA256, salted with the session id, splits the secret into one key per
-//! direction. The server holds only public identity keys, so it can neither derive a
-//! traffic key nor decrypt a frame. The server-issued probe key authenticates hole-punch
-//! datagrams only; it is deliberately not used here.
+//! X25519. HKDF-SHA256 splits the secret into one key per direction, salted with the session
+//! id and a per-connection epoch (both tickets' single-use nonces). The server holds only
+//! public identity keys, so it can neither derive a traffic key nor decrypt a frame. The
+//! server-issued probe key authenticates hole-punch datagrams only; it is deliberately not
+//! used here.
+//!
+//! Peer identity is trust-on-first-use through the rendezvous service: the ticket that names
+//! the peer's public key is server-signed, so a malicious server can substitute it and MITM.
+//! Callers authenticate the server over TLS and may pin the peer identity out of band
+//! (`PathSetup::with_expected_peer_identity`). The epoch gives fresh keys per connection, not
+//! forward secrecy, because the identity keys are long-lived.
 //!
 //! Each frame uses a fresh 96-bit nonce built from the sender's direction byte and a
 //! monotonic counter, and authenticates a header that binds the key id, direction, counter,
@@ -16,9 +23,10 @@
 //! frame cannot be replayed, a lower counter is a regression, a reflected frame carries the
 //! wrong direction, and a frame for another identity pair carries an unknown key id.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -81,6 +89,12 @@ pub enum AeadError {
     InvalidKeyMaterial,
     #[error("the agreed key is degenerate; refusing to use it")]
     WeakKey,
+    #[error("connection epoch is missing or empty; re-register with rendezvous")]
+    InvalidEpoch,
+    #[error(
+        "this connection epoch was already used for this session and role; a new path needs fresh tickets"
+    )]
+    EpochReused,
     #[error("sealed frame is malformed: {reason}")]
     Malformed { reason: String },
     #[error("sealed frame carries key id {found}; this session uses {expected}")]
@@ -91,7 +105,7 @@ pub enum AeadError {
     Authentication,
     #[error("frame counter {counter} was already received")]
     Replayed { counter: u64 },
-    #[error("frame counter {counter} regressed below {highest}")]
+    #[error("frame counter {counter} regressed outside the replay window (highest {highest})")]
     CounterRegression { counter: u64, highest: u64 },
     #[error("frame counter space is exhausted; the session must be re-established")]
     CounterExhausted,
@@ -198,7 +212,66 @@ fn direction_byte(role: TicketRole) -> u8 {
     }
 }
 
-/// Per-frame secrecy and authentication for one session.
+/// The per-connection epoch mixed into key derivation.
+///
+/// The identity keys are static, so the same session id would otherwise produce the same
+/// keys — and the same ChaCha20-Poly1305 nonces — for every connection. Each connection
+/// exchanges the two peers' single-use ticket nonces through rendezvous; both sides mix the
+/// same pair, in role order, into the HKDF salt. A reconnecting peer re-registers with a
+/// fresh ticket and therefore derives fresh keys, and a second `ConnectedPath` for one
+/// session id can never reuse a nonce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Epoch {
+    client_nonce: String,
+    device_nonce: String,
+}
+
+impl Epoch {
+    pub fn new(
+        client_nonce: impl Into<String>,
+        device_nonce: impl Into<String>,
+    ) -> Result<Self, AeadError> {
+        let epoch = Self {
+            client_nonce: client_nonce.into(),
+            device_nonce: device_nonce.into(),
+        };
+        if epoch.client_nonce.is_empty() || epoch.device_nonce.is_empty() {
+            return Err(AeadError::InvalidEpoch);
+        }
+        Ok(epoch)
+    }
+
+    /// Orders this peer's own nonce and the opposite peer's nonce by role, which is what
+    /// makes both sides derive the same salt.
+    pub fn split(own_nonce: &str, peer_nonce: &str, role: TicketRole) -> Result<Self, AeadError> {
+        match role {
+            TicketRole::Client => Self::new(own_nonce, peer_nonce),
+            TicketRole::Device => Self::new(peer_nonce, own_nonce),
+        }
+    }
+
+    pub fn client_nonce(&self) -> &str {
+        &self.client_nonce
+    }
+
+    pub fn device_nonce(&self) -> &str {
+        &self.device_nonce
+    }
+
+    fn salt(&self, session_id: &str) -> Vec<u8> {
+        let mut salt = Vec::with_capacity(
+            session_id.len() + self.client_nonce.len() + self.device_nonce.len() + 3,
+        );
+        salt.extend_from_slice(session_id.as_bytes());
+        salt.push(0);
+        salt.extend_from_slice(self.client_nonce.as_bytes());
+        salt.push(0);
+        salt.extend_from_slice(self.device_nonce.as_bytes());
+        salt
+    }
+}
+
+/// Per-frame secrecy and authentication for one session connection.
 pub struct SessionCipher {
     session_id: String,
     role: TicketRole,
@@ -207,12 +280,56 @@ pub struct SessionCipher {
     recv_cipher: ChaCha20Poly1305,
     peer_direction: u8,
     send_counter: AtomicU64,
-    recv_state: Mutex<RecvState>,
+    recv_state: Mutex<ReplayWindow>,
 }
 
+/// Replay window for authenticated frames.
+///
+/// A strict high-water mark would turn a legitimate UDP reorder into a fatal
+/// `CounterRegression`. The window accepts any not-yet-seen counter within
+/// [`AEAD_REPLAY_WINDOW`] of the highest one, refuses a repeat as [`AeadError::Replayed`],
+/// and reports a counter below the window as [`AeadError::CounterRegression`] so a caller can
+/// tell a reorder from a fatal regression.
+const AEAD_REPLAY_WINDOW: u64 = 64;
+
 #[derive(Default)]
-struct RecvState {
-    highest: u64,
+struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u64,
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, counter: u64) -> Result<(), AeadError> {
+        match self.highest {
+            None => {
+                self.highest = Some(counter);
+                self.seen = 1;
+                Ok(())
+            }
+            Some(highest) if counter > highest => {
+                let shift = counter - highest;
+                self.seen = if shift >= AEAD_REPLAY_WINDOW {
+                    1
+                } else {
+                    (self.seen << shift) | 1
+                };
+                self.highest = Some(counter);
+                Ok(())
+            }
+            Some(highest) => {
+                let offset = highest - counter;
+                if offset >= AEAD_REPLAY_WINDOW {
+                    return Err(AeadError::CounterRegression { counter, highest });
+                }
+                let bit = 1u64 << offset;
+                if self.seen & bit != 0 {
+                    return Err(AeadError::Replayed { counter });
+                }
+                self.seen |= bit;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl fmt::Debug for SessionCipher {
@@ -233,10 +350,14 @@ impl SessionCipher {
         peer: IdentityPublicKey,
         session_id: &str,
         role: TicketRole,
+        epoch: &Epoch,
     ) -> Result<Self, AeadError> {
         if session_id.is_empty() {
             return Err(AeadError::InvalidKeyMaterial);
         }
+        // Two paths for one session with the same epoch would reuse a ChaCha20-Poly1305
+        // nonce, so the second is refused rather than silently repeating keystream.
+        claim_epoch(session_id, role, epoch)?;
         let peer_public = PublicKey::from(*peer.as_bytes());
         let shared = own.secret.diffie_hellman(&peer_public);
         if shared.as_bytes().iter().all(|byte| *byte == 0) {
@@ -244,7 +365,8 @@ impl SessionCipher {
         }
 
         let mut okm = [0u8; 64];
-        Hkdf::<Sha256>::new(Some(session_id.as_bytes()), shared.as_bytes())
+        let salt = epoch.salt(session_id);
+        Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
             .expand(AEAD_LABEL, &mut okm)
             .map_err(|_| AeadError::WeakKey)?;
         let client_to_device = &okm[..32];
@@ -263,14 +385,14 @@ impl SessionCipher {
         Ok(Self {
             session_id: session_id.to_owned(),
             role,
-            key_id: key_id(session_id, client_public, device_public),
+            key_id: key_id(session_id, client_public, device_public, epoch),
             send_cipher: ChaCha20Poly1305::new_from_slice(send_key)
                 .map_err(|_| AeadError::InvalidKeyMaterial)?,
             recv_cipher: ChaCha20Poly1305::new_from_slice(recv_key)
                 .map_err(|_| AeadError::InvalidKeyMaterial)?,
             peer_direction: direction_byte(role.opposite()),
             send_counter: AtomicU64::new(1),
-            recv_state: Mutex::new(RecvState::default()),
+            recv_state: Mutex::new(ReplayWindow::default()),
         })
     }
 
@@ -322,8 +444,8 @@ impl SessionCipher {
         Ok(sealed)
     }
 
-    /// Opens one sealed frame. Authenticates first, then rejects a replayed or regressed
-    /// counter, so a forged frame can never burn a counter.
+    /// Opens one sealed frame. Authenticates first, then applies the bounded replay window,
+    /// so a forged frame can never burn a counter and a reordered frame is still delivered.
     pub fn open(&self, sealed: &[u8]) -> Result<Envelope, AeadError> {
         if sealed.len() < SealedHeader::MIN_LEN {
             return Err(AeadError::Malformed {
@@ -379,21 +501,10 @@ impl SessionCipher {
             )
             .map_err(|_| AeadError::Authentication)?;
 
-        let mut state = self
-            .recv_state
+        self.recv_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if counter == state.highest {
-            return Err(AeadError::Replayed { counter });
-        }
-        if counter < state.highest {
-            return Err(AeadError::CounterRegression {
-                counter,
-                highest: state.highest,
-            });
-        }
-        state.highest = counter;
-        drop(state);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accept(counter)?;
 
         let envelope =
             Envelope::decode(plaintext.as_slice()).map_err(|error| AeadError::InvalidEnvelope {
@@ -420,6 +531,35 @@ impl SessionCipher {
     }
 }
 
+/// Epochs this process has already used, per session and role.
+///
+/// A reconnect must bring fresh tickets; reusing a ticket pair would derive the same keys,
+/// which is the one thing AEAD cannot survive. The registry is process-local: after a restart
+/// the rendezvous service has minted fresh nonces anyway.
+/// Session, role, and the two ticket nonces.
+type ClaimedEpoch = (String, u8, String, String);
+
+fn claimed_epochs() -> &'static Mutex<HashSet<ClaimedEpoch>> {
+    static CLAIMED: OnceLock<Mutex<HashSet<ClaimedEpoch>>> = OnceLock::new();
+    CLAIMED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn claim_epoch(session_id: &str, role: TicketRole, epoch: &Epoch) -> Result<(), AeadError> {
+    let key = (
+        session_id.to_owned(),
+        direction_byte(role),
+        epoch.client_nonce().to_owned(),
+        epoch.device_nonce().to_owned(),
+    );
+    let mut claimed = claimed_epochs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !claimed.insert(key) {
+        return Err(AeadError::EpochReused);
+    }
+    Ok(())
+}
+
 fn associated_data(session_id: &str, header: &[u8; SealedHeader::LEN]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AEAD_LABEL.len() + 2 + session_id.len() + header.len());
     aad.extend_from_slice(AEAD_LABEL);
@@ -440,6 +580,7 @@ fn key_id(
     session_id: &str,
     client_public: IdentityPublicKey,
     device_public: IdentityPublicKey,
+    epoch: &Epoch,
 ) -> [u8; KEY_ID_LEN] {
     let mut first = client_public.0;
     let mut second = device_public.0;
@@ -452,6 +593,7 @@ fn key_id(
     hasher.update(session_id.as_bytes());
     hasher.update(first);
     hasher.update(second);
+    hasher.update(epoch.salt(session_id));
     let digest = hasher.finalize();
     let mut id = [0u8; KEY_ID_LEN];
     id.copy_from_slice(&digest[..KEY_ID_LEN]);

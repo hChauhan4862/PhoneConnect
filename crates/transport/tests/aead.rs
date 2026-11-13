@@ -7,10 +7,15 @@
 
 use phoneconnect::v1::{DeviceId, Envelope, RequestId, SessionId, StreamKind};
 use phoneconnect_transport::{
-    AeadError, IdentityKey, IdentityPublicKey, SealedHeader, SessionCipher, TicketRole,
+    AeadError, Epoch, IdentityKey, IdentityPublicKey, SealedHeader, SessionCipher, TicketRole,
 };
 
 const SESSION: &str = "sess_aead";
+
+/// A fresh epoch, the way two freshly minted tickets provide one.
+fn epoch() -> Epoch {
+    Epoch::new(identity().to_secret_string(), identity().to_secret_string()).expect("epoch")
+}
 const PAYLOAD_MARKER: &[u8] = b"PC-AEAD-PLAINTEXT-MARKER";
 
 fn envelope(request: &str, sequence: u32) -> Envelope {
@@ -38,11 +43,13 @@ impl Pair {
     fn new() -> Self {
         let client_identity = identity();
         let device_identity = identity();
+        let epoch = epoch();
         let client = SessionCipher::new(
             &client_identity,
             device_identity.public_key(),
             SESSION,
             TicketRole::Client,
+            &epoch,
         )
         .expect("client cipher");
         let device = SessionCipher::new(
@@ -50,6 +57,7 @@ impl Pair {
             client_identity.public_key(),
             SESSION,
             TicketRole::Device,
+            &epoch,
         )
         .expect("device cipher");
         Self {
@@ -141,6 +149,7 @@ fn only_the_pinned_peer_identity_can_decrypt() {
         pair.device_identity.public_key(),
         SESSION,
         TicketRole::Client,
+        &epoch(),
     )
     .expect("impostor cipher");
     let frame_key_id = pair.client.key_id();
@@ -159,6 +168,7 @@ fn only_the_pinned_peer_identity_can_decrypt() {
         impostor_identity.public_key(),
         SESSION,
         TicketRole::Device,
+        &epoch(),
     )
     .expect("mismatched cipher");
     assert_eq!(
@@ -218,7 +228,7 @@ fn a_tampered_authenticated_header_fails() {
 }
 
 #[test]
-fn a_replayed_or_regressed_counter_fails() {
+fn a_replayed_counter_is_refused() {
     let pair = Pair::new();
     let first = pair.client.seal(&envelope("req-one", 1)).expect("seal");
     let second = pair.client.seal(&envelope("req-two", 2)).expect("seal");
@@ -232,11 +242,39 @@ fn a_replayed_or_regressed_counter_fails() {
     pair.device.open(&second).expect("second frame");
     assert_eq!(
         pair.device.open(&first),
+        Err(AeadError::Replayed { counter: 1 }),
+        "a replayed frame is still a replay after a newer one arrives"
+    );
+}
+
+#[test]
+fn a_reordered_frame_is_accepted_but_a_regression_is_fatal() {
+    let pair = Pair::new();
+    let first = pair.client.seal(&envelope("req-one", 1)).expect("seal");
+    let second = pair.client.seal(&envelope("req-two", 2)).expect("seal");
+
+    // UDP reorders: a frame inside the window that has not been seen is delivered, so the
+    // caller can tell a reorder apart from a fatal regression.
+    pair.device.open(&second).expect("newer frame first");
+    assert_eq!(
+        pair.device.open(&first).expect("reordered frame delivered"),
+        envelope("req-one", 1)
+    );
+
+    // Once the counter is far outside the window it is a regression, not a reorder.
+    let mut frames = Vec::new();
+    for _ in 0..80 {
+        frames.push(pair.client.seal(&envelope("req-bulk", 3)).expect("seal"));
+    }
+    let last = frames.pop().expect("a frame");
+    pair.device.open(&last).expect("jump ahead");
+    assert_eq!(
+        pair.device.open(&frames[0]),
         Err(AeadError::CounterRegression {
-            counter: 1,
-            highest: 2
+            counter: 3,
+            highest: 82
         }),
-        "an older counter is a regression, never a fresh frame"
+        "a counter outside the window is a fatal regression"
     );
 }
 
@@ -291,4 +329,117 @@ fn a_malformed_sealed_record_is_refused() {
     let sealed = pair.client.seal(&envelope("req-short", 1)).expect("seal");
     let truncated = &sealed[..sealed.len() - 4];
     assert_eq!(pair.device.open(truncated), Err(AeadError::Authentication));
+}
+
+#[test]
+fn a_second_connection_on_one_session_derives_fresh_keys() {
+    let client_identity = identity();
+    let device_identity = identity();
+    let first_epoch = Epoch::new("first-client-nonce", "first-device-nonce").expect("epoch");
+    let second_epoch = Epoch::new("second-client-nonce", "second-device-nonce").expect("epoch");
+
+    let first_client = SessionCipher::new(
+        &client_identity,
+        device_identity.public_key(),
+        SESSION,
+        TicketRole::Client,
+        &first_epoch,
+    )
+    .expect("first client cipher");
+    let second_client = SessionCipher::new(
+        &client_identity,
+        device_identity.public_key(),
+        SESSION,
+        TicketRole::Client,
+        &second_epoch,
+    )
+    .expect("second client cipher");
+    let first_device = SessionCipher::new(
+        &device_identity,
+        client_identity.public_key(),
+        SESSION,
+        TicketRole::Device,
+        &first_epoch,
+    )
+    .expect("first device cipher");
+    let second_device = SessionCipher::new(
+        &device_identity,
+        client_identity.public_key(),
+        SESSION,
+        TicketRole::Device,
+        &second_epoch,
+    )
+    .expect("second device cipher");
+
+    assert_ne!(
+        first_client.key_id(),
+        second_client.key_id(),
+        "a new connection epoch means new keys"
+    );
+
+    // The first connection's frame opens only on the first device cipher: a reconnect never
+    // reuses a key, so it can never reuse a ChaCha20-Poly1305 nonce.
+    let frame = first_client.seal(&envelope("req-first", 1)).expect("seal");
+    first_device.open(&frame).expect("same epoch decrypts");
+    assert_eq!(
+        second_device.open(&frame),
+        Err(AeadError::UnknownKeyId {
+            found: first_client.key_id(),
+            expected: second_client.key_id(),
+        })
+    );
+
+    // `Epoch::split` orders the nonces by role, so both peers derive the same salt.
+    let theirs = Epoch::split("client-nonce", "device-nonce", TicketRole::Device).expect("epoch");
+    let ours = Epoch::split("device-nonce", "client-nonce", TicketRole::Client).expect("epoch");
+    assert_eq!(theirs, ours);
+}
+
+#[test]
+fn reusing_one_epoch_for_two_paths_is_refused() {
+    let client_identity = identity();
+    let device_identity = identity();
+    let epoch = Epoch::new("reused-client-nonce", "reused-device-nonce").expect("epoch");
+
+    SessionCipher::new(
+        &client_identity,
+        device_identity.public_key(),
+        "sess_reuse",
+        TicketRole::Client,
+        &epoch,
+    )
+    .expect("first path");
+    // The peer half of the same connection is not a reuse.
+    SessionCipher::new(
+        &device_identity,
+        client_identity.public_key(),
+        "sess_reuse",
+        TicketRole::Device,
+        &epoch,
+    )
+    .expect("peer half");
+
+    assert_eq!(
+        SessionCipher::new(
+            &client_identity,
+            device_identity.public_key(),
+            "sess_reuse",
+            TicketRole::Client,
+            &epoch,
+        )
+        .err(),
+        Some(AeadError::EpochReused),
+        "a second path on one session must bring a fresh epoch"
+    );
+
+    // A fresh epoch is accepted.
+    let fresh = Epoch::new("fresh-client-nonce", "fresh-device-nonce").expect("epoch");
+    SessionCipher::new(
+        &client_identity,
+        device_identity.public_key(),
+        "sess_reuse",
+        TicketRole::Client,
+        &fresh,
+    )
+    .expect("fresh epoch");
 }

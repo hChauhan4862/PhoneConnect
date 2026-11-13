@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
-use crate::aead::{AeadError, IdentityKey, IdentityPublicKey, SealedHeader, SessionCipher};
+use crate::aead::{AeadError, Epoch, IdentityKey, IdentityPublicKey, SealedHeader, SessionCipher};
 use crate::candidates::{CandidateError, CandidateSet};
 use crate::hole_punch::{
     DirectSocket, HolePunchError, HolePunchOutcome, MAX_DIRECT_FRAME_BYTES, ProbeConfig,
@@ -92,6 +92,8 @@ pub enum TicketError {
     Expired { expires_at: i64 },
     #[error("ticket is for session {found}, not {expected}")]
     SessionMismatch { found: String, expected: String },
+    #[error("ticket names peer identity {found}, not the expected pinned identity {expected}")]
+    PeerIdentityMismatch { found: String, expected: String },
     #[error("session id {session_id} is invalid: {reason}")]
     InvalidSession { session_id: String, reason: String },
 }
@@ -180,7 +182,6 @@ impl Ticket {
         let credentials = ProbeCredentials::new(
             self.session_id.clone(),
             self.role,
-            self.nonce.clone(),
             probe_key,
             self.expires_at,
         )
@@ -282,6 +283,9 @@ pub struct PathConfig {
     pub probe: ProbeConfig,
     /// Bounded switch confirmation.
     pub switch: SwitchConfig,
+    /// A committed direct path with no inbound frame for this long is demoted to the relay,
+    /// so a path that stops delivering can never black-hole frames.
+    pub direct_health_timeout: Duration,
     /// Frame profile. Control paths must use [`FrameLimits::control_only`].
     pub frame_limits: FrameLimits,
     /// Largest sealed frame the direct datagram path accepts.
@@ -297,6 +301,7 @@ impl Default for PathConfig {
         Self {
             probe: ProbeConfig::default(),
             switch: SwitchConfig::default(),
+            direct_health_timeout: Duration::from_secs(2),
             frame_limits: FrameLimits::control_only(),
             direct_frame_limit: MAX_DIRECT_FRAME_BYTES,
             recv_timeout: Duration::from_secs(5),
@@ -327,19 +332,33 @@ impl PathConfig {
                 reason: "switch retries and timeout must be non-zero".to_owned(),
             });
         }
-        if self.recv_timeout.is_zero() {
+        if self.recv_timeout.is_zero() || self.direct_health_timeout.is_zero() {
             return Err(PathError::InvalidConfig {
-                reason: "recv_timeout must be non-zero".to_owned(),
+                reason: "recv_timeout and direct_health_timeout must be non-zero".to_owned(),
             });
         }
         Ok(())
     }
 }
 
+/// Everything a relay-only path needs. It still seals frames, so it requires an identity, a
+/// peer identity, and a connection epoch.
+pub struct RelayOnlyPath<'a> {
+    pub relay: Arc<dyn RelayChannel>,
+    pub identity: &'a IdentityKey,
+    pub peer_identity: IdentityPublicKey,
+    pub session_id: &'a str,
+    pub device_id: &'a str,
+    pub role: TicketRole,
+    pub epoch: &'a Epoch,
+    pub config: PathConfig,
+}
+
 /// Everything a path needs besides the ticket and candidates.
 pub struct PathSetup {
     socket: Arc<UdpSocket>,
     identity: IdentityKey,
+    expected_peer_identity: Option<IdentityPublicKey>,
     relay: Option<Arc<dyn RelayChannel>>,
     config: PathConfig,
     now_ms: i64,
@@ -350,6 +369,7 @@ impl fmt::Debug for PathSetup {
         formatter
             .debug_struct("PathSetup")
             .field("relay", &self.relay.is_some())
+            .field("pinned_peer", &self.expected_peer_identity.is_some())
             .field("identity", &self.identity)
             .field("config", &self.config)
             .field("now_ms", &self.now_ms)
@@ -363,10 +383,22 @@ impl PathSetup {
         Self {
             socket,
             identity,
+            expected_peer_identity: None,
             relay: None,
             config: PathConfig::default(),
             now_ms: unix_ms(),
         }
+    }
+
+    /// Pins the peer identity the caller expects, out of band.
+    ///
+    /// Peer identity otherwise arrives through the server-signed ticket (trust on first use
+    /// via rendezvous). A caller that learned the peer's identity another way — a previous
+    /// session, an operator-provided value — pins it here, and `connect` fails closed if the
+    /// ticket names a different one.
+    pub fn with_expected_peer_identity(mut self, peer: IdentityPublicKey) -> Self {
+        self.expected_peer_identity = Some(peer);
+        self
     }
 
     /// Attaches an already-authorized relay. The relay is the fallback and the migration
@@ -412,6 +444,10 @@ pub enum PathError {
     Protocol(#[from] ProtocolError),
     #[error("invalid path configuration: {reason}")]
     InvalidConfig { reason: String },
+    /// The connection epoch is not available yet: the opposite peer has not registered its
+    /// ticket nonce. Register with rendezvous and retry; this is never terminal.
+    #[error("connection epoch is unavailable; register candidates and retry")]
+    EpochUnavailable,
     #[error("direct frame of {length} bytes exceeds the {limit}-byte datagram limit")]
     DirectFrameTooLarge { length: usize, limit: usize },
     #[error("path is shut down")]
@@ -453,6 +489,8 @@ struct DirectState {
     socket: Arc<DirectSocket>,
     peer: SocketAddr,
     rtt: Duration,
+    /// Last authenticated inbound frame, used to demote a path that stopped delivering.
+    last_inbound: std::sync::Mutex<std::time::Instant>,
 }
 
 struct PathState {
@@ -502,17 +540,19 @@ impl ConnectedPath {
     /// A path that only ever uses the relay. Used when a deployment disables UDP, and by
     /// callers that already hold an authorized relay channel. Frames still have to be
     /// sealed, so an identity and peer key are required.
-    pub fn relay_only(
-        relay: Arc<dyn RelayChannel>,
-        identity: &IdentityKey,
-        peer_identity: IdentityPublicKey,
-        session_id: &str,
-        device_id: &str,
-        role: TicketRole,
-        config: PathConfig,
-    ) -> Result<Self, PathError> {
+    pub fn relay_only(setup: RelayOnlyPath<'_>) -> Result<Self, PathError> {
+        let RelayOnlyPath {
+            relay,
+            identity,
+            peer_identity,
+            session_id,
+            device_id,
+            role,
+            epoch,
+            config,
+        } = setup;
         config.validate()?;
-        let cipher = SessionCipher::new(identity, peer_identity, session_id, role)?;
+        let cipher = SessionCipher::new(identity, peer_identity, session_id, role, epoch)?;
         Ok(Self {
             session_id: session_id.to_owned(),
             device_id: device_id.to_owned(),
@@ -557,6 +597,11 @@ impl ConnectedPath {
         self.cipher.key_id()
     }
 
+    /// The rendezvous round the direct probe socket currently uses, once one exists.
+    pub async fn probe_round_id(&self) -> Option<String> {
+        self.probe_socket().map(|socket| socket.round_id())
+    }
+
     /// Round trip measured while validating the direct path. `None` until a direct path
     /// validated.
     pub fn direct_rtt(&self) -> Option<Duration> {
@@ -587,6 +632,14 @@ impl ConnectedPath {
                     .map(|direct| (Arc::clone(&direct.socket), direct.peer)),
                 state.relay.clone(),
             )
+        };
+        // A committed direct path that stopped delivering is demoted to the relay before a
+        // frame is written to it, so frames are never black-holed.
+        let kind = if kind == PathKind::Direct && !self.direct_is_healthy().await {
+            self.kind.store(RELAY, Ordering::SeqCst);
+            PathKind::Relay
+        } else {
+            kind
         };
         match kind {
             PathKind::Direct => {
@@ -625,10 +678,18 @@ impl ConnectedPath {
                 state.relay.clone(),
             )
         };
+        let kind = if kind == PathKind::Direct && !self.direct_is_healthy().await {
+            self.kind.store(RELAY, Ordering::SeqCst);
+            PathKind::Relay
+        } else {
+            kind
+        };
         let sealed = match kind {
             PathKind::Direct => {
                 let socket = direct.ok_or(PathError::Shutdown)?;
-                socket.recv_frame(self.config.recv_timeout).await?
+                let frame = socket.recv_frame(self.config.recv_timeout).await?;
+                self.mark_direct_inbound().await;
+                frame
             }
             PathKind::Relay => {
                 let relay = relay.ok_or(PathError::NoPath)?;
@@ -705,7 +766,12 @@ impl ConnectedPath {
             PathController::select(direct_latency, relay_latency).ok_or(PathError::NoPath)?;
         if selection == PathKind::Direct {
             if let Some((socket, HolePunchOutcome { peer, rtt })) = direct {
-                state.direct = Some(DirectState { socket, peer, rtt });
+                state.direct = Some(DirectState {
+                    socket,
+                    peer,
+                    rtt,
+                    last_inbound: std::sync::Mutex::new(std::time::Instant::now()),
+                });
             }
         }
         self.kind.store(path_kind_byte(selection), Ordering::SeqCst);
@@ -770,6 +836,27 @@ impl ConnectedPath {
             .take()
     }
 
+    async fn direct_is_healthy(&self) -> bool {
+        let state = self.state.read().await;
+        match state.direct.as_ref() {
+            Some(direct) => direct
+                .last_inbound
+                .lock()
+                .map(|last| last.elapsed() <= self.config.direct_health_timeout)
+                .unwrap_or(true),
+            None => false,
+        }
+    }
+
+    async fn mark_direct_inbound(&self) {
+        let state = self.state.read().await;
+        if let Some(direct) = state.direct.as_ref() {
+            if let Ok(mut last) = direct.last_inbound.lock() {
+                *last = std::time::Instant::now();
+            }
+        }
+    }
+
     fn relay_latency(&self, state: &PathState) -> Option<Duration> {
         state.relay.as_ref().map(|relay| {
             relay
@@ -826,9 +913,16 @@ async fn negotiate_direct(
     if candidates.is_empty() {
         return Ok(None);
     }
+    // One reader per path: a new rendezvous round re-keys the existing socket instead of
+    // starting a second task on the same file descriptor.
     let socket = match existing {
-        Some(existing) if existing.credentials().nonce() == credentials.nonce() => existing,
-        _ => Arc::new(DirectSocket::open(udp, credentials).await?),
+        Some(existing) => {
+            if existing.round_id() != credentials.round_id() {
+                existing.rekey(credentials);
+            }
+            existing
+        }
+        None => Arc::new(DirectSocket::open(udp, credentials).await?),
     };
     let outcome = match socket.punch(candidates, probe).await {
         Ok(outcome) => outcome,
@@ -839,8 +933,22 @@ async fn negotiate_direct(
         }
         Err(error) => return Err(error.into()),
     };
+    let mut events = socket.subscribe();
     match socket.negotiate_switch(outcome.peer, switch).await {
-        Ok(()) => Ok(Some((socket, Some(outcome)))),
+        Ok(()) => {
+            // Both switches completed; each side now says it is reading the direct path and
+            // waits for the peer to say the same. A side that is not reading never confirms,
+            // so asymmetric loss can never commit one peer alone.
+            socket.send_confirm(outcome.peer).await?;
+            if socket
+                .await_confirmation(&mut events, outcome.peer, switch.confirmation_timeout)
+                .await
+            {
+                Ok(Some((socket, Some(outcome))))
+            } else {
+                Ok(Some((socket, None)))
+            }
+        }
         Err(HolePunchError::SwitchUnconfirmed) => Ok(Some((socket, None))),
         Err(error) => Err(error.into()),
     }
@@ -875,12 +983,28 @@ impl PathController {
             .into());
         }
 
+        // The epoch is the two peers' single-use ticket nonces. Without the peer's nonce a
+        // second connection on the same session would derive the same keys and the same
+        // nonces, so this refuses to build a path until rendezvous has exchanged them.
+        let peer_nonce = candidates.peer_nonce().ok_or(PathError::EpochUnavailable)?;
+        let epoch = Epoch::split(&ticket.nonce, peer_nonce, ticket.role)?;
         let cipher = SessionCipher::new(
             &setup.identity,
             verified.peer_identity_key,
             candidates.session_id(),
             ticket.role,
+            &epoch,
         )?;
+
+        if let Some(expected) = setup.expected_peer_identity {
+            if expected != verified.peer_identity_key {
+                return Err(TicketError::PeerIdentityMismatch {
+                    found: verified.peer_identity_key.to_string(),
+                    expected: expected.to_string(),
+                }
+                .into());
+            }
+        }
 
         let PathSetup {
             socket,
@@ -939,6 +1063,7 @@ impl PathController {
                     socket: direct_socket,
                     peer,
                     rtt,
+                    last_inbound: std::sync::Mutex::new(std::time::Instant::now()),
                 });
                 path.kind.store(DIRECT, Ordering::SeqCst);
             }

@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         switch: SwitchConfig {
             retries: 3,
             timeout: Duration::from_millis(100),
+            ..SwitchConfig::default()
         },
         ..PathConfig::default()
     };

@@ -42,7 +42,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 pub use aead::{
-    AeadError, IdentityKey, IdentityPublicKey, KEY_ID_LEN, SealedHeader, SessionCipher,
+    AeadError, Epoch, IdentityKey, IdentityPublicKey, KEY_ID_LEN, SealedHeader, SessionCipher,
 };
 pub use candidates::{
     CandidateError, CandidateKind, CandidateSet, EndpointCandidate, RendezvousCandidates,
@@ -53,7 +53,7 @@ pub use hole_punch::{
 };
 pub use path::{
     ConnectedPath, PathConfig, PathController, PathError, PathKind, PathSetup, RelayChannel,
-    RelayError, Ticket, TicketError,
+    RelayError, RelayOnlyPath, Ticket, TicketError,
 };
 
 /// Converts a server-advertised relay endpoint into the WebSocket URL a peer attaches to.

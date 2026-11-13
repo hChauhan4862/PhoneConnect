@@ -1,9 +1,9 @@
 //! Authenticated UDP hole punching and the direct data path that follows it.
 //!
-//! Every datagram carries the rendezvous nonce and an HMAC-SHA256 tag over the whole
-//! packet. The key is derived from the ticket's probe key, the session id, the nonce, and
-//! the sender's role, so a packet minted for another session, another ticket, or the
-//! opposite role never authenticates. Authentication happens before any sequence is
+//! Every datagram carries the rendezvous round id and an HMAC-SHA256 tag over the whole
+//! packet. The key is derived from the round's shared probe key, the session id, and the
+//! sender's role, so a packet minted for another session, another round, or the opposite
+//! role never authenticates. Authentication happens before any sequence is
 //! accepted, and a 64-entry replay window rejects a captured probe, acknowledgement, or
 //! frame instead of validating a path with it.
 //!
@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, mpsc};
 type HmacSha256 = Hmac<Sha256>;
 
 const MAGIC: &[u8] = b"PCPROBE1";
-/// magic + kind + role + seq + nonce digest + body length.
+/// magic + kind + role + seq + round id + body length.
 const HEADER_LEN: usize = 8 + 1 + 1 + 4 + 32 + 2;
 const MAC_LEN: usize = 32;
 const NONCE_DIGEST_LEN: usize = 32;
@@ -123,13 +123,16 @@ pub enum HolePunchError {
     Io { reason: String },
 }
 
-/// The authenticated, nonce-bound material one ticket grants for the direct path.
+/// The material one rendezvous round grants for the direct path.
+///
+/// Probes are bound to the round's shared probe key, not to a ticket's redemption nonce: a
+/// peer that re-requests a ticket gets a new nonce but must still interoperate with the peer
+/// that holds the older ticket from the same round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCredentials {
     session_id: String,
     role: TicketRole,
-    nonce: String,
-    nonce_digest: [u8; NONCE_DIGEST_LEN],
+    round_id: [u8; NONCE_DIGEST_LEN],
     probe_key: Vec<u8>,
     expires_at: i64,
 }
@@ -138,23 +141,17 @@ impl ProbeCredentials {
     pub fn new(
         session_id: impl Into<String>,
         role: TicketRole,
-        nonce: impl Into<String>,
         probe_key: Vec<u8>,
         expires_at: i64,
     ) -> Result<Self, HolePunchError> {
         if probe_key.len() != 32 {
             return Err(HolePunchError::Unauthenticated);
         }
-        let nonce = nonce.into();
-        if nonce.is_empty() {
-            return Err(HolePunchError::Unauthenticated);
-        }
-        let nonce_digest: [u8; NONCE_DIGEST_LEN] = Sha256::digest(nonce.as_bytes()).into();
+        let round_id: [u8; NONCE_DIGEST_LEN] = Sha256::digest(&probe_key).into();
         Ok(Self {
             session_id: session_id.into(),
             role,
-            nonce,
-            nonce_digest,
+            round_id,
             probe_key,
             expires_at,
         })
@@ -168,8 +165,12 @@ impl ProbeCredentials {
         self.role
     }
 
-    pub fn nonce(&self) -> &str {
-        &self.nonce
+    /// Identifier of the rendezvous round this peer probes on, derived from the round key.
+    pub fn round_id(&self) -> String {
+        self.round_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     pub fn expires_at(&self) -> i64 {
@@ -186,7 +187,7 @@ impl ProbeCredentials {
         mac.update(KEY_LABEL);
         mac.update(self.session_id.as_bytes());
         mac.update(&[0]);
-        mac.update(&self.nonce_digest);
+        mac.update(&self.round_id);
         mac.update(&[role.byte()]);
         let tag = mac.finalize().into_bytes();
         let mut key = [0u8; 32];
@@ -209,6 +210,9 @@ pub enum ProbePacket {
     Switch { seq: u32 },
     /// "I validated this path too; both sides may commit."
     SwitchAck { seq: u32, echo: u32 },
+    /// "I have validated this path and will read it." A side only sends this after its own
+    /// switch completed, so the peer commits only when the sender really is reading.
+    Confirm { seq: u32 },
 }
 
 const KIND_PROBE: u8 = 1;
@@ -216,6 +220,7 @@ const KIND_ACK: u8 = 2;
 const KIND_FRAME: u8 = 3;
 const KIND_SWITCH: u8 = 4;
 const KIND_SWITCH_ACK: u8 = 5;
+const KIND_CONFIRM: u8 = 6;
 
 impl ProbePacket {
     pub fn probe(seq: u32) -> Self {
@@ -244,13 +249,18 @@ impl ProbePacket {
         Self::SwitchAck { seq, echo }
     }
 
+    pub fn confirm(seq: u32) -> Self {
+        Self::Confirm { seq }
+    }
+
     pub fn seq(&self) -> u32 {
         match self {
             Self::Probe { seq }
             | Self::Ack { seq, .. }
             | Self::Frame { seq, .. }
             | Self::Switch { seq }
-            | Self::SwitchAck { seq, .. } => *seq,
+            | Self::SwitchAck { seq, .. }
+            | Self::Confirm { seq } => *seq,
         }
     }
 
@@ -262,13 +272,14 @@ impl ProbePacket {
             Self::Frame { payload, .. } => (KIND_FRAME, payload.clone()),
             Self::Switch { .. } => (KIND_SWITCH, Vec::new()),
             Self::SwitchAck { echo, .. } => (KIND_SWITCH_ACK, echo.to_be_bytes().to_vec()),
+            Self::Confirm { .. } => (KIND_CONFIRM, Vec::new()),
         };
         let mut datagram = Vec::with_capacity(HEADER_LEN + body.len() + MAC_LEN);
         datagram.extend_from_slice(MAGIC);
         datagram.push(kind);
         datagram.push(credentials.role.byte());
         datagram.extend_from_slice(&self.seq().to_be_bytes());
-        datagram.extend_from_slice(&credentials.nonce_digest);
+        datagram.extend_from_slice(&credentials.round_id);
         datagram.extend_from_slice(&(body.len() as u16).to_be_bytes());
         datagram.extend_from_slice(&body);
 
@@ -295,7 +306,7 @@ impl ProbePacket {
             return Err(HolePunchError::Unauthenticated);
         }
         let seq = u32::from_be_bytes([datagram[10], datagram[11], datagram[12], datagram[13]]);
-        if datagram[14..HEADER_LEN - 2] != credentials.nonce_digest {
+        if datagram[14..HEADER_LEN - 2] != credentials.round_id {
             return Err(HolePunchError::Unauthenticated);
         }
         let body_len =
@@ -331,6 +342,7 @@ impl ProbePacket {
             }
             KIND_SWITCH if body.is_empty() => Ok(Self::Switch { seq }),
             KIND_SWITCH_ACK => Ok(Self::SwitchAck { seq, echo: echo()? }),
+            KIND_CONFIRM if body.is_empty() => Ok(Self::Confirm { seq }),
             _ => Err(HolePunchError::Malformed),
         }
     }
@@ -425,6 +437,8 @@ pub enum DirectEvent {
     Switch { from: SocketAddr, echo: u32 },
     /// The peer confirmed our switch request.
     SwitchAck { from: SocketAddr, echo: u32 },
+    /// The peer says it is reading the direct path.
+    Confirmed { from: SocketAddr },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -435,8 +449,8 @@ struct AckEvent {
 
 struct DirectInner {
     socket: Arc<UdpSocket>,
-    credentials: ProbeCredentials,
-    authenticator: ProbeAuthenticator,
+    credentials: std::sync::RwLock<ProbeCredentials>,
+    authenticators: std::sync::RwLock<AuthenticatorRing>,
     seq: AtomicU32,
     peer: Mutex<Option<SocketAddr>>,
     acks: broadcast::Sender<AckEvent>,
@@ -462,8 +476,8 @@ impl std::fmt::Debug for DirectSocket {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DirectSocket")
-            .field("session_id", &self.inner.credentials.session_id)
-            .field("role", &self.inner.credentials.role)
+            .field("session_id", &self.credentials().session_id().to_owned())
+            .field("role", &self.credentials().role())
             .field("peer", &self.peer())
             .finish_non_exhaustive()
     }
@@ -481,8 +495,8 @@ impl DirectSocket {
         let (frames, frame_receiver) = mpsc::channel(DIRECT_FRAME_QUEUE);
         let inner = Arc::new(DirectInner {
             socket,
-            authenticator: ProbeAuthenticator::new(&credentials),
-            credentials,
+            authenticators: std::sync::RwLock::new(AuthenticatorRing::new(&credentials)),
+            credentials: std::sync::RwLock::new(credentials),
             seq: AtomicU32::new(0),
             peer: Mutex::new(None),
             acks,
@@ -500,8 +514,31 @@ impl DirectSocket {
         })
     }
 
-    pub fn credentials(&self) -> &ProbeCredentials {
-        &self.inner.credentials
+    /// The round this socket currently sends on.
+    pub fn round_id(&self) -> String {
+        self.credentials().round_id()
+    }
+
+    /// Switches this socket to a new rendezvous round without starting a second reader.
+    ///
+    /// One task owns `recv_from` for the socket's whole lifetime; rotating the key in place
+    /// is what keeps that true. The previous round's authenticator stays valid for a short
+    /// overlap so in-flight datagrams are still accepted.
+    pub fn rekey(&self, credentials: ProbeCredentials) {
+        if let Ok(mut ring) = self.inner.authenticators.write() {
+            ring.rotate(&credentials);
+        }
+        if let Ok(mut current) = self.inner.credentials.write() {
+            *current = credentials;
+        }
+    }
+
+    fn credentials(&self) -> ProbeCredentials {
+        self.inner
+            .credentials
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, HolePunchError> {
@@ -563,7 +600,8 @@ impl DirectSocket {
         for _ in 0..config.max_attempts {
             attempts += 1;
             let seq = self.inner.next_seq()?;
-            let probe = ProbePacket::probe(seq).encode(&self.inner.credentials);
+            let credentials = self.credentials();
+            let probe = ProbePacket::probe(seq).encode(&credentials);
             let sent_at = Instant::now();
             for candidate in candidates {
                 self.inner.send_datagram(&probe, *candidate).await?;
@@ -617,10 +655,7 @@ impl DirectSocket {
             if now >= next_request {
                 let seq = self.inner.next_seq()?;
                 self.inner
-                    .send_datagram(
-                        &ProbePacket::switch(seq).encode(&self.inner.credentials),
-                        peer,
-                    )
+                    .send_datagram(&ProbePacket::switch(seq).encode(&self.credentials()), peer)
                     .await?;
                 pending = Some(seq);
                 next_request = now + config.retry_interval();
@@ -638,7 +673,7 @@ impl DirectSocket {
                 {
                     return Ok(());
                 }
-                Ok(Ok(DirectEvent::SwitchAck { .. })) => {}
+                Ok(Ok(DirectEvent::SwitchAck { .. } | DirectEvent::Confirmed { .. })) => {}
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
                     return Err(HolePunchError::Closed);
@@ -661,10 +696,48 @@ impl DirectSocket {
         let seq = self.inner.next_seq()?;
         self.inner
             .send_datagram(
-                &ProbePacket::switch_ack(seq, echo).encode(&self.inner.credentials),
+                &ProbePacket::switch_ack(seq, echo).encode(&self.credentials()),
                 from,
             )
             .await
+    }
+
+    /// Tells the peer this side now reads the direct path, after its own switch completed.
+    pub async fn send_confirm(&self, peer: SocketAddr) -> Result<(), HolePunchError> {
+        let seq = self.inner.next_seq()?;
+        self.inner
+            .send_datagram(&ProbePacket::confirm(seq).encode(&self.credentials()), peer)
+            .await
+    }
+
+    /// Subscribes to switch and confirmation events. Subscribe *before* sending anything a
+    /// peer may answer, so a fast answer is never missed.
+    pub fn subscribe(&self) -> broadcast::Receiver<DirectEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// Waits on an already-subscribed event stream for the peer's confirmation, bounded. A
+    /// peer that is not reading the direct path never sends one, and the caller must keep
+    /// the relay as the delivery path.
+    pub async fn await_confirmation(
+        &self,
+        events: &mut broadcast::Receiver<DirectEvent>,
+        peer: SocketAddr,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(DirectEvent::Confirmed { from })) if from == peer => return true,
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => return false,
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Acknowledges a peer's switch request after the local path state machine decided the
@@ -677,7 +750,7 @@ impl DirectSocket {
     pub async fn send_frame(&self, peer: SocketAddr, sealed: &[u8]) -> Result<(), HolePunchError> {
         let packet = ProbePacket::frame(self.inner.next_seq()?, sealed.to_vec())?;
         self.inner
-            .send_datagram(&packet.encode(&self.inner.credentials), peer)
+            .send_datagram(&packet.encode(&self.credentials()), peer)
             .await
     }
 
@@ -704,7 +777,50 @@ impl Drop for DirectSocket {
     }
 }
 
+/// Current round authenticator plus the previous one during a rotation overlap.
+struct AuthenticatorRing {
+    current: ProbeAuthenticator,
+    previous: Option<(ProbeAuthenticator, Instant)>,
+}
+
+/// How long datagrams from the previous round are still accepted after a rotation.
+const REKEY_OVERLAP: Duration = Duration::from_secs(2);
+
+impl AuthenticatorRing {
+    fn new(credentials: &ProbeCredentials) -> Self {
+        Self {
+            current: ProbeAuthenticator::new(credentials),
+            previous: None,
+        }
+    }
+
+    fn rotate(&mut self, credentials: &ProbeCredentials) {
+        let next = ProbeAuthenticator::new(credentials);
+        let previous = std::mem::replace(&mut self.current, next);
+        self.previous = Some((previous, Instant::now() + REKEY_OVERLAP));
+    }
+
+    fn accept(&self, datagram: &[u8]) -> Result<ProbePacket, HolePunchError> {
+        match self.current.accept(datagram) {
+            Err(HolePunchError::Unauthenticated) => match &self.previous {
+                Some((previous, retire_at)) if Instant::now() < *retire_at => {
+                    previous.accept(datagram)
+                }
+                _ => Err(HolePunchError::Unauthenticated),
+            },
+            other => other,
+        }
+    }
+}
+
 impl DirectInner {
+    fn accept(&self, datagram: &[u8]) -> Result<ProbePacket, HolePunchError> {
+        self.authenticators
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accept(datagram)
+    }
+
     fn peer(&self) -> MutexGuard<'_, Option<SocketAddr>> {
         self.peer
             .lock()
@@ -743,6 +859,8 @@ impl DirectInner {
 pub struct SwitchConfig {
     pub retries: u32,
     pub timeout: Duration,
+    /// How long this side waits for the peer's confirmation after both switches completed.
+    pub confirmation_timeout: Duration,
 }
 
 impl Default for SwitchConfig {
@@ -750,6 +868,7 @@ impl Default for SwitchConfig {
         Self {
             retries: 3,
             timeout: Duration::from_millis(150),
+            confirmation_timeout: Duration::from_millis(750),
         }
     }
 }
@@ -780,11 +899,16 @@ async fn switch_responder(inner: Arc<DirectInner>) {
                     continue;
                 }
                 if let Ok(seq) = inner.next_seq() {
-                    let ack = ProbePacket::switch_ack(seq, echo).encode(&inner.credentials);
+                    let credentials = inner
+                        .credentials
+                        .read()
+                        .map(|current| current.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let ack = ProbePacket::switch_ack(seq, echo).encode(&credentials);
                     let _ = inner.socket.send_to(&ack, from).await;
                 }
             }
-            Ok(DirectEvent::SwitchAck { .. }) => {}
+            Ok(DirectEvent::SwitchAck { .. } | DirectEvent::Confirmed { .. }) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -809,11 +933,16 @@ async fn read_loop(inner: Arc<DirectInner>) {
                 return;
             }
         };
-        match inner.authenticator.accept(&buffer[..length]) {
+        match inner.accept(&buffer[..length]) {
             Ok(ProbePacket::Probe { seq }) => {
+                let credentials = inner
+                    .credentials
+                    .read()
+                    .map(|current| current.clone())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
                 let ack = inner
                     .next_seq()
-                    .map(|own| ProbePacket::ack(own, seq).encode(&inner.credentials));
+                    .map(|own| ProbePacket::ack(own, seq).encode(&credentials));
                 if let Ok(ack) = ack {
                     let _ = inner.socket.send_to(&ack, from).await;
                 }
@@ -826,6 +955,9 @@ async fn read_loop(inner: Arc<DirectInner>) {
             }
             Ok(ProbePacket::SwitchAck { echo, .. }) => {
                 let _ = inner.events.send(DirectEvent::SwitchAck { from, echo });
+            }
+            Ok(ProbePacket::Confirm { .. }) => {
+                let _ = inner.events.send(DirectEvent::Confirmed { from });
             }
             Ok(ProbePacket::Frame { payload, .. }) => {
                 let known = *inner.peer() == Some(from);

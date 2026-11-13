@@ -65,10 +65,21 @@ direction. Every frame is sealed with ChaCha20-Poly1305, a per-direction nonce b
 the direction byte and a monotonic counter, and associated data that binds the session id,
 stream kind, sequence, counter, and key id.
 
-The server only ever receives the public halves. It cannot derive a traffic key, so it
-cannot read a frame even though it carries it. The server-issued probe key authenticates
-hole-punch datagrams only; it never keys encryption. A tampered frame, an unknown key id, a
-reflected frame, a replayed counter, and a counter regression are all refused explicitly.
+The server only ever receives the public halves. It cannot derive a traffic key from what it
+stores, so it cannot read a frame even though it carries it. The server-issued probe key
+authenticates hole-punch datagrams only; it never keys encryption. A tampered frame, an
+unknown key id, a reflected frame, a replayed counter, and a counter regression are refused
+explicitly, while a reordered frame inside the replay window is still delivered.
+
+Each connection mixes a fresh epoch (both tickets' single-use nonces) into the key
+derivation, so a reconnecting peer derives new keys and never reuses a ChaCha20-Poly1305
+nonce.
+
+The trust model is explicit: peer identity is trust-on-first-use through this rendezvous
+service, because the ticket that names the peer's key is signed by the server. A malicious
+or compromised server can substitute a peer key and MITM, so clients must authenticate the
+server over TLS and may pin the peer identity out of band. The protocol gives fresh keys per
+connection but not forward secrecy.
 
 ## Rendezvous tickets and direct-path candidate exchange
 

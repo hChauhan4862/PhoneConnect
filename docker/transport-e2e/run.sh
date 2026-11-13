@@ -88,8 +88,25 @@ register_candidate() {
         -d "{\"ticket\":$2,\"endpoint\":\"$DEAD_CANDIDATE\"}"
 }
 
-CLIENT_CANDIDATES=$(register_candidate "$CAPABILITY" "$CLIENT_TICKET")
-DEVICE_CANDIDATES=$(register_candidate "$CREDENTIAL" "$DEVICE_TICKET")
+register_candidate "$CAPABILITY" "$CLIENT_TICKET" >/dev/null
+register_candidate "$CREDENTIAL" "$DEVICE_TICKET" >/dev/null
+
+# Re-read both views once each peer has registered: the response to the first registration
+# cannot contain the other peer's nonce yet, and the nonce pair is the connection epoch both
+# stubs need before they can derive the same traffic keys.
+CLIENT_CANDIDATES=$(curl -fsS "$BASE/api/sessions/$SESSION_ID/candidates" \
+    -H "Authorization: Bearer $CAPABILITY")
+DEVICE_CANDIDATES=$(curl -fsS "$BASE/api/sessions/$SESSION_ID/candidates" \
+    -H "Authorization: Bearer $CREDENTIAL")
+
+ensure_peer_nonce() {
+    printf '%s' "$1" | grep -q '"peer_nonce"' || {
+        echo "rendezvous did not exchange the peer nonce" >&2
+        exit 1
+    }
+}
+ensure_peer_nonce "$CLIENT_CANDIDATES"
+ensure_peer_nonce "$DEVICE_CANDIDATES"
 
 RELAY_URL="ws://server:8080/api/sessions/$SESSION_ID/relay"
 COMMON=(-e "STUB_RELAY_URL=$RELAY_URL" -e "STUB_PAYLOAD=fallback")

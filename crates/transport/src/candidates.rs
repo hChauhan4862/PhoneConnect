@@ -53,6 +53,9 @@ pub struct RendezvousCandidates {
     /// Hex-encoded Ed25519 key that verifies the server's rendezvous tickets.
     #[serde(default)]
     pub verification_key: String,
+    /// Redemption nonce of the opposite peer's ticket, once that peer has registered.
+    #[serde(default)]
+    pub peer_nonce: Option<String>,
     pub candidates: Vec<WireCandidate>,
 }
 
@@ -89,6 +92,7 @@ pub struct CandidateSet {
     session_id: String,
     expires_at: i64,
     verification_key: String,
+    peer_nonce: Option<String>,
     candidates: Vec<EndpointCandidate>,
 }
 
@@ -166,6 +170,7 @@ impl CandidateSet {
             session_id: rendezvous.session_id,
             expires_at: rendezvous.expires_at,
             verification_key: rendezvous.verification_key,
+            peer_nonce: rendezvous.peer_nonce,
             candidates,
         })
     }
@@ -181,6 +186,11 @@ impl CandidateSet {
     /// Hex-encoded Ed25519 key that verifies this session's tickets.
     pub fn verification_key(&self) -> &str {
         &self.verification_key
+    }
+
+    /// The opposite peer's ticket nonce, which completes this connection's key epoch.
+    pub fn peer_nonce(&self) -> Option<&str> {
+        self.peer_nonce.as_deref()
     }
 
     pub fn candidates(&self) -> &[EndpointCandidate] {
