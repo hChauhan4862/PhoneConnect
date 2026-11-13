@@ -131,7 +131,10 @@ that session id: create a new session and never retry on the old one.
 A transport that ends because of revocation or expiry sends a WebSocket close frame with a
 stable code (`device_revoked`, `session_revoked`, `session_expired`, `idle_timeout`,
 `backpressure`, and so on). Peers learn revocation from that stream error, not from the
-status the lease reported when it was issued. Closed relay state is dropped when the session expires, so memory stays bounded by
+status the lease reported when it was issued. A full peer queue is one of those closes: a
+sender that overruns it never sees a per-frame "backpressure" response, it sees the stream
+close, which is why the transport treats any relay refusal as the signal that the copy did
+not reach the peer. Closed relay state is dropped when the session expires, so memory stays bounded by
 sessions from the last five minutes.
 
 ## Configuration

@@ -1924,6 +1924,9 @@ struct AckLossProxy {
     drop_confirm_from_client: ConfirmLoss,
     /// Stop forwarding entirely, without closing the socket.
     paused: Arc<AtomicBool>,
+    /// Drop everything from the client to the device, without closing the socket. The
+    /// opposite direction keeps working, which is what a one-way outage looks like.
+    drop_client_outbound: Option<Arc<AtomicBool>>,
     /// Confirmations already dropped.
     confirms_dropped: Arc<AtomicUsize>,
 }
@@ -1948,6 +1951,15 @@ impl AckLossProxy {
                 continue;
             };
             if self.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            if from == self.client
+                && self
+                    .drop_client_outbound
+                    .as_ref()
+                    .is_some_and(|drop| drop.load(Ordering::SeqCst))
+            {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
                 continue;
             }
             if self.drop_switch_acks
@@ -2005,6 +2017,7 @@ async fn asymmetric_ack_loss_never_commits_one_peer_and_keeps_delivering() {
             drop_switch_acks: true,
             drop_confirm_from_client: ConfirmLoss::None,
             paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: None,
             confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
@@ -2124,6 +2137,7 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
             drop_switch_acks: false,
             drop_confirm_from_client: ConfirmLoss::None,
             paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: None,
             confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
@@ -2306,6 +2320,7 @@ async fn a_single_lost_confirmation_is_retransmitted_and_both_sides_commit() {
             drop_switch_acks: false,
             drop_confirm_from_client: ConfirmLoss::First,
             paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: None,
             confirms_dropped: Arc::clone(&confirms_dropped),
         }
         .run(Arc::clone(&stop)),
@@ -2376,6 +2391,7 @@ async fn a_permanently_lost_confirmation_leaves_both_peers_on_the_relay() {
             drop_switch_acks: false,
             drop_confirm_from_client: ConfirmLoss::All,
             paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: None,
             confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
@@ -2608,6 +2624,7 @@ async fn a_demoted_direct_path_re_promotes_when_the_peer_returns() {
             drop_switch_acks: false,
             drop_confirm_from_client: ConfirmLoss::None,
             paused: Arc::clone(&paused),
+            drop_client_outbound: None,
             confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
@@ -2970,6 +2987,7 @@ async fn a_silent_direct_path_still_demotes_on_receive() {
             drop_switch_acks: false,
             drop_confirm_from_client: ConfirmLoss::None,
             paused: Arc::clone(&paused),
+            drop_client_outbound: None,
             confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
@@ -3385,5 +3403,387 @@ async fn inbound_ring_overflow_is_reported_on_the_path() {
         pair.client.dropped_frames() >= 80 - 64,
         "every frame beyond the ring's capacity is counted: {}",
         pair.client.dropped_frames()
+    );
+}
+
+// --------------------------------------------------------------------------------------
+// Round 5: relay reachability across the transition bound, delivery-shaped send results,
+// and local loss as a distinct signal.
+// --------------------------------------------------------------------------------------
+
+/// A relay that reports a full peer queue the way the server does: by closing the socket.
+/// The production path never returns `Backpressure` to a WebSocket peer — the queue overflow
+/// closes the connection and the peer reads the close reason — so a fix that only recognises
+/// `Backpressure` never fires outside the test suite.
+struct ClosedRelay {
+    sends: AtomicUsize,
+}
+
+#[async_trait]
+impl RelayChannel for ClosedRelay {
+    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        Err(RelayError::Closed {
+            reason: "backpressure".to_owned(),
+        })
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        std::future::pending().await
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// A committed direct path whose outbound direction fails must not take the relay with it.
+/// The peer stops hearing us, demotes to the relay, and sends there; a committed path that
+/// never reads the relay loses those frames and keeps reporting `Ok` for frames that were
+/// dropped. The relay has to stay readable for the whole path lifetime, a relay frame has to
+/// move our sends there, and no frame reported as sent may go missing.
+#[tokio::test]
+async fn a_one_way_outbound_fault_after_commit_keeps_delivering_over_the_relay() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let one_way = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::clone(&dropped),
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: Some(Arc::clone(&one_way)),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, client_probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(150),
+        keepalive_interval: Duration::from_millis(40),
+        recv_timeout: Duration::from_secs(1),
+        transition_timeout: Duration::from_secs(30),
+        transition_max_frames: 4,
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(client_relay)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    // Commit the client to the direct path with a real direct frame: a committed path is the
+    // state the fault has to survive.
+    let warmup = envelope("req-one-way-warmup", b"commit to direct");
+    device_path.send_frame(&warmup).await.expect("warmup send");
+    assert_eq!(recv(&client_path).await, warmup);
+    assert!(
+        !client_path.transition_active(),
+        "the direct frame committed"
+    );
+
+    // Our outbound direction fails; the peer's still works, so our keepalives are answered
+    // and nothing here may conclude the path is dead.
+    one_way.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The peer stopped hearing us and sends on the relay. A committed path that only reads
+    // the direct socket never sees this.
+    let peer_frame = envelope("req-one-way-peer", b"the peer is on the relay");
+    device_path
+        .send_frame(&peer_frame)
+        .await
+        .expect("the peer demoted and sent on the relay");
+    assert_eq!(
+        device_path.path_kind(),
+        PathKind::Relay,
+        "the peer stopped hearing us, so it uses the relay"
+    );
+    assert_eq!(
+        recv(&client_path).await,
+        peer_frame,
+        "a committed path still drains the relay"
+    );
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "a relay-origin frame moves our sends to the relay"
+    );
+
+    // Every frame the client reports as sent must arrive.
+    for index in 0..4 {
+        let frame = envelope(&format!("req-one-way-{index}"), b"must arrive");
+        timeout(Duration::from_secs(2), client_path.send_frame(&frame))
+            .await
+            .expect("send is bounded")
+            .expect("send reports success");
+        assert_eq!(
+            recv(&device_path).await,
+            frame,
+            "a frame reported as sent arrived"
+        );
+    }
+
+    assert_eq!(
+        client_path.relay_backpressure_events(),
+        0,
+        "recovery must not charge the relay until it closes the session"
+    );
+    assert!(
+        !client_probe.closed(),
+        "the relay fallback is never closed by path state"
+    );
+
+    drop(client_path);
+    drop(device_path);
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+/// A relay that closes instead of reporting `Backpressure` still ends the duplication, and a
+/// frame the direct copy delivered is reported as sent instead of as an error.
+#[tokio::test]
+async fn a_relay_that_closes_ends_duplication_and_a_delivered_frame_is_not_an_error() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+
+    let closed = Arc::new(ClosedRelay {
+        sends: AtomicUsize::new(0),
+    });
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(Arc::clone(&closed) as Arc<dyn RelayChannel>)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    let first = envelope("req-closed-relay-1", b"direct delivery");
+    client_path
+        .send_frame(&first)
+        .await
+        .expect("the direct copy landed even though the relay closed its copy");
+    assert_eq!(
+        client_path.relay_backpressure_events(),
+        1,
+        "a relay refusal is reported instead of returned as a send failure"
+    );
+    assert_eq!(closed.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(recv(&device_path).await, first);
+
+    let second = envelope("req-closed-relay-2", b"no more copies");
+    client_path
+        .send_frame(&second)
+        .await
+        .expect("direct delivery");
+    assert_eq!(
+        closed.sends.load(Ordering::SeqCst),
+        1,
+        "a relay that closed ends the duplication instead of being charged again"
+    );
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+    assert_eq!(recv(&device_path).await, second);
+}
+
+/// Frames the bounded inbound ring drops are lost locally, so the next read must say so in a
+/// way the caller can distinguish from a peer whose counter went backwards.
+#[tokio::test]
+async fn a_local_drop_gap_is_a_frames_lost_signal_not_a_counter_regression() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(1000),
+            keepalive_interval: Duration::from_millis(40),
+            transition_timeout: Duration::from_secs(30),
+            transition_max_frames: 4,
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    // The device sends while the client never reads: the client's inbound ring holds 64.
+    for index in 0..80 {
+        let frame = envelope(&format!("req-gap-{index}"), b"filling the ring");
+        pair.device.send_frame(&frame).await.expect("send");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(pair.client.dropped_frames() >= 16);
+
+    let error = timeout(Duration::from_secs(2), pair.client.recv_frame())
+        .await
+        .expect("the read is bounded")
+        .expect_err("the gap is reported instead of being passed off as a peer fault");
+    match error {
+        PathError::FramesLost { count } => {
+            assert!(count >= 16, "the loss count is reported: {count}")
+        }
+        other => panic!("local loss must not surface as {other}"),
+    }
+
+    // Non-fatal: the frames the ring still holds continue to arrive, starting after the gap.
+    assert_eq!(
+        recv(&pair.client).await.request_id,
+        "req-gap-16",
+        "the session keeps delivering after the loss is reported"
+    );
+}
+
+/// `dropped_frames` is documented as monotonic; shutting the path down must not reset it to
+/// zero, which would hide the loss from a caller that reports it after the session ends.
+#[tokio::test]
+async fn the_dropped_frame_counter_stays_monotonic_after_shutdown() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(1000),
+            keepalive_interval: Duration::from_millis(40),
+            transition_timeout: Duration::from_secs(30),
+            transition_max_frames: 4,
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    for index in 0..80 {
+        let frame = envelope(&format!("req-shutdown-{index}"), b"filling the ring");
+        pair.device.send_frame(&frame).await.expect("send");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let before = pair.client.dropped_frames();
+    assert!(before >= 16, "the loss happened: {before}");
+    pair.client.shutdown().await.expect("shutdown");
+    assert_eq!(
+        pair.client.dropped_frames(),
+        before,
+        "the counter is monotonic across shutdown"
     );
 }

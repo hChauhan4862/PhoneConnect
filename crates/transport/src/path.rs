@@ -22,8 +22,17 @@
 //! the relay is being read re-promotes it. A freshly committed or re-promoted direct path
 //! duplicates every frame onto the relay, bounded by
 //! [`PathConfig::transition_timeout`] and [`PathConfig::transition_max_frames`], until a
-//! direct frame proves the peer reads direct; a relay that reports backpressure ends the
+//! direct frame proves the peer reads direct; a relay that refuses a copy ends the
 //! duplication instead of being charged again.
+//!
+//! The transition bound ends the *duplication*, never the relay. Once a path has a relay it
+//! reads it for the rest of its life, in every state, so a peer that demoted — or that we
+//! demoted ourselves onto — still reaches us. Only relay *sends* are limited, because they
+//! are what can fill the relay's bounded queue. A relay-origin frame is proof the peer
+//! reads the relay, so it moves our sends there; the next direct frame moves them back.
+//! Without that, a one-way outage (our datagrams lost, the peer's delivered) would be
+//! permanent: we would commit to direct, the peer would demote, and every frame we reported
+//! as sent would be dropped.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -308,6 +317,12 @@ pub struct PathConfig {
     /// Frame bound of the same transition. Whatever is reached first, time or count, ends
     /// the duplication.
     pub transition_max_frames: u32,
+    /// How long a relay frame waits for its direct twin while the path is duplicating and the
+    /// peer still answers keepalives. An in-memory or low-latency relay delivers the copy of
+    /// a dual-sent frame before the datagram arrives, and without this the receiver would
+    /// abandon a healthy direct path for its own duplicate. Bounded by the caller's remaining
+    /// `recv_timeout`, and skipped entirely when the direct path is not duplicating.
+    pub relay_frame_grace: Duration,
     /// Frame profile. Control paths must use [`FrameLimits::control_only`].
     pub frame_limits: FrameLimits,
     /// Largest sealed frame the direct datagram path accepts.
@@ -327,6 +342,7 @@ impl Default for PathConfig {
             keepalive_interval: Duration::from_millis(500),
             transition_timeout: Duration::from_secs(1),
             transition_max_frames: 16,
+            relay_frame_grace: Duration::from_millis(20),
             frame_limits: FrameLimits::control_only(),
             direct_frame_limit: MAX_DIRECT_FRAME_BYTES,
             recv_timeout: Duration::from_secs(5),
@@ -374,6 +390,11 @@ impl PathConfig {
         if self.transition_timeout.is_zero() || self.transition_max_frames == 0 {
             return Err(PathError::InvalidConfig {
                 reason: "the path transition must be bounded in both time and frames".to_owned(),
+            });
+        }
+        if self.relay_frame_grace.is_zero() {
+            return Err(PathError::InvalidConfig {
+                reason: "relay_frame_grace must be non-zero".to_owned(),
             });
         }
         Ok(())
@@ -489,6 +510,12 @@ pub enum PathError {
     EpochUnavailable,
     #[error("direct frame of {length} bytes exceeds the {limit}-byte datagram limit")]
     DirectFrameTooLarge { length: usize, limit: usize },
+    /// The bounded inbound ring dropped frames because the application was not reading fast
+    /// enough. Non-fatal and local: nothing is wrong with the peer, and the next read
+    /// continues with the frames that are still queued. Reported instead of surfacing as an
+    /// `AeadError::CounterRegression`, which would blame the peer for local loss.
+    #[error("the direct path dropped {count} inbound frame(s) because the reader fell behind")]
+    FramesLost { count: u32 },
     #[error("path is shut down")]
     Shutdown,
 }
@@ -547,9 +574,19 @@ const RELAY: u8 = 1;
 ///
 /// The duplication is bounded by [`PathConfig::transition_timeout`] and
 /// [`PathConfig::transition_max_frames`]. An inbound direct frame — the only proof the peer
-/// reads the direct path — ends it at once; so does a relay that reports backpressure, which
-/// means the peer is not draining its relay queue and cannot be relying on it.
+/// reads the direct path — ends it at once; so does a relay that refuses a copy, which means
+/// the copy did not reach the peer. The bound ends the duplication, not the relay: the relay
+/// is still read, so a peer that moved to it keeps delivering.
 const PENDING: u8 = 2;
+
+/// Which transport a received frame came from. The receive path reports it so a frame the
+/// peer really sent moves the send side, while a duplicate copy (which the AEAD rejects as
+/// `Replayed`) does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSource {
+    Direct,
+    Relay,
+}
 
 /// Tickets this process has already opened a path with, per session and role.
 ///
@@ -611,6 +648,16 @@ fn direct_snapshot(state: &PathState) -> Option<(Arc<DirectSocket>, SocketAddr)>
         .map(|direct| (Arc::clone(&direct.socket), direct.peer))
 }
 
+/// Waits for one relay frame, or for ever when this read has given up on the relay. Both
+/// sides of the wait in [`ConnectedPath::recv_both`] then have the same shape, and a dropped
+/// relay keeps the direct read running instead of spinning.
+async fn await_relay(relay: Option<Arc<dyn RelayChannel>>) -> Result<Vec<u8>, RelayError> {
+    match relay {
+        Some(relay) => relay.recv_frame().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn path_kind_byte(kind: PathKind) -> u8 {
     match kind {
         PathKind::Direct => DIRECT,
@@ -636,12 +683,21 @@ pub struct ConnectedPath {
     transition_started: std::sync::Mutex<Option<std::time::Instant>>,
     /// Frames duplicated onto the relay during the current transition.
     transition_frames: AtomicU32,
-    /// Relay copies the relay refused because its peer queue was full, over the path's
-    /// whole life. Reported by [`ConnectedPath::relay_backpressure_events`].
+    /// Relay copies the relay refused — because the peer's queue was full, or because it
+    /// closed the session — over the path's whole life. Reported by
+    /// [`ConnectedPath::relay_backpressure_events`].
     relay_backpressure: AtomicU32,
     /// Whether the relay refused a copy during the current transition, so duplication must
     /// not be charged again until the next one starts.
     relay_suppressed: AtomicBool,
+    /// Frames the direct socket's bounded inbound ring dropped, kept here so the counter
+    /// stays readable (and monotonic) after the socket is closed.
+    dropped_frames: AtomicU32,
+    /// Highest drop count already surfaced as [`PathError::FramesLost`].
+    loss_reported: AtomicU32,
+    /// A relay frame that lost its race with the direct copy of the same frame, kept so it
+    /// can be handed out instead of being dropped.
+    held_relay_frame: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl fmt::Debug for ConnectedPath {
@@ -700,6 +756,9 @@ impl ConnectedPath {
             transition_frames: AtomicU32::new(0),
             relay_backpressure: AtomicU32::new(0),
             relay_suppressed: AtomicBool::new(false),
+            dropped_frames: AtomicU32::new(0),
+            loss_reported: AtomicU32::new(0),
+            held_relay_frame: std::sync::Mutex::new(None),
         })
     }
 
@@ -743,21 +802,47 @@ impl ConnectedPath {
         self.state_byte() == PENDING && !self.transition_exhausted()
     }
 
-    /// Relay copies refused with backpressure. Non-zero means the relay's peer queue was
-    /// full — the peer is not draining its relay — so the path stopped duplicating onto it
-    /// and delivered on the direct path only. Reported instead of being swallowed.
+    /// Relay copies the relay refused, over the path's whole life. A refusal means the copy
+    /// did not reach the peer — the production relay reports a full peer queue by closing
+    /// the connection, which a peer reads as [`RelayError::Closed`] — so this is also the
+    /// signal that ended the duplication early.
     pub fn relay_backpressure_events(&self) -> u32 {
         self.relay_backpressure.load(Ordering::SeqCst)
     }
 
     /// Frames the direct path's inbound ring dropped because the application was not reading
     /// fast enough. The ring is bounded so a stalled reader cannot stop the socket from
-    /// answering keepalives and switches; the cost is loss, which is reported here rather
-    /// than surfacing as an unexplained sequence hole at the AEAD layer.
+    /// answering keepalives and switches; the cost is loss, which is reported here and as
+    /// [`PathError::FramesLost`] on the next receive rather than surfacing as an unexplained
+    /// sequence hole at the AEAD layer. The counter is monotonic: shutting the path down does
+    /// not reset it.
     pub fn dropped_frames(&self) -> u32 {
-        self.probe_socket()
+        self.observe_dropped_frames()
+    }
+
+    /// Reads the socket's drop counter into this path's own, so the value survives the socket
+    /// being closed. Never decreases.
+    fn observe_dropped_frames(&self) -> u32 {
+        let live = self
+            .probe_socket()
             .map(|socket| socket.dropped_frames())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        self.dropped_frames
+            .fetch_max(live, Ordering::SeqCst)
+            .max(live)
+    }
+
+    /// Local loss the caller has not been told about yet. `None` means nothing new was
+    /// dropped, so a gap reported now would be the peer's fault, not ours.
+    fn unreported_loss(&self) -> Option<u32> {
+        let dropped = self.observe_dropped_frames();
+        let reported = self.loss_reported.load(Ordering::SeqCst);
+        if dropped > reported {
+            self.loss_reported.store(dropped, Ordering::SeqCst);
+            Some(dropped - reported)
+        } else {
+            None
+        }
     }
 
     fn begin_transition(&self) {
@@ -859,25 +944,22 @@ impl ConnectedPath {
                 let (socket, peer) = direct.ok_or(PathError::NoPath)?;
                 let relay = relay.ok_or(PathError::NoPath)?;
                 // Both copies go out while the peer may still be reading the relay; its
-                // replay window drops the duplicate. Success on either path is delivery.
+                // replay window drops the duplicate. Success on either path is delivery, and
+                // any relay refusal — backpressure here, or the close the production relay
+                // sends instead — ends the duplication instead of being charged again.
                 let direct_sent = sealed.len() <= self.config.direct_frame_limit
                     && socket.send_frame(peer, &sealed).await.is_ok();
                 self.transition_frames.fetch_add(1, Ordering::SeqCst);
                 match self.send_via_relay(Some(relay), &sealed).await {
                     Ok(()) => Ok(()),
-                    Err(PathError::Relay(RelayError::Backpressure)) => {
-                        // The peer is not draining its relay queue, so a relay copy can
-                        // never arrive. Stop duplicating and deliver on the direct path;
-                        // the count reports the refusal instead of hiding it.
+                    Err(error) => {
+                        // The copy did not reach the peer: the relay refused it or closed the
+                        // session. Stop duplicating, and report the frame as sent when the
+                        // direct copy landed, because it did.
                         self.relay_backpressure.fetch_add(1, Ordering::SeqCst);
                         self.relay_suppressed.store(true, Ordering::SeqCst);
-                        if direct_sent {
-                            Ok(())
-                        } else {
-                            Err(PathError::Relay(RelayError::Backpressure))
-                        }
+                        if direct_sent { Ok(()) } else { Err(error) }
                     }
-                    Err(error) => Err(error),
                 }
             }
             _ => match relay {
@@ -900,179 +982,206 @@ impl ConnectedPath {
     ///
     /// A duplicate that arrives on the other path during a transition, or twice from the
     /// network, is skipped rather than surfaced: the AEAD replay window already rejected it,
-    /// and it is not an application error.
+    /// and it is not an application error. Loss the bounded inbound ring caused is surfaced
+    /// as [`PathError::FramesLost`] — non-fatal and local — instead of as the
+    /// [`AeadError::CounterRegression`] a broken peer would produce.
+    ///
+    /// One task should own the receive side, as with any stream: a competing reader can
+    /// replace a relay frame that is being held for the next read.
     pub async fn recv_frame(&self) -> Result<Envelope, PathError> {
+        if let Some(count) = self.unreported_loss() {
+            return Err(PathError::FramesLost { count });
+        }
         let deadline = std::time::Instant::now() + self.config.recv_timeout;
         loop {
-            let sealed = self.next_sealed(deadline).await?;
+            let (sealed, source) = self.next_sealed(deadline).await?;
             match self.cipher.open(&sealed) {
-                Ok(envelope) => return Ok(envelope),
+                Ok(envelope) => {
+                    // The state only changes for a frame the peer actually sent in this
+                    // round: a duplicate copy carries no information about where the peer
+                    // reads, and the replay window has just told us it is old news.
+                    match source {
+                        FrameSource::Direct => self.commit_direct(),
+                        FrameSource::Relay => self.adopt_relay(),
+                    }
+                    return Ok(envelope);
+                }
                 Err(AeadError::Replayed { .. }) => continue,
+                Err(AeadError::CounterRegression { counter, highest }) => {
+                    // A regression our own ring explains is local loss, never a peer fault,
+                    // so the caller is told what actually happened and can carry on.
+                    if let Some(count) = self.unreported_loss() {
+                        return Err(PathError::FramesLost { count });
+                    }
+                    return Err(AeadError::CounterRegression { counter, highest }.into());
+                }
                 Err(error) => return Err(error.into()),
             }
         }
     }
 
-    async fn next_sealed(&self, deadline: std::time::Instant) -> Result<Vec<u8>, PathError> {
-        let (state, direct, relay) = {
+    /// Reads the next sealed frame from whichever transport delivers one.
+    ///
+    /// A path that has a relay reads it for as long as it exists, whatever state the send
+    /// side is in: the relay is the fallback for the whole path lifetime, so a peer that
+    /// moved to it must still reach us. The state only decides where *sends* go, which is
+    /// what can fill the relay's bounded queue.
+    async fn next_sealed(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<u8>, FrameSource), PathError> {
+        let (direct, relay) = {
             let state = self.state.read().await;
             if state.closed {
                 return Err(PathError::Shutdown);
             }
-            let mut current = self.state_byte();
             // A transition path lives as long as the peer answers keepalives. Only a dead
             // socket demotes it; an idle session must not lose its direct path.
-            if current == PENDING {
+            if self.state_byte() == PENDING {
                 let dead = direct_snapshot(&state)
                     .map(|(socket, _)| !socket.is_alive(self.config.direct_health_timeout))
                     .unwrap_or(true);
                 if dead && state.relay.is_some() {
                     self.end_transition();
                     self.kind.store(RELAY, Ordering::SeqCst);
-                    current = RELAY;
                 }
             }
-            (current, direct_snapshot(&state), state.relay.clone())
+            (direct_snapshot(&state), state.relay.clone())
         };
-        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match (direct, relay) {
+            (Some((socket, _)), Some(relay)) => self.recv_both(socket, relay, deadline).await,
+            (Some((socket, _)), None) => {
+                // A path built without a relay is direct or it is nothing.
+                Ok((socket.recv_frame(remaining).await?, FrameSource::Direct))
+            }
+            (None, Some(relay)) => {
+                if remaining.is_zero() {
+                    return Err(HolePunchError::ReceiveTimeout.into());
+                }
+                match tokio::time::timeout(remaining, relay.recv_frame()).await {
+                    Ok(result) => Ok((self.open_relay_frame(&result?)?, FrameSource::Relay)),
+                    Err(_) => Err(HolePunchError::ReceiveTimeout.into()),
+                }
+            }
+            (None, None) => Err(PathError::NoPath),
+        }
+    }
 
-        match state {
-            DIRECT => {
-                let (socket, _) = direct.ok_or(PathError::Shutdown)?;
-                // With a relay to fall back to, never wait longer than the health bound in
-                // one go: a dead path must hand over promptly instead of blocking the
-                // caller. A live path keeps waiting for the rest of the caller's deadline;
-                // silence from a healthy peer is not a reason to demote it.
-                loop {
-                    let wait = if relay.is_some() {
-                        remaining().min(self.config.direct_health_timeout)
-                    } else {
-                        remaining()
-                    };
-                    match socket.recv_frame(wait).await {
-                        Ok(frame) => {
-                            self.end_transition();
-                            return Ok(frame);
-                        }
-                        Err(HolePunchError::ReceiveTimeout) if relay.is_some() => {
-                            if socket.is_alive(self.config.direct_health_timeout) {
-                                if remaining().is_zero() {
-                                    return Err(HolePunchError::ReceiveTimeout.into());
-                                }
-                                continue;
-                            }
-                            self.kind.store(RELAY, Ordering::SeqCst);
-                            return self
-                                .recv_relay(relay, deadline, Some(Arc::clone(&socket)))
-                                .await;
-                        }
-                        Err(HolePunchError::ReceiveTimeout) => {
-                            return Err(HolePunchError::ReceiveTimeout.into());
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
+    /// Reads from the direct socket and the relay at once, for the path's whole life.
+    ///
+    /// A ready direct frame wins a tie so a dual-sent frame keeps its direct order. A relay
+    /// frame the peer really sent while we were not duplicating is the proof that it reads
+    /// the relay, so it moves our sends there; the next direct frame moves them back. Each
+    /// wait is bounded by the health bound, which is where a peer that stopped answering
+    /// keepalives moves our sends to the relay — the read never closes.
+    async fn recv_both(
+        &self,
+        socket: Arc<DirectSocket>,
+        relay: Arc<dyn RelayChannel>,
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<u8>, FrameSource), PathError> {
+        let mut relay: Option<Arc<dyn RelayChannel>> = Some(relay);
+        let mut relay_fault: Option<RelayError> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(match relay_fault {
+                    Some(fault) => fault.into(),
+                    None => HolePunchError::ReceiveTimeout.into(),
+                });
             }
-            PENDING => {
-                // The direct path is preferred and the relay is the safety net: wait for a
-                // direct frame first, and fall back to the relay copy only if none arrives
-                // within the health bound. A direct frame is the proof that commits the path.
-                let (socket, _) = direct.ok_or(PathError::Shutdown)?;
-                let wait = if relay.is_some() {
-                    remaining().min(self.config.direct_health_timeout)
-                } else {
-                    remaining()
-                };
-                match socket.recv_frame(wait).await {
-                    Ok(frame) => {
-                        self.end_transition();
-                        self.kind.store(DIRECT, Ordering::SeqCst);
-                        Ok(frame)
-                    }
-                    Err(HolePunchError::ReceiveTimeout) if relay.is_some() => {
-                        let relay = relay.ok_or(PathError::NoPath)?;
-                        self.recv_relay(Some(relay), deadline, Some(Arc::clone(&socket)))
-                            .await
-                    }
-                    // A path built without a relay reports the timeout it actually saw. It
-                    // has a direct candidate, so "no candidate and no relay" would be a lie.
+            if let Some(frame) = socket.try_recv_frame() {
+                return Ok((frame, FrameSource::Direct));
+            }
+            // A relay frame a direct frame preempted once is handed out before waiting again.
+            if let Some(sealed) = self.take_held_relay_frame() {
+                return Ok((sealed, FrameSource::Relay));
+            }
+            let wait = if relay.is_some() {
+                remaining.min(self.config.direct_health_timeout)
+            } else {
+                remaining
+            };
+            let relay_read = relay.clone();
+            tokio::select! {
+                biased;
+                direct = socket.recv_frame(wait) => match direct {
+                    Ok(frame) => return Ok((frame, FrameSource::Direct)),
                     Err(HolePunchError::ReceiveTimeout) => {
-                        Err(HolePunchError::ReceiveTimeout.into())
+                        if !socket.is_alive(self.config.direct_health_timeout) {
+                            // The peer stopped answering: send on the relay from now on
+                            // without giving up the read, which is how a peer that is still
+                            // reachable in the other direction keeps delivering.
+                            self.end_transition();
+                            self.kind.store(RELAY, Ordering::SeqCst);
+                        }
                     }
-                    Err(error) => Err(error.into()),
-                }
-            }
-            _ => {
-                // A frame already queued on the direct socket means the peer is using direct
-                // again; re-promote instead of leaving a working path idle.
-                if let Some((socket, _)) = &direct {
-                    if let Some(frame) = socket.try_recv_frame() {
-                        self.end_transition();
-                        self.kind.store(DIRECT, Ordering::SeqCst);
-                        return Ok(frame);
+                    Err(error) => return Err(error.into()),
+                },
+                relayed = await_relay(relay_read) => match relayed {
+                    Ok(frame) => {
+                        // While we are duplicating, the peer probably is too, and its direct
+                        // copy of this very frame may still be in flight — on a loopback
+                        // relay the copy is faster than the datagram. Give the direct copy a
+                        // moment so a healthy direct path is not abandoned for a copy, and
+                        // keep the relay frame if the direct one wins, so nothing is lost.
+                        let duplicating = self.state_byte() == PENDING;
+                        if duplicating && socket.is_alive(self.config.direct_health_timeout) {
+                            let grace = self.config.relay_frame_grace.min(remaining);
+                            if let Ok(Ok(direct)) = tokio::time::timeout(
+                                grace,
+                                socket.recv_frame(grace),
+                            )
+                            .await
+                            {
+                                // Keep the copy, unwrapped, for the next read: it is a real
+                                // frame the peer sent, so losing it would be loss.
+                                let sealed = self.open_relay_frame(&frame)?;
+                                self.hold_relay_frame(sealed);
+                                return Ok((direct, FrameSource::Direct));
+                            }
+                        }
+                        let sealed = self.open_relay_frame(&frame)?;
+                        return Ok((sealed, FrameSource::Relay));
                     }
-                }
-                match relay {
-                    Some(relay) => {
-                        let direct = direct.as_ref().map(|(socket, _)| Arc::clone(socket));
-                        self.recv_relay(Some(relay), deadline, direct).await
+                    Err(error) => {
+                        // Keep reading the direct path: a relay that failed is not a reason
+                        // to lose the frames a working direct path still carries. The fault
+                        // is what the caller sees if nothing arrives before the deadline.
+                        relay = None;
+                        relay_fault = Some(error);
                     }
-                    None => match direct {
-                        Some((socket, _)) => Ok(socket.recv_frame(remaining()).await?),
-                        None => Err(PathError::NoPath),
-                    },
-                }
+                },
             }
         }
     }
 
-    /// Reads one sealed frame from the relay, bounded by the caller's deadline.
-    ///
-    /// While the relay is being awaited the direct queue is awaited too, so a direct frame
-    /// that arrives during the wait re-promotes the path and is surfaced instead of being
-    /// stranded in the queue until the next call. Preferring whichever side answers first is
-    /// what keeps a re-promoted path from stalling behind a relay read.
-    async fn recv_relay(
-        &self,
-        relay: Option<Arc<dyn RelayChannel>>,
-        deadline: std::time::Instant,
-        direct: Option<Arc<DirectSocket>>,
-    ) -> Result<Vec<u8>, PathError> {
-        let relay = relay.ok_or(PathError::NoPath)?;
-        // A direct socket that reports an error is dropped from the wait instead of being
-        // re-polled, so a closed socket cannot spin against the deadline.
-        let mut direct = direct;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(HolePunchError::ReceiveTimeout.into());
-            }
-            let Some(socket) = direct.clone() else {
-                return match tokio::time::timeout(remaining, relay.recv_frame()).await {
-                    Ok(result) => self.open_relay_frame(&result?),
-                    Err(_) => Err(HolePunchError::ReceiveTimeout.into()),
-                };
-            };
-            let direct_frame = tokio::select! {
-                direct = socket.recv_frame(remaining) => direct,
-                relayed = tokio::time::timeout(remaining, relay.recv_frame()) => {
-                    return match relayed {
-                        Ok(result) => self.open_relay_frame(&result?),
-                        Err(_) => Err(HolePunchError::ReceiveTimeout.into()),
-                    };
-                }
-            };
-            match direct_frame {
-                Ok(frame) => {
-                    // The peer is sending on the direct path again, so it reads it too:
-                    // commit and prefer it from now on.
-                    self.end_transition();
-                    self.kind.store(DIRECT, Ordering::SeqCst);
-                    return Ok(frame);
-                }
-                Err(_) => direct = None,
-            }
-        }
+    /// The peer's frame arrived on the direct path: it reads direct, so send there.
+    fn commit_direct(&self) {
+        self.end_transition();
+        self.kind.store(DIRECT, Ordering::SeqCst);
+    }
+
+    /// The peer chose the relay, so a direct send would not be read. The direct socket stays
+    /// open and keeps being read: the next direct frame moves the sends back.
+    fn adopt_relay(&self) {
+        self.end_transition();
+        self.kind.store(RELAY, Ordering::SeqCst);
+    }
+
+    fn hold_relay_frame(&self, frame: Vec<u8>) {
+        *self
+            .held_relay_frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(frame);
+    }
+
+    fn take_held_relay_frame(&self) -> Option<Vec<u8>> {
+        self.held_relay_frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     fn open_relay_frame(&self, frame: &[u8]) -> Result<Vec<u8>, PathError> {
@@ -1212,6 +1321,9 @@ impl ConnectedPath {
     /// Ends the path. The relay is closed here because the caller is done with the
     /// session; path migration never calls this.
     pub async fn shutdown(&self) -> Result<(), PathError> {
+        // Snapshot the drop counter before the socket goes away: the caller may report the
+        // loss after the session ends, and the counter is documented as monotonic.
+        self.observe_dropped_frames();
         let (relay, direct) = {
             let mut state = self.state.write().await;
             if state.closed {
@@ -1289,6 +1401,8 @@ impl Drop for ConnectedPath {
         // shut down, so abandoning a path does not leak a socket task.
         if let Ok(mut socket) = self.probe_socket.lock() {
             if let Some(socket) = socket.take() {
+                self.dropped_frames
+                    .fetch_max(socket.dropped_frames(), Ordering::SeqCst);
                 socket.close();
             }
         }
@@ -1431,6 +1545,9 @@ impl PathController {
             transition_frames: AtomicU32::new(0),
             relay_backpressure: AtomicU32::new(0),
             relay_suppressed: AtomicBool::new(false),
+            dropped_frames: AtomicU32::new(0),
+            loss_reported: AtomicU32::new(0),
+            held_relay_frame: std::sync::Mutex::new(None),
         };
 
         let negotiated = negotiate_direct(
