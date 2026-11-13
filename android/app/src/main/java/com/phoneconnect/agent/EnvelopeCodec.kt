@@ -108,13 +108,27 @@ object EnvelopeCodec {
         if (available < declared) {
             throw WireError.TruncatedFrame(declared = declared, available = available)
         }
+        val envelope = decodeBody(
+            buffer.copyOfRange(LENGTH_PREFIX_LEN, LENGTH_PREFIX_LEN + declared),
+        ).getOrThrow()
+        DecodedEnvelope(envelope, LENGTH_PREFIX_LEN + declared)
+    }
+
+    /**
+     * Decodes and validates one encoded envelope body (no length prefix), which is what a
+     * sealed frame carries after its AEAD layer is opened.
+     */
+    fun decodeBody(body: ByteArray): Result<Envelope> = runCatching {
+        if (body.size > CONTROL_FRAME_LIMIT) {
+            throw WireError.FrameTooLarge(streamKind = null, declared = body.size, limit = CONTROL_FRAME_LIMIT)
+        }
         val envelope = try {
-            Envelope.parseFrom(buffer.copyOfRange(LENGTH_PREFIX_LEN, LENGTH_PREFIX_LEN + declared))
+            Envelope.parseFrom(body)
         } catch (error: InvalidProtocolBufferException) {
             throw WireError.MalformedBody(error.message ?: "invalid protobuf")
         }
         validate(envelope)
-        DecodedEnvelope(envelope, LENGTH_PREFIX_LEN + declared)
+        envelope
     }
 
     /** Advances the per-stream counter, refusing to wrap. */
@@ -124,6 +138,16 @@ object EnvelopeCodec {
             throw WireError.SequenceExhausted(current)
         }
         envelope.toBuilder().setSequence((current + 1u).toInt()).build()
+    }
+
+    /** The wire number of a validated stream kind; the sealed-frame header carries it. */
+    fun streamKindNumber(kind: StreamKind): Int = when (kind) {
+        StreamKind.STREAM_KIND_CONTROL -> 1
+        StreamKind.STREAM_KIND_EVENTS -> 2
+        StreamKind.STREAM_KIND_FILE -> 3
+        StreamKind.STREAM_KIND_MEDIA -> 4
+        StreamKind.STREAM_KIND_PROXY -> 5
+        else -> 0
     }
 
     /** Checks what a relay or peer must not be trusted about; returns the decoded kind. */

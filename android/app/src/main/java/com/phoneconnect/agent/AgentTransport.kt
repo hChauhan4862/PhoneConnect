@@ -1,10 +1,11 @@
 package com.phoneconnect.agent
 
 import com.google.protobuf.ByteString
+import com.phoneconnect.agent.crypto.SessionCipher
 import com.phoneconnect.agent.wire.Envelope
 import com.phoneconnect.agent.wire.StreamKind
 
-/** One message delivered by a [FrameChannel]: a whole frame, or the end of the stream. */
+/** One message delivered by a [FrameChannel]: a whole sealed frame, or the end of the stream. */
 sealed interface ChannelEvent {
     data class Frame(val bytes: ByteArray) : ChannelEvent
 
@@ -13,11 +14,10 @@ sealed interface ChannelEvent {
 }
 
 /**
- * The authenticated byte channel one session runs on: exactly one PhoneConnect frame per
- * message, sealed end to end before it reaches the relay.
+ * The authenticated byte channel one session runs on: exactly one sealed PhoneConnect frame
+ * per message.
  *
- * Sealing is the implementation's contract: a channel hands [AgentTransport] plaintext
- * frames only after the session is authenticated and closes with the server's close code.
+ * A channel moves ciphertext and reports the server's close code; it never sees plaintext.
  * The relay lease (`409 relay_unavailable`) never produces a channel, so a session that
  * cannot relay ends before this interface is reached.
  */
@@ -25,6 +25,13 @@ interface FrameChannel : AutoCloseable {
     suspend fun send(frame: ByteArray)
 
     suspend fun receive(): ChannelEvent
+
+    /**
+     * Writes a WebSocket ping on transports that need one. The server closes a relay
+     * direction that has carried nothing for 30 seconds, so a channel says it is still there
+     * without consuming a frame slot, a sequence number, or a queue entry.
+     */
+    suspend fun keepalive() {}
 
     override fun close()
 }
@@ -39,19 +46,16 @@ sealed interface Inbound {
 
 /**
  * Speaks the shared envelope contract on one session: control and event streams only,
- * monotonic per-stream sequence numbers, the 1 MiB control-only frame profile, and
- * server revocation as an immediate stream close.
- *
- * It owns framing and stream lifecycle, not the sealed transport: a [FrameChannel] arrives
- * already authenticated and sealed.
+ * monotonic per-stream sequence numbers, the 1 MiB control-only frame profile, sealing every
+ * frame through [SessionCipher], binding inbound frames to this session and device, and
+ * turning server revocation into an immediate stream close.
  */
 class AgentTransport(
     private val channel: FrameChannel,
-    deviceId: String,
-    sessionId: String,
+    private val deviceId: String,
+    private val sessionId: String,
+    private val cipher: SessionCipher,
 ) : AutoCloseable {
-    private val deviceId: String = deviceId
-    private val sessionId: String = sessionId
     private val sequences = mutableMapOf<StreamKind, Long>()
     private var ended: ConnectionFailure? = null
 
@@ -73,19 +77,24 @@ class AgentTransport(
         ended?.let { return Inbound.End(it) }
         return when (val event = channel.receive()) {
             is ChannelEvent.Frame -> {
-                val decoded = EnvelopeCodec.decode(event.bytes).getOrElse { error ->
+                val envelope = cipher.open(event.bytes).getOrElse { error ->
                     return end(error.asProtocolFailure())
                 }
-                if (decoded.consumed != event.bytes.size) {
-                    // A channel message carries exactly one frame; anything else means the
-                    // two sides disagree about framing.
+                // A frame sealed by this session can still be addressed elsewhere if a peer
+                // is confused; never surface another session's or device's traffic.
+                if (envelope.sessionId != sessionId || envelope.deviceId != deviceId) {
                     return end(ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR))
                 }
-                Inbound.Frame(decoded.envelope)
+                Inbound.Frame(envelope)
             }
 
             is ChannelEvent.Closed -> end(failureFor(event.reason))
         }
+    }
+
+    /** Pings the relay so a quiet direction is not reaped while the session is healthy. */
+    suspend fun keepalive() {
+        if (ended == null) channel.keepalive()
     }
 
     override fun close() {
@@ -98,14 +107,16 @@ class AgentTransport(
         if (sequence > MAX_SEQUENCE) {
             throw WireError.SequenceExhausted(MAX_SEQUENCE.toUInt())
         }
-        sequences[kind] = sequence + 1
-
         val envelope = EnvelopeCodec.newEnvelope(kind, deviceId, sessionId, requestId).toBuilder()
             .setSequence(sequence.toInt())
             .setDeadlineUnixMs(deadlineUnixMs)
             .setPayload(ByteString.copyFrom(payload))
             .build()
-        channel.send(EnvelopeCodec.encode(envelope).getOrThrow())
+        // The sequence number is consumed only once the frame is actually sealed and handed
+        // to the channel: a failed send must not leave a hole in a monotonic stream.
+        val sealed = cipher.seal(envelope).getOrThrow()
+        channel.send(sealed)
+        sequences[kind] = sequence + 1
     }
 
     private fun end(failure: ConnectionFailure): Inbound.End {
@@ -114,7 +125,11 @@ class AgentTransport(
         return Inbound.End(failure)
     }
 
-    /** Every framing or validation failure is a protocol failure, never a silent drop. */
+    /**
+     * Every sealing, framing, or validation failure ends the stream as a protocol failure.
+     * A bad tag and a bad envelope are equally fatal to this session and equally retryable on
+     * a fresh one; none of them is ever dropped silently or surfaced as data.
+     */
     private fun Throwable.asProtocolFailure(): ConnectionFailure =
         ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR)
 

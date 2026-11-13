@@ -141,15 +141,15 @@ class EnrollmentStoreTest {
             mainSources.filterValues { it.contains("annotation class IdentityBoundary") }.keys,
         )
         assertEquals(
-            "only the enrollment storage implementation may opt in",
-            setOf("KeystoreEnrollmentStore.kt"),
+            "only the identity boundary may opt in",
+            setOf("KeystoreEnrollmentStore.kt", "EnrollmentFlow.kt", "TransportSessionRunner.kt"),
             mainSources.filterValues { it.contains("@OptIn(IdentityBoundary::class)") }.keys,
         )
 
         val decryptCallers = mainSources.filterValues { it.contains("openIdentity(") }.keys
         assertEquals(
-            "only the boundary's declaration and its storage may open an identity",
-            setOf("EnrollmentStore.kt", "KeystoreEnrollmentStore.kt"),
+            "only the boundary's declaration, its storage, and the session runner may open an identity",
+            setOf("EnrollmentStore.kt", "KeystoreEnrollmentStore.kt", "TransportSessionRunner.kt"),
             decryptCallers,
         )
     }

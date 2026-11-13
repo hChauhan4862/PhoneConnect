@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "com.phoneconnect.agent"
-        minSdk = 26
+        minSdk = 28
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
@@ -43,6 +43,8 @@ android {
 }
 
 kotlin {
+    // JDK 21 comes from a Gradle toolchain, not a machine-specific path in gradle.properties.
+    jvmToolchain(21)
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
@@ -73,9 +75,11 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.google.protobuf:protobuf-javalite:4.29.3")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("androidx.test:core:1.6.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
