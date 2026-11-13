@@ -266,20 +266,10 @@ fn enforces_the_one_mib_control_frame_limit() {
         "expected FrameTooLarge from the prefix alone, got {error:?}"
     );
 
-    // A control-only connection tightens every stream limit, so the 1 MiB cap applies to
+    // A control-only connection uses the dedicated profile, so the 1 MiB cap applies to
     // the prefix before the stream kind can be inspected.
-    let mut control_only = FrameLimits::new();
-    for kind in [
-        StreamKind::Control,
-        StreamKind::Events,
-        StreamKind::File,
-        StreamKind::Media,
-        StreamKind::Proxy,
-    ] {
-        control_only = control_only
-            .with_stream_limit(kind, CONTROL_FRAME_LIMIT)
-            .expect("non-zero limit");
-    }
+    let control_only = FrameLimits::control_only();
+    assert_eq!(control_only.max_limit(), CONTROL_FRAME_LIMIT);
     let mut frame = (CONTROL_FRAME_LIMIT + 1).to_be_bytes().to_vec();
     frame.extend_from_slice(&[0u8; 16]);
     let error = decode_frame(&frame, &control_only)
@@ -357,6 +347,97 @@ fn stream_limits_are_configurable_per_stream_kind() {
             .is_err(),
         "a zero limit would reject every frame, which is a configuration error"
     );
+}
+
+#[test]
+fn control_only_profile_rejects_oversized_frames_at_the_prefix() {
+    let control_only = FrameLimits::control_only();
+    assert_eq!(control_only.max_limit(), CONTROL_FRAME_LIMIT);
+    for kind in [
+        StreamKind::Control,
+        StreamKind::Events,
+        StreamKind::File,
+        StreamKind::Media,
+        StreamKind::Proxy,
+    ] {
+        assert_eq!(
+            control_only.limit_for(kind),
+            CONTROL_FRAME_LIMIT,
+            "control-only caps {kind:?} at the control limit"
+        );
+    }
+
+    // A file frame that the default profile accepts is refused at the prefix, before the
+    // body is inspected: the per-kind limit cannot be known yet, so the profile's 1 MiB
+    // cap must do the rejecting.
+    let mut file_envelope = sample_envelope();
+    file_envelope.set_kind(StreamKind::File);
+    file_envelope.payload = vec![7u8; 2 * 1024 * 1024];
+    let file_frame = raw_frame(&file_envelope);
+    assert!(
+        file_frame.len() > CONTROL_FRAME_LIMIT as usize,
+        "the fixture must exceed the control limit"
+    );
+    let error = decode_frame(&file_frame, &control_only)
+        .expect_err("a control-only peer must not buffer a 2 MiB frame");
+    assert!(
+        matches!(
+            error,
+            ProtocolError::FrameTooLarge {
+                stream_kind: None,
+                length,
+                limit
+            } if length == file_frame.len() - LENGTH_PREFIX_LEN && limit == CONTROL_FRAME_LIMIT as usize
+        ),
+        "expected a prefix-level FrameTooLarge for a 2 MiB frame, got {error:?}"
+    );
+
+    // Only the prefix is buffered: a peer announcing an oversized control frame and then
+    // sending no body must be refused for size, not reported as truncated.
+    let truncated_body = (CONTROL_FRAME_LIMIT + 1).to_be_bytes().to_vec();
+    assert_eq!(truncated_body.len(), LENGTH_PREFIX_LEN);
+    let error = decode_frame(&truncated_body, &control_only)
+        .expect_err("an oversized announcement is rejected before any body read");
+    assert!(
+        matches!(
+            error,
+            ProtocolError::FrameTooLarge {
+                stream_kind: None,
+                length,
+                limit
+            } if length == CONTROL_FRAME_LIMIT as usize + 1 && limit == CONTROL_FRAME_LIMIT as usize
+        ),
+        "expected a prefix-level FrameTooLarge with no body buffered, got {error:?}"
+    );
+
+    // Legal control frames still decode under the profile.
+    let mut envelope = sample_envelope();
+    envelope.payload = vec![0u8; CONTROL_FRAME_LIMIT as usize - 256];
+    let frame = encode_frame(&envelope, &control_only).expect("control frame within 1 MiB encodes");
+    let decoded = decode_frame(&frame, &control_only).expect("control frame within 1 MiB decodes");
+    assert_eq!(decoded.envelope, envelope);
+}
+
+#[test]
+fn refuses_limits_for_the_unspecified_stream_kind() {
+    let error = FrameLimits::default()
+        .with_stream_limit(StreamKind::Unspecified, 8 * 1024 * 1024)
+        .expect_err("Unspecified must not alias the control limit");
+    assert!(
+        matches!(
+            error,
+            ProtocolError::UnspecifiedStreamKindLimit { limit } if limit == 8 * 1024 * 1024
+        ),
+        "expected UnspecifiedStreamKindLimit, got {error:?}"
+    );
+
+    let limits = FrameLimits::default();
+    assert_eq!(
+        limits.limit_for(StreamKind::Control),
+        CONTROL_FRAME_LIMIT,
+        "a refused configuration must not change the control limit"
+    );
+    assert_eq!(limits.max_limit(), STREAM_FRAME_LIMIT);
 }
 
 #[test]

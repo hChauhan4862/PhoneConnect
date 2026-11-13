@@ -69,6 +69,10 @@ pub enum ProtocolError {
     },
     #[error("invalid frame limit {limit} for {stream_kind:?} streams")]
     InvalidFrameLimit { stream_kind: StreamKind, limit: u32 },
+    #[error(
+        "frame limits apply to concrete stream kinds; Unspecified cannot be configured (limit {limit})"
+    )]
+    UnspecifiedStreamKindLimit { limit: u32 },
     #[error("malformed protobuf frame: {0}")]
     Decode(#[from] prost::DecodeError),
     #[error("could not encode protobuf frame: {0}")]
@@ -102,6 +106,23 @@ impl FrameLimits {
         Self::default()
     }
 
+    /// Profile for control-only connections: every stream kind is capped at
+    /// [`CONTROL_FRAME_LIMIT`], so an oversized frame is refused from its length prefix
+    /// before any body is buffered or decoded.
+    ///
+    /// Use this for connections that carry only control and event streams. It is the
+    /// required profile for control-only connections; default limits cap the prefix at
+    /// the 4 MiB stream limit, which would let a peer force up to 4 MiB of buffering
+    /// before the stream kind is known.
+    pub const fn control_only() -> Self {
+        Self {
+            control: CONTROL_FRAME_LIMIT,
+            file: CONTROL_FRAME_LIMIT,
+            media: CONTROL_FRAME_LIMIT,
+            proxy: CONTROL_FRAME_LIMIT,
+        }
+    }
+
     /// Limit for `stream_kind`. Unspecified kinds are held to the control limit; their
     /// frames are rejected by validation anyway.
     pub const fn limit_for(&self, stream_kind: StreamKind) -> u32 {
@@ -129,7 +150,9 @@ impl FrameLimits {
         max
     }
 
-    /// Overrides the limit for one stream kind. Control and events share one limit.
+    /// Overrides the limit for one concrete stream kind. Control and events share one
+    /// limit; [`StreamKind::Unspecified`] is refused because
+    /// its frames are never valid and aliasing it to control would hide a caller mistake.
     pub fn with_stream_limit(
         mut self,
         stream_kind: StreamKind,
@@ -139,14 +162,24 @@ impl FrameLimits {
             return Err(ProtocolError::InvalidFrameLimit { stream_kind, limit });
         }
         match stream_kind {
-            StreamKind::Unspecified | StreamKind::Control | StreamKind::Events => {
-                self.control = limit
+            StreamKind::Unspecified => Err(ProtocolError::UnspecifiedStreamKindLimit { limit }),
+            StreamKind::Control | StreamKind::Events => {
+                self.control = limit;
+                Ok(self)
             }
-            StreamKind::File => self.file = limit,
-            StreamKind::Media => self.media = limit,
-            StreamKind::Proxy => self.proxy = limit,
+            StreamKind::File => {
+                self.file = limit;
+                Ok(self)
+            }
+            StreamKind::Media => {
+                self.media = limit;
+                Ok(self)
+            }
+            StreamKind::Proxy => {
+                self.proxy = limit;
+                Ok(self)
+            }
         }
-        Ok(self)
     }
 }
 
