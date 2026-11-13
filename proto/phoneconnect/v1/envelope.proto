@@ -2,6 +2,11 @@ syntax = "proto3";
 
 package phoneconnect.v1;
 
+// Generated Kotlin/Java types live in the agent's own namespace, one class per message.
+// These options are language bindings only; the wire schema is shared by every component.
+option java_package = "com.phoneconnect.agent.wire";
+option java_multiple_files = true;
+
 // Logical stream a PhoneConnect envelope belongs to. Numbers are never reused: a
 // replacement stream gets a new number so older peers reject what they cannot classify.
 enum StreamKind {

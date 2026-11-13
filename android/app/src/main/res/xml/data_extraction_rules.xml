@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Enrollment material is sealed with a non-exportable Keystore key, so a backup would
+     only restore bytes this device cannot open. Exclude it from both transfer paths. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude
+            domain="sharedpref"
+            path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude
+            domain="sharedpref"
+            path="." />
+    </device-transfer>
+</data-extraction-rules>

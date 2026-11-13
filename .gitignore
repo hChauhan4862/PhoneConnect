@@ -11,3 +11,9 @@ dist/
 .idea/
 .vscode/
 .superpowers/
+# Android agent build state (kept inside the module so an unwritable $HOME cannot block it)
+android/.gradle-home/
+android/.gradle-dist/
+android/.android/
+android/local.properties
+android/.kotlin/
