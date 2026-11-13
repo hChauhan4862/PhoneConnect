@@ -3787,3 +3787,915 @@ async fn the_dropped_frame_counter_stays_monotonic_after_shutdown() {
         "the counter is monotonic across shutdown"
     );
 }
+
+// --------------------------------------------------------------------------------------
+// Round 6: the relay stays attached for the path's whole life, and a held relay frame can
+// never fall out of the replay window.
+// --------------------------------------------------------------------------------------
+
+/// A relay that enforces the server's idle rule in process: a direction that carries nothing
+/// for `idle_timeout` is closed, which is what `RELAY_IDLE_TIMEOUT_MS` does to a session whose
+/// traffic is all direct. A keepalive is the one thing that resets it without carrying a
+/// frame.
+struct IdleRelay {
+    peer: RelayPeer,
+    idle_timeout: Duration,
+    last_active: std::sync::Mutex<Instant>,
+    keepalives: AtomicUsize,
+    closed: AtomicBool,
+}
+
+impl IdleRelay {
+    fn new(peer: RelayPeer, idle_timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            peer,
+            idle_timeout,
+            last_active: std::sync::Mutex::new(Instant::now()),
+            keepalives: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    fn idle_error() -> RelayError {
+        RelayError::Closed {
+            reason: "idle_timeout".to_owned(),
+        }
+    }
+
+    fn touch(&self) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn alive(&self) -> bool {
+        self.last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            <= self.idle_timeout
+    }
+
+    fn keepalives(&self) -> usize {
+        self.keepalives.load(Ordering::SeqCst)
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RelayChannel for IdleRelay {
+    async fn send_frame(&self, frame: &[u8]) -> Result<(), RelayError> {
+        if !self.alive() {
+            return Err(Self::idle_error());
+        }
+        self.touch();
+        self.peer.send_bytes(frame).await.map_err(relay_error)
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        if !self.alive() {
+            return Err(Self::idle_error());
+        }
+        let frame = self.peer.recv_bytes().await.map_err(relay_error)?;
+        self.touch();
+        Ok(frame)
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn keepalive(&self) -> Result<(), RelayError> {
+        self.keepalives.fetch_add(1, Ordering::SeqCst);
+        if !self.alive() {
+            return Err(Self::idle_error());
+        }
+        self.touch();
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// A relay whose socket has already closed. Reads report the close, keepalives fail, and a
+/// write is *accepted* — which is what a half-open socket does, and exactly why a frame
+/// reported as sent on one is worse than an error.
+struct DeadRelay {
+    keepalives: AtomicUsize,
+}
+
+impl DeadRelay {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            keepalives: AtomicUsize::new(0),
+        })
+    }
+
+    fn closed() -> RelayError {
+        RelayError::Closed {
+            reason: "idle_timeout".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RelayChannel for DeadRelay {
+    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        Err(Self::closed())
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    async fn keepalive(&self) -> Result<(), RelayError> {
+        self.keepalives.fetch_add(1, Ordering::SeqCst);
+        Err(Self::closed())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// A relay that works until the test closes it. Afterwards it is a half-open socket: reads
+/// report the close and writes are accepted.
+struct DyingRelay {
+    peer: RelayPeer,
+    dead: AtomicBool,
+    sends: AtomicUsize,
+    keepalives: AtomicUsize,
+}
+
+impl DyingRelay {
+    fn new(peer: RelayPeer) -> Arc<Self> {
+        Arc::new(Self {
+            peer,
+            dead: AtomicBool::new(false),
+            sends: AtomicUsize::new(0),
+            keepalives: AtomicUsize::new(0),
+        })
+    }
+
+    fn die(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
+    }
+
+    fn sends(&self) -> usize {
+        self.sends.load(Ordering::SeqCst)
+    }
+
+    fn keepalives(&self) -> usize {
+        self.keepalives.load(Ordering::SeqCst)
+    }
+
+    fn closed() -> RelayError {
+        RelayError::Closed {
+            reason: "idle_timeout".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RelayChannel for DyingRelay {
+    async fn send_frame(&self, frame: &[u8]) -> Result<(), RelayError> {
+        if self.is_dead() {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        self.peer.send_bytes(frame).await.map_err(relay_error)
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        if self.is_dead() {
+            return Err(Self::closed());
+        }
+        self.peer.recv_bytes().await.map_err(relay_error)
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    async fn keepalive(&self) -> Result<(), RelayError> {
+        self.keepalives.fetch_add(1, Ordering::SeqCst);
+        if self.is_dead() {
+            return Err(Self::closed());
+        }
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// Connects both roles over loopback with caller-supplied relay channels.
+async fn connect_pair_with_relays(
+    harness: &Harness,
+    config: PathConfig,
+    client_relay: Arc<dyn RelayChannel>,
+    device_relay: Arc<dyn RelayChannel>,
+) -> (ConnectedPath, ConnectedPath, SocketAddr, SocketAddr) {
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client, device) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, harness)
+                .with_relay(client_relay)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    (
+        client.expect("client connects"),
+        device.expect("device connects"),
+        client_addr,
+        device_addr,
+    )
+}
+
+/// A direct path is healthy for a minute and the relay is never touched. The server closes a
+/// relay direction that carries nothing, so without a keepalive the fallback is gone long
+/// before the one-way fault that needs it — and neither peer has a relay socket left to
+/// recover on.
+#[tokio::test]
+async fn a_healthy_direct_path_keeps_its_relay_usable_past_the_relay_idle_timeout() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let one_way = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::clone(&dropped),
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::new(AtomicBool::new(false)),
+            drop_client_outbound: Some(Arc::clone(&one_way)),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+
+    let idle_timeout = Duration::from_millis(300);
+    let client_relay = IdleRelay::new(harness.relay_peer(PeerRole::Client).await, idle_timeout);
+    let device_relay = IdleRelay::new(harness.relay_peer(PeerRole::Device).await, idle_timeout);
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(150),
+        keepalive_interval: Duration::from_millis(40),
+        recv_timeout: Duration::from_secs(1),
+        transition_timeout: Duration::from_secs(30),
+        transition_max_frames: 4,
+        relay_keepalive_interval: Duration::from_millis(100),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(Arc::clone(&client_relay) as Arc<dyn RelayChannel>)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(Arc::clone(&device_relay) as Arc<dyn RelayChannel>)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    let warmup = envelope("req-liveness-warmup", b"commit to direct");
+    device_path.send_frame(&warmup).await.expect("warmup send");
+    assert_eq!(recv(&client_path).await, warmup);
+    assert!(
+        !client_path.transition_active(),
+        "the direct frame committed"
+    );
+
+    // Ten times the relay's idle timeout of healthy direct traffic: nothing is sent on the
+    // relay by either peer, because direct is working.
+    tokio::time::sleep(idle_timeout * 10).await;
+    assert!(
+        client_relay.alive() && device_relay.alive(),
+        "the relay must still be attached after ten {} ms idle timeouts of healthy direct \
+         traffic",
+        idle_timeout.as_millis()
+    );
+    assert!(
+        client_relay.keepalives() > 0 && device_relay.keepalives() > 0,
+        "both peers keep their relay alive without carrying a frame on it"
+    );
+
+    // A one-way outbound fault: the peer stops hearing us, demotes, and sends on the relay.
+    one_way.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let peer_frame = envelope("req-liveness-peer", b"the peer is on the relay");
+    device_path
+        .send_frame(&peer_frame)
+        .await
+        .expect("the demoted peer still has a relay to send on");
+    assert_eq!(
+        recv(&client_path).await,
+        peer_frame,
+        "the committed path still drains a relay that survived the idle timeout"
+    );
+    assert_eq!(client_path.path_kind(), PathKind::Relay);
+
+    for index in 0..3 {
+        let frame = envelope(&format!("req-liveness-{index}"), b"must arrive");
+        timeout(Duration::from_secs(2), client_path.send_frame(&frame))
+            .await
+            .expect("send is bounded")
+            .expect("send reports success");
+        assert_eq!(recv(&device_path).await, frame);
+    }
+    assert!(!client_relay.closed(), "the fallback was never closed");
+
+    drop(client_path);
+    drop(device_path);
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+/// A relay that dies while the direct path is healthy must not be reported as the result of
+/// an idle read: `server/README.md` says a closed relay means a new session, so surfacing it
+/// would tear down a path that is delivering.
+#[tokio::test]
+async fn an_idle_direct_receive_is_a_timeout_not_a_relay_closure() {
+    let harness = Harness::new(SESSION).await;
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let dead = DeadRelay::new();
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(40),
+        recv_timeout: Duration::from_millis(300),
+        relay_keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path, _, _) = connect_pair_with_relays(
+        &harness,
+        config,
+        Arc::clone(&dead) as Arc<dyn RelayChannel>,
+        device_relay,
+    )
+    .await;
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    let warmup = envelope("req-idle-relay-warmup", b"commit to direct");
+    device_path.send_frame(&warmup).await.expect("warmup send");
+    assert_eq!(recv(&client_path).await, warmup);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let error = timeout(Duration::from_secs(2), client_path.recv_frame())
+        .await
+        .expect("the read is bounded")
+        .expect_err("nothing was sent");
+    assert!(
+        matches!(error, PathError::HolePunch(HolePunchError::ReceiveTimeout)),
+        "an idle read on a healthy direct path is a timeout, not the relay's death: {error}"
+    );
+    assert!(
+        !error.is_terminal(),
+        "a healthy direct path is not a dead session"
+    );
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "a dead relay does not demote a working direct path"
+    );
+    assert!(
+        dead.keepalives.load(Ordering::SeqCst) > 0,
+        "the path holds its relay for its whole life, so it pings it"
+    );
+
+    // The direct path is untouched by the relay's death.
+    let after = envelope("req-idle-relay-after", b"direct still works");
+    device_path.send_frame(&after).await.expect("send");
+    assert_eq!(recv(&client_path).await, after);
+}
+
+/// The relay's death stays observable where it matters: a send that needs the relay must
+/// report the close, never `Ok` for a frame a half-open socket accepted and nobody will read.
+#[tokio::test]
+async fn a_send_that_needs_a_dead_relay_reports_the_close_instead_of_success() {
+    let harness = Harness::new(SESSION).await;
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let dying = DyingRelay::new(harness.relay_peer(PeerRole::Client).await);
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(40),
+        recv_timeout: Duration::from_millis(300),
+        relay_keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path, _, _) = connect_pair_with_relays(
+        &harness,
+        config,
+        Arc::clone(&dying) as Arc<dyn RelayChannel>,
+        device_relay,
+    )
+    .await;
+
+    let warmup = envelope("req-dead-relay-warmup", b"commit to direct");
+    device_path.send_frame(&warmup).await.expect("warmup send");
+    assert_eq!(recv(&client_path).await, warmup);
+
+    // The relay closes while nothing is using it. The keepalive is what notices.
+    dying.die();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    client_path
+        .fallback_to_relay()
+        .await
+        .expect("the path falls back");
+    let frame = envelope("req-dead-relay", b"where did this go?");
+    let error = timeout(Duration::from_secs(2), client_path.send_frame(&frame))
+        .await
+        .expect("send is bounded")
+        .expect_err("a frame handed to a dead relay was not delivered");
+    match error {
+        PathError::Relay(RelayError::Closed { reason }) => {
+            assert_eq!(
+                reason, "idle_timeout",
+                "the reason is the relay's, not ours"
+            )
+        }
+        other => panic!("a dead relay must be reported as a relay close, got {other}"),
+    }
+    assert!(
+        dying.keepalives() > 0,
+        "the keepalive is what observed the closure"
+    );
+    assert_eq!(
+        dying.sends(),
+        0,
+        "the frame was never handed to a socket already known to be closed"
+    );
+}
+
+/// A relay wrapper the test controls: copies can be forwarded to the peer or swallowed.
+/// Swallowing one models a relay copy that is lost, which is what lets a test queue exactly
+/// one copy without also delivering its twin.
+struct ControlledRelay {
+    peer: RelayPeer,
+    drop_copies: AtomicBool,
+}
+
+impl ControlledRelay {
+    fn new(peer: RelayPeer) -> Arc<Self> {
+        Arc::new(Self {
+            peer,
+            drop_copies: AtomicBool::new(false),
+        })
+    }
+
+    fn drop_copies(&self) {
+        self.drop_copies.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl RelayChannel for ControlledRelay {
+    async fn send_frame(&self, frame: &[u8]) -> Result<(), RelayError> {
+        if self.drop_copies.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.peer.send_bytes(frame).await.map_err(relay_error)
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        self.peer.recv_bytes().await.map_err(relay_error)
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// A relay that hands the path one frame the server could never have forwarded.
+struct MalformedRelay {
+    frame: std::sync::Mutex<Option<Vec<u8>>>,
+    sends: AtomicUsize,
+}
+
+impl MalformedRelay {
+    fn new(frame: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            frame: std::sync::Mutex::new(Some(frame)),
+            sends: AtomicUsize::new(0),
+        })
+    }
+
+    fn sends(&self) -> usize {
+        self.sends.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RelayChannel for MalformedRelay {
+    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        let frame = self
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match frame {
+            Some(frame) => Ok(frame),
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+fn malformed_relay_frame() -> Vec<u8> {
+    b"not a PhoneConnect frame".to_vec()
+}
+
+/// The transition config the held-frame tests need: long enough that both peers keep
+/// duplicating for the whole test, with a grace wide enough to catch a direct twin on purpose.
+fn transition_config() -> PathConfig {
+    PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(40),
+        recv_timeout: Duration::from_secs(1),
+        transition_timeout: Duration::from_secs(30),
+        transition_max_frames: 400,
+        relay_frame_grace: Duration::from_millis(200),
+        ..PathConfig::default()
+    }
+}
+
+/// Re-negotiates both peers onto the direct path with fresh tickets, which is the one way a
+/// path enters a transition with its cipher's window already advanced.
+async fn re_promote(
+    harness: &Harness,
+    client: &ConnectedPath,
+    device: &ConnectedPath,
+    client_addr: SocketAddr,
+    device_addr: SocketAddr,
+) {
+    let key = harness.verification_key();
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_upgrade, device_upgrade) = tokio::join!(
+        client.upgrade_with(&client_ticket, &client_candidates, NOW_MS),
+        device.upgrade_with(&device_ticket, &device_candidates, NOW_MS)
+    );
+    assert_eq!(
+        client_upgrade.expect("client re-promotes"),
+        PathKind::Direct
+    );
+    assert_eq!(
+        device_upgrade.expect("device re-promotes"),
+        PathKind::Direct
+    );
+}
+
+/// A relay frame that was held while the direct twin won must be delivered *before* the
+/// direct frames that are queued behind it, because it is older than every one of them.
+#[tokio::test]
+async fn a_held_relay_frame_is_delivered_before_the_direct_frames_queued_behind_it() {
+    let harness = Harness::new(SESSION).await;
+    let (client_relay, _client_probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let controlled = ControlledRelay::new(harness.relay_peer(PeerRole::Device).await);
+    let (client_path, device_path, client_addr, device_addr) = connect_pair_with_relays(
+        &harness,
+        transition_config(),
+        client_relay,
+        Arc::clone(&controlled) as Arc<dyn RelayChannel>,
+    )
+    .await;
+    assert!(
+        client_path.transition_active(),
+        "a freshly committed direct path duplicates, which is when a frame can be held"
+    );
+
+    // The device is on the relay, so this frame reaches the client only as a relay copy. It is
+    // the older of the frames this test delivers, and it stays queued and unread.
+    device_path
+        .fallback_to_relay()
+        .await
+        .expect("the device falls back");
+    let held = envelope("req-held", b"the copy that is older than the ring");
+    device_path.send_frame(&held).await.expect("relay send");
+
+    // Both peers duplicate again, so the device's next frame goes out on the direct path too.
+    re_promote(
+        &harness,
+        &client_path,
+        &device_path,
+        client_addr,
+        device_addr,
+    )
+    .await;
+    controlled.drop_copies();
+
+    // The client is parked in the relay read when the twin arrives; the twin wins the grace
+    // and the relay copy is kept for the next read.
+    let mut receiving = Box::pin(client_path.recv_frame());
+    tokio::select! {
+        biased;
+        frame = &mut receiving => panic!("nothing was queued, yet the read completed: {frame:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let twin = envelope("req-held-twin", b"the direct copy of the held frame");
+    device_path.send_frame(&twin).await.expect("dual send");
+    let delivered = timeout(Duration::from_secs(2), &mut receiving)
+        .await
+        .expect("the read is bounded")
+        .expect("the direct twin decodes");
+    assert_eq!(delivered, twin);
+
+    // A second frame is queued behind the held copy.
+    let queued = envelope("req-held-queued", b"newer than the held copy");
+    device_path.send_frame(&queued).await.expect("direct send");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(
+        recv(&client_path).await,
+        held,
+        "the held copy is older than the queued direct frame and is delivered first"
+    );
+    assert_eq!(recv(&client_path).await, queued);
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "delivering a held copy does not move our sends to the relay"
+    );
+}
+
+/// A relay copy that was already outside the replay window when it was held is our own
+/// scheduling loss, not a broken peer: it must be reported as loss, never as the
+/// `CounterRegression` that would blame the peer for it.
+#[tokio::test]
+async fn a_held_relay_frame_that_left_the_replay_window_is_reported_as_loss() {
+    let harness = Harness::new(SESSION).await;
+    let (client_relay, _client_probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let controlled = ControlledRelay::new(harness.relay_peer(PeerRole::Device).await);
+    let (client_path, device_path, client_addr, device_addr) = connect_pair_with_relays(
+        &harness,
+        transition_config(),
+        client_relay,
+        Arc::clone(&controlled) as Arc<dyn RelayChannel>,
+    )
+    .await;
+
+    // One relay copy is queued and its twin is read, so the copy stays behind in the queue.
+    let stale = envelope("req-window-stale", b"the copy that will be too old");
+    device_path.send_frame(&stale).await.expect("dual send");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        recv(&client_path).await,
+        stale,
+        "the direct twin commits the path"
+    );
+
+    // The next 64 frames arrive only on the direct path and are all read, which moves the
+    // replay window exactly 64 counters past the queued copy.
+    controlled.drop_copies();
+    for index in 0..64 {
+        let frame = envelope(&format!("req-window-{index}"), b"direct only");
+        device_path.send_frame(&frame).await.expect("direct send");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    for index in 0..64 {
+        let frame = recv(&client_path).await;
+        assert_eq!(frame.request_id, format!("req-window-{index}"));
+    }
+    assert_eq!(
+        client_path.dropped_frames(),
+        0,
+        "the ring held every frame, so the window moved by exactly 64"
+    );
+
+    // A transition again, so the grace applies: the stale copy is read, the newer direct twin
+    // wins the grace, and the copy is held even though it can no longer be delivered.
+    re_promote(
+        &harness,
+        &client_path,
+        &device_path,
+        client_addr,
+        device_addr,
+    )
+    .await;
+    let mut receiving = Box::pin(client_path.recv_frame());
+    tokio::select! {
+        biased;
+        frame = &mut receiving => panic!("nothing was queued, yet the read completed: {frame:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let current = envelope("req-window-current", b"window is now ahead of the copy");
+    device_path.send_frame(&current).await.expect("dual send");
+    assert_eq!(
+        timeout(Duration::from_secs(2), &mut receiving)
+            .await
+            .expect("the read is bounded")
+            .expect("the current frame decodes"),
+        current
+    );
+
+    let error = timeout(Duration::from_secs(2), client_path.recv_frame())
+        .await
+        .expect("the read is bounded")
+        .expect_err("the held copy is outside the window and cannot be delivered");
+    match error {
+        PathError::FramesLost { count } => assert!(count >= 1, "the loss is counted: {count}"),
+        other => panic!("a stale held copy is local loss, not a peer fault: {other}"),
+    }
+
+    // Non-fatal and local: the direct path keeps delivering.
+    let after = envelope("req-window-after", b"the session carries on");
+    device_path.send_frame(&after).await.expect("send");
+    assert_eq!(recv(&client_path).await, after);
+}
+
+/// A malformed relay copy must not cost the caller the direct frame that already arrived
+/// while the copy was being decoded: the direct frame is delivered, and the relay is what is
+/// reported when something actually needs it.
+#[tokio::test]
+async fn a_malformed_relay_copy_does_not_lose_the_direct_frame_already_received() {
+    let harness = Harness::new(SESSION).await;
+    let malformed = MalformedRelay::new(malformed_relay_frame());
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let (client_path, device_path, _, _) = connect_pair_with_relays(
+        &harness,
+        transition_config(),
+        Arc::clone(&malformed) as Arc<dyn RelayChannel>,
+        device_relay,
+    )
+    .await;
+    assert!(client_path.transition_active());
+
+    // The client reads the malformed copy and, while it waits the grace for a twin, the direct
+    // frame arrives. Losing that frame would be loss the caller cannot see.
+    let mut receiving = Box::pin(client_path.recv_frame());
+    tokio::select! {
+        biased;
+        frame = &mut receiving => panic!("the malformed copy was not read: {frame:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    let frame = envelope("req-malformed-relay", b"delivered despite the copy");
+    device_path.send_frame(&frame).await.expect("send");
+    assert_eq!(
+        timeout(Duration::from_secs(2), &mut receiving)
+            .await
+            .expect("the read is bounded")
+            .expect("the direct frame is delivered, not lost to the malformed copy"),
+        frame
+    );
+    assert_eq!(
+        malformed.sends(),
+        0,
+        "the client never sent through the broken relay"
+    );
+}

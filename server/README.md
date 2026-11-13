@@ -137,6 +137,19 @@ close, which is why the transport treats any relay refusal as the signal that th
 not reach the peer. Closed relay state is dropped when the session expires, so memory stays bounded by
 sessions from the last five minutes.
 
+A peer's socket is closed with `idle_timeout` when nothing has crossed it in either direction
+for 30 seconds. Anything the peer sends proves it is still there, including a WebSocket ping
+and a pong — a ping is answered by the relay itself and is never forwarded, so it costs no
+frame slot, no queue depth, and no sequence number. That is the keepalive the transport uses:
+a session whose traffic is entirely direct sends the relay nothing, so without a periodic
+ping the fallback would be closed about thirty seconds into an otherwise healthy session.
+
+`idle_timeout` closes the *relay*, not the session. A peer whose direct path is delivering
+should keep using it: the transport reports the loss of the relay only to a send that actually
+needs it, and never as the result of an otherwise idle read. Reserve "create a new session" for
+`409 relay_unavailable` on a *new* lease, or for a `device_revoked`, `session_revoked`, or
+`session_expired` close.
+
 ## Configuration
 
 | Variable | Default | Meaning |

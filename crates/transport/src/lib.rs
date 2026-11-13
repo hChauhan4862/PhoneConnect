@@ -52,8 +52,8 @@ pub use hole_punch::{
     ProbePacket, SwitchConfig, TicketRole,
 };
 pub use path::{
-    ConnectedPath, PathConfig, PathController, PathError, PathKind, PathSetup, RelayChannel,
-    RelayError, RelayOnlyPath, Ticket, TicketError,
+    ConnectedPath, PathConfig, PathController, PathError, PathKind, PathSetup, RELAY_IDLE_TIMEOUT,
+    RelayChannel, RelayError, RelayOnlyPath, Ticket, TicketError,
 };
 
 /// Converts a server-advertised relay endpoint into the WebSocket URL a peer attaches to.
@@ -201,6 +201,18 @@ impl RelayChannel for WebSocketRelay {
 
     async fn close(&self) -> Result<(), RelayError> {
         self.sink.lock().await.close().await.map_err(socket_error)
+    }
+
+    /// A WebSocket ping. The relay answers it itself, so it resets the server's 30-second
+    /// idle deadline without occupying a frame slot, a queue entry, or a sequence number —
+    /// which a keepalive frame forwarded to the peer would.
+    async fn keepalive(&self) -> Result<(), RelayError> {
+        self.sink
+            .lock()
+            .await
+            .send(Message::Ping(b"pc-ka".to_vec().into()))
+            .await
+            .map_err(socket_error)
     }
 
     /// The measured relay round trip, so path selection compares a real number instead of

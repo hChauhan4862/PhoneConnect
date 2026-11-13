@@ -212,6 +212,25 @@ fn direction_byte(role: TicketRole) -> u8 {
     }
 }
 
+/// The frame counter of a sealed frame addressed to this peer, when its header is readable.
+/// Every check here repeats a check in [`SessionCipher::open`], which is where a frame that
+/// fails one of them is diagnosed; this only has to say what `open` would read.
+fn peer_counter(sealed: &[u8], key_id: &[u8; KEY_ID_LEN], peer_direction: u8) -> Option<u64> {
+    if sealed.len() < SealedHeader::MIN_LEN
+        || sealed[SealedHeader::VERSION_OFFSET] != SEALED_VERSION
+        || sealed[SealedHeader::KEY_ID_OFFSET..SealedHeader::DIRECTION_OFFSET] != *key_id
+        || sealed[SealedHeader::DIRECTION_OFFSET] != peer_direction
+    {
+        return None;
+    }
+    let counter = u64::from_be_bytes(
+        sealed[SealedHeader::COUNTER_OFFSET..SealedHeader::STREAM_KIND_OFFSET]
+            .try_into()
+            .ok()?,
+    );
+    (counter != 0).then_some(counter)
+}
+
 /// The per-connection epoch mixed into key derivation.
 ///
 /// The identity keys are static, so the same session id would otherwise produce the same
@@ -442,6 +461,29 @@ impl SessionCipher {
         sealed.extend_from_slice(&header);
         sealed.extend_from_slice(&ciphertext);
         Ok(sealed)
+    }
+
+    /// True when [`Self::open`] would still accept this frame's counter, i.e. the frame has
+    /// not fallen out of the replay window behind the frames already received.
+    ///
+    /// The header is read, never decrypted and never recorded, so a caller that has been
+    /// holding a frame can decide whether it is still deliverable instead of discovering it as
+    /// a [`AeadError::CounterRegression`]. A frame this method cannot read is reported as
+    /// still deliverable: [`Self::open`] is where a malformed frame is diagnosed.
+    pub fn within_replay_window(&self, sealed: &[u8]) -> bool {
+        let Some(counter) = peer_counter(sealed, &self.key_id, self.peer_direction) else {
+            return true;
+        };
+        let highest = self
+            .recv_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .highest;
+        match highest {
+            // A counter ahead of the window is always acceptable.
+            Some(highest) => counter > highest || highest - counter < AEAD_REPLAY_WINDOW,
+            None => true,
+        }
     }
 
     /// Opens one sealed frame. Authenticates first, then applies the bounded replay window,

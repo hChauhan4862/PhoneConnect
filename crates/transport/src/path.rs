@@ -289,6 +289,19 @@ pub trait RelayChannel: Send + Sync {
     async fn recv_frame(&self) -> Result<Vec<u8>, RelayError>;
     async fn close(&self) -> Result<(), RelayError>;
 
+    /// Tells the relay this peer is still attached, without sending a frame: the server's
+    /// idle deadline covers a direction that carries nothing, so a path whose traffic is
+    /// direct has to say something on the relay or lose it. A `WebSocketRelay` sends a ping,
+    /// which the server answers itself; it is never forwarded to the peer, never enters the
+    /// relay's bounded queue, and never consumes a sequence number.
+    ///
+    /// An error means the relay is gone and the path records it: from then on, a send that
+    /// needs the relay reports it instead of reporting a frame as delivered. The default is a
+    /// no-op for channels that do not need one.
+    async fn keepalive(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
     /// Measured relay round-trip time. `None` means no measurement exists yet; selection
     /// then uses [`PathConfig::relay_latency_estimate`] as an upper bound.
     fn latency(&self) -> Option<Duration> {
@@ -323,6 +336,16 @@ pub struct PathConfig {
     /// abandon a healthy direct path for its own duplicate. Bounded by the caller's remaining
     /// `recv_timeout`, and skipped entirely when the direct path is not duplicating.
     pub relay_frame_grace: Duration,
+    /// How often a path that holds a relay tells the server it is still there.
+    ///
+    /// The relay closes a socket whose direction has carried nothing for
+    /// [`RELAY_IDLE_TIMEOUT`], and a healthy direct path sends the relay nothing at all, so
+    /// without this the fallback quietly disappears while the direct path looks fine. The
+    /// keepalive is a WebSocket ping: the server answers it itself and never forwards it, so
+    /// it costs no frame slot, no queue depth, and no sequence number. It must be shorter
+    /// than the server's idle timeout — [`PathConfig::validate`] refuses one that is not — and
+    /// the default is a third of it.
+    pub relay_keepalive_interval: Duration,
     /// Frame profile. Control paths must use [`FrameLimits::control_only`].
     pub frame_limits: FrameLimits,
     /// Largest sealed frame the direct datagram path accepts.
@@ -343,6 +366,7 @@ impl Default for PathConfig {
             transition_timeout: Duration::from_secs(1),
             transition_max_frames: 16,
             relay_frame_grace: Duration::from_millis(20),
+            relay_keepalive_interval: Duration::from_secs(10),
             frame_limits: FrameLimits::control_only(),
             direct_frame_limit: MAX_DIRECT_FRAME_BYTES,
             recv_timeout: Duration::from_secs(5),
@@ -395,6 +419,17 @@ impl PathConfig {
         if self.relay_frame_grace.is_zero() {
             return Err(PathError::InvalidConfig {
                 reason: "relay_frame_grace must be non-zero".to_owned(),
+            });
+        }
+        if self.relay_keepalive_interval.is_zero()
+            || self.relay_keepalive_interval >= RELAY_IDLE_TIMEOUT
+        {
+            return Err(PathError::InvalidConfig {
+                reason: format!(
+                    "relay_keepalive_interval must be non-zero and shorter than the relay's \
+                     {} ms idle timeout",
+                    RELAY_IDLE_TIMEOUT.as_millis()
+                ),
             });
         }
         Ok(())
@@ -510,11 +545,13 @@ pub enum PathError {
     EpochUnavailable,
     #[error("direct frame of {length} bytes exceeds the {limit}-byte datagram limit")]
     DirectFrameTooLarge { length: usize, limit: usize },
-    /// The bounded inbound ring dropped frames because the application was not reading fast
-    /// enough. Non-fatal and local: nothing is wrong with the peer, and the next read
-    /// continues with the frames that are still queued. Reported instead of surfacing as an
-    /// `AeadError::CounterRegression`, which would blame the peer for local loss.
-    #[error("the direct path dropped {count} inbound frame(s) because the reader fell behind")]
+    /// The path dropped frames locally, because the application was not reading fast enough
+    /// (the bounded inbound ring) or because a held relay frame could no longer be delivered
+    /// inside the replay window. Non-fatal and local: nothing is wrong with the peer, and the
+    /// next read continues with the frames that are still queued. Reported instead of
+    /// surfacing as an `AeadError::CounterRegression`, which would blame the peer for local
+    /// loss.
+    #[error("the path dropped {count} inbound frame(s) because the reader fell behind")]
     FramesLost { count: u32 },
     #[error("path is shut down")]
     Shutdown,
@@ -586,6 +623,62 @@ const PENDING: u8 = 2;
 enum FrameSource {
     Direct,
     Relay,
+    /// A relay frame that was held while its direct twin arrived. It is a real frame — it is
+    /// delivered exactly once — but it was dual-sent, so it says nothing about where the peer
+    /// reads and must not move the send side.
+    HeldRelay,
+}
+
+/// The server's relay idle timeout: a relay direction that carries nothing for this long is
+/// closed. [`PathConfig::relay_keepalive_interval`] must stay well below it.
+pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keeps the relay attached for as long as the path holds it, and remembers why it ended.
+///
+/// The relay closes a socket whose direction has carried nothing for
+/// [`RELAY_IDLE_TIMEOUT`]. A healthy direct path sends the relay nothing, so the fallback the
+/// whole receive side depends on would quietly disappear about thirty seconds into every
+/// healthy session, and a later one-way fault would have nothing left to recover onto. This
+/// task pings the relay at [`PathConfig::relay_keepalive_interval`] for the path's lifetime
+/// and records the fault that ends it, so a relay that died is still reportable by a caller
+/// that actually needs it.
+struct RelayLiveness {
+    relay: Arc<dyn RelayChannel>,
+    interval: Duration,
+    fault: std::sync::Mutex<Option<RelayError>>,
+}
+
+impl RelayLiveness {
+    fn new(relay: Arc<dyn RelayChannel>, interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            relay,
+            interval,
+            fault: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Records the fault that ended the relay, keeping the first one: it is the one that says
+    /// why the socket went away. Backpressure is refused a copy, not a dead transport, so it
+    /// is not remembered as one.
+    fn record(&self, error: RelayError) {
+        if matches!(error, RelayError::Backpressure) {
+            return;
+        }
+        let mut fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if fault.is_none() {
+            *fault = Some(error);
+        }
+    }
+
+    fn fault(&self) -> Option<RelayError> {
+        self.fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// Tickets this process has already opened a path with, per session and role.
@@ -665,6 +758,26 @@ fn path_kind_byte(kind: PathKind) -> u8 {
     }
 }
 
+/// Starts the relay keepalive for this path. `None` means no Tokio runtime was available
+/// yet; the first send or receive arms it instead.
+fn spawn_relay_keepalive(liveness: Arc<RelayLiveness>) -> Option<tokio::task::JoinHandle<()>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    Some(handle.spawn(async move {
+        let mut ticker = tokio::time::interval(liveness.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The attach handshake has just reset the server's deadline; the first keepalive is
+        // due one interval later.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(error) = liveness.relay.keepalive().await {
+                liveness.record(error);
+                return;
+            }
+        }
+    }))
+}
+
 /// Connected path over the lower-latency validated transport.
 pub struct ConnectedPath {
     session_id: String,
@@ -693,11 +806,19 @@ pub struct ConnectedPath {
     /// Frames the direct socket's bounded inbound ring dropped, kept here so the counter
     /// stays readable (and monotonic) after the socket is closed.
     dropped_frames: AtomicU32,
+    /// Held relay frames dropped because they left the replay window before they could be
+    /// delivered. Local loss, like a ring drop, and reported the same way.
+    held_frames_dropped: AtomicU32,
     /// Highest drop count already surfaced as [`PathError::FramesLost`].
     loss_reported: AtomicU32,
     /// A relay frame that lost its race with the direct copy of the same frame, kept so it
     /// can be handed out instead of being dropped.
     held_relay_frame: std::sync::Mutex<Option<Vec<u8>>>,
+    /// The relay keepalive, alive exactly as long as this path holds its relay.
+    relay_keepalive: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The relay this path keeps attached, with the fault that ended it, if it ended. Taken
+    /// away when the path shuts down.
+    relay_liveness: std::sync::Mutex<Option<Arc<RelayLiveness>>>,
 }
 
 impl fmt::Debug for ConnectedPath {
@@ -728,7 +849,7 @@ impl ConnectedPath {
         } = setup;
         config.validate()?;
         let cipher = SessionCipher::new(identity, peer_identity, session_id, role, epoch)?;
-        Ok(Self {
+        let path = Self {
             session_id: session_id.to_owned(),
             device_id: device_id.to_owned(),
             ticket: Ticket {
@@ -743,6 +864,10 @@ impl ConnectedPath {
                 signature: String::new(),
             },
             cipher,
+            relay_liveness: std::sync::Mutex::new(Some(RelayLiveness::new(
+                Arc::clone(&relay),
+                config.relay_keepalive_interval,
+            ))),
             config,
             socket: None,
             probe_socket: std::sync::Mutex::new(None),
@@ -757,9 +882,13 @@ impl ConnectedPath {
             relay_backpressure: AtomicU32::new(0),
             relay_suppressed: AtomicBool::new(false),
             dropped_frames: AtomicU32::new(0),
+            held_frames_dropped: AtomicU32::new(0),
             loss_reported: AtomicU32::new(0),
             held_relay_frame: std::sync::Mutex::new(None),
-        })
+            relay_keepalive: std::sync::Mutex::new(None),
+        };
+        path.arm_relay_keepalive();
+        Ok(path)
     }
 
     pub fn session_id(&self) -> &str {
@@ -835,7 +964,10 @@ impl ConnectedPath {
     /// Local loss the caller has not been told about yet. `None` means nothing new was
     /// dropped, so a gap reported now would be the peer's fault, not ours.
     fn unreported_loss(&self) -> Option<u32> {
-        let dropped = self.observe_dropped_frames();
+        // Both sources are local: the ring dropped frames for a stalled reader, and a held
+        // relay frame was dropped once it could no longer be delivered in order.
+        let dropped =
+            self.observe_dropped_frames() + self.held_frames_dropped.load(Ordering::SeqCst);
         let reported = self.loss_reported.load(Ordering::SeqCst);
         if dropped > reported {
             self.loss_reported.store(dropped, Ordering::SeqCst);
@@ -893,6 +1025,7 @@ impl ConnectedPath {
             if state.closed {
                 return Err(PathError::Shutdown);
             }
+            self.arm_relay_keepalive();
             (
                 self.state_byte(),
                 direct_snapshot(&state),
@@ -992,6 +1125,7 @@ impl ConnectedPath {
         if let Some(count) = self.unreported_loss() {
             return Err(PathError::FramesLost { count });
         }
+        self.arm_relay_keepalive();
         let deadline = std::time::Instant::now() + self.config.recv_timeout;
         loop {
             let (sealed, source) = self.next_sealed(deadline).await?;
@@ -1003,6 +1137,9 @@ impl ConnectedPath {
                     match source {
                         FrameSource::Direct => self.commit_direct(),
                         FrameSource::Relay => self.adopt_relay(),
+                        // A held copy is a real frame, but it was dual-sent: it says nothing
+                        // about where the peer reads.
+                        FrameSource::HeldRelay => {}
                     }
                     return Ok(envelope);
                 }
@@ -1059,10 +1196,17 @@ impl ConnectedPath {
                 if remaining.is_zero() {
                     return Err(HolePunchError::ReceiveTimeout.into());
                 }
-                match tokio::time::timeout(remaining, relay.recv_frame()).await {
-                    Ok(result) => Ok((self.open_relay_frame(&result?)?, FrameSource::Relay)),
-                    Err(_) => Err(HolePunchError::ReceiveTimeout.into()),
-                }
+                let frame = match tokio::time::timeout(remaining, relay.recv_frame()).await {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => {
+                        // A relay-only path has nothing else to read, so the caller sees this
+                        // one; recording it also stops a later send from claiming delivery.
+                        self.note_relay_fault(error.clone());
+                        return Err(error.into());
+                    }
+                    Err(_) => return Err(HolePunchError::ReceiveTimeout.into()),
+                };
+                Ok((self.open_relay_frame(&frame)?, FrameSource::Relay))
             }
             (None, None) => Err(PathError::NoPath),
         }
@@ -1082,21 +1226,38 @@ impl ConnectedPath {
         deadline: std::time::Instant,
     ) -> Result<(Vec<u8>, FrameSource), PathError> {
         let mut relay: Option<Arc<dyn RelayChannel>> = Some(relay);
-        let mut relay_fault: Option<RelayError> = None;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(match relay_fault {
-                    Some(fault) => fault.into(),
-                    None => HolePunchError::ReceiveTimeout.into(),
-                });
+                // Whether the relay died is the caller's business only when the direct path is
+                // not delivering. While it is, an idle read is a timeout on a healthy
+                // session, never "the relay is gone, create a new session" — the choice that
+                // would tear down a working direct path. The fault stays recorded, so a send
+                // that actually needs the relay still reports it.
+                if !socket.is_alive(self.config.direct_health_timeout) {
+                    if let Some(fault) = self.relay_fault() {
+                        return Err(fault.into());
+                    }
+                }
+                return Err(HolePunchError::ReceiveTimeout.into());
+            }
+            // A relay frame that a direct frame preempted once goes out before the direct
+            // ring: it arrived before anything the ring still holds, so handing it out later
+            // would only push it further behind the replay window, where it would be
+            // delivered as the peer's `CounterRegression` instead of as our own loss.
+            if let Some(held) = self.take_held_relay_frame() {
+                if self.cipher.within_replay_window(&held) {
+                    return Ok((held, FrameSource::HeldRelay));
+                }
+                // Holding it for longer would leave the window, so it is dropped and counted
+                // as local loss. Non-fatal: the next read continues with what still arrives.
+                self.held_frames_dropped.fetch_add(1, Ordering::SeqCst);
+                if let Some(count) = self.unreported_loss() {
+                    return Err(PathError::FramesLost { count });
+                }
             }
             if let Some(frame) = socket.try_recv_frame() {
                 return Ok((frame, FrameSource::Direct));
-            }
-            // A relay frame a direct frame preempted once is handed out before waiting again.
-            if let Some(sealed) = self.take_held_relay_frame() {
-                return Ok((sealed, FrameSource::Relay));
             }
             let wait = if relay.is_some() {
                 remaining.min(self.config.direct_health_timeout)
@@ -1121,6 +1282,19 @@ impl ConnectedPath {
                 },
                 relayed = await_relay(relay_read) => match relayed {
                     Ok(frame) => {
+                        // Decode the copy before a direct frame is consumed. A malformed relay
+                        // frame is a relay failure; it must not also cost the caller the
+                        // datagram that already arrived.
+                        let sealed = match self.open_relay_frame(&frame) {
+                            Ok(sealed) => sealed,
+                            Err(error) => {
+                                relay = None;
+                                self.note_relay_fault(RelayError::Malformed {
+                                    reason: error.to_string(),
+                                });
+                                continue;
+                            }
+                        };
                         // While we are duplicating, the peer probably is too, and its direct
                         // copy of this very frame may still be in flight — on a loopback
                         // relay the copy is faster than the datagram. Give the direct copy a
@@ -1137,20 +1311,19 @@ impl ConnectedPath {
                             {
                                 // Keep the copy, unwrapped, for the next read: it is a real
                                 // frame the peer sent, so losing it would be loss.
-                                let sealed = self.open_relay_frame(&frame)?;
                                 self.hold_relay_frame(sealed);
                                 return Ok((direct, FrameSource::Direct));
                             }
                         }
-                        let sealed = self.open_relay_frame(&frame)?;
                         return Ok((sealed, FrameSource::Relay));
                     }
                     Err(error) => {
                         // Keep reading the direct path: a relay that failed is not a reason
                         // to lose the frames a working direct path still carries. The fault
-                        // is what the caller sees if nothing arrives before the deadline.
+                        // is recorded, and reported by a send that needs the relay or by a
+                        // read that has nothing else to read.
                         relay = None;
-                        relay_fault = Some(error);
+                        self.note_relay_fault(error);
                     }
                 },
             }
@@ -1184,6 +1357,64 @@ impl ConnectedPath {
             .take()
     }
 
+    /// Starts the relay keepalive this path holds for its whole life, once. A path without a
+    /// relay, or one that has shut down, does nothing.
+    fn arm_relay_keepalive(&self) {
+        let Some(liveness) = self
+            .relay_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        let mut slot = self
+            .relay_keepalive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = spawn_relay_keepalive(liveness);
+        }
+    }
+
+    /// Stops the keepalive and forgets the relay it watched. Idempotent.
+    fn stop_relay_keepalive(&self) {
+        self.relay_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = self
+            .relay_keepalive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    /// The fault that ended the relay, if it ended. A relay whose death was observed is never
+    /// reported as available again: the socket may still accept writes long after the peer
+    /// stopped reading it.
+    fn relay_fault(&self) -> Option<RelayError> {
+        self.relay_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|liveness| liveness.fault())
+    }
+
+    fn note_relay_fault(&self, error: RelayError) {
+        if let Some(liveness) = self
+            .relay_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            liveness.record(error);
+        }
+    }
+
     fn open_relay_frame(&self, frame: &[u8]) -> Result<Vec<u8>, PathError> {
         let outer = decode_frame(frame, &self.config.frame_limits)?;
         if outer.consumed != frame.len() {
@@ -1200,8 +1431,20 @@ impl ConnectedPath {
         sealed: &[u8],
     ) -> Result<(), PathError> {
         let relay = relay.ok_or(PathError::NoPath)?;
+        // A relay whose death was already observed never reports a frame as sent. A socket can
+        // still accept writes after the peer's close — the bytes go nowhere — and `Ok` for a
+        // frame nobody will read is the one outcome the caller cannot recover from.
+        if let Some(fault) = self.relay_fault() {
+            return Err(fault.into());
+        }
         let frame = self.relay_envelope(sealed)?;
-        relay.send_frame(&frame).await.map_err(PathError::from)
+        match relay.send_frame(&frame).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.note_relay_fault(error.clone());
+                Err(error.into())
+            }
+        }
     }
 
     fn check_direct_size(&self, sealed: &[u8]) -> Result<(), PathError> {
@@ -1333,6 +1576,9 @@ impl ConnectedPath {
             (state.relay.clone(), state.direct.take())
         };
         self.end_transition();
+        // The keepalive belongs to the path, not to the relay handle: stop it before the
+        // relay it pings is closed.
+        self.stop_relay_keepalive();
         if let Some(direct) = direct {
             direct.socket.close();
         }
@@ -1406,6 +1652,8 @@ impl Drop for ConnectedPath {
                 socket.close();
             }
         }
+        // A path that was never shut down must not keep pinging a relay nobody holds.
+        self.stop_relay_keepalive();
     }
 }
 
@@ -1546,9 +1794,15 @@ impl PathController {
             relay_backpressure: AtomicU32::new(0),
             relay_suppressed: AtomicBool::new(false),
             dropped_frames: AtomicU32::new(0),
+            held_frames_dropped: AtomicU32::new(0),
             loss_reported: AtomicU32::new(0),
             held_relay_frame: std::sync::Mutex::new(None),
+            relay_keepalive: std::sync::Mutex::new(None),
+            relay_liveness: std::sync::Mutex::new(relay.as_ref().map(|relay| {
+                RelayLiveness::new(Arc::clone(relay), config.relay_keepalive_interval)
+            })),
         };
+        path.arm_relay_keepalive();
 
         let negotiated = negotiate_direct(
             Arc::clone(&socket),

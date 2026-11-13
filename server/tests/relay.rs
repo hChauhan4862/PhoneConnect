@@ -1104,7 +1104,7 @@ mod transport {
     use axum::http::StatusCode;
     use futures_util::{SinkExt, StreamExt};
     use phoneconnect::v1::{Envelope, FrameLimits, encode_frame};
-    use phoneconnect_server::relay::RelayClose;
+    use phoneconnect_server::relay::{RelayClose, RelayLimits};
     use phoneconnect_server::store::DeviceStore;
     use tokio::net::TcpListener;
     use tokio_tungstenite::MaybeTlsStream;
@@ -1272,6 +1272,68 @@ mod transport {
             ),
             other => panic!("expected HTTP 409, got {other:?}"),
         }
+
+        server.abort();
+    }
+
+    /// The transport keeps its relay attached with a WebSocket ping, which costs no frame
+    /// slot, no queue entry, and no sequence number. That only works because the relay treats
+    /// anything a peer sends — a ping included — as proof the socket is alive: without it, the
+    /// idle deadline would close a relay that a healthy direct path never touches.
+    #[tokio::test]
+    async fn a_websocket_ping_keeps_the_relay_attached_past_the_idle_timeout() {
+        async fn ping_and_await_pong(socket: &mut Socket) {
+            socket
+                .send(Message::Ping(b"pc-ka".to_vec().into()))
+                .await
+                .expect("ping sent");
+            let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("the relay answers within the deadline")
+                .expect("the stream stays open")
+                .expect("a message");
+            match message {
+                Message::Pong(_) => {}
+                other => panic!("the relay answered with {other:?} instead of a Pong"),
+            }
+        }
+
+        let app = TestApp::with_relay(RelayLimits {
+            idle_timeout_ms: 400,
+            ..RelayLimits::default()
+        });
+        let (device_id, credential) = app.enroll_new("user-a").await;
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_owned();
+        let capability = session["capability"]
+            .as_str()
+            .expect("capability")
+            .to_owned();
+        let (_, lease) = app.relay_upgrade(&session_id, Some(&capability)).await;
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, lease["endpoint"].as_str().expect("endpoint"));
+
+        let mut client = attach(&url, &capability).await;
+        let mut device = attach(&url, &credential).await;
+
+        // Three idle timeouts of nothing but pings: a session whose traffic is all direct
+        // sends no frames at all, so this is the only thing keeping the relay attached.
+        for _ in 0..12 {
+            ping_and_await_pong(&mut client).await;
+            ping_and_await_pong(&mut device).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The sockets survived the idle deadline, so a frame still crosses them.
+        let forwarded = frame(&session_id, b"after three idle timeouts");
+        device
+            .send(Message::Binary(forwarded.clone().into()))
+            .await
+            .expect("the device socket is still attached");
+        assert_eq!(next_binary(&mut client).await, forwarded);
 
         server.abort();
     }

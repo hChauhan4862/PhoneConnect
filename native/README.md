@@ -67,11 +67,32 @@ run the same negotiation:
   duplicating, a relay frame waits up to `PathConfig::relay_frame_grace` for its own direct
   copy, so a low-latency relay does not talk a healthy direct path out of the data it is
   already delivering.
+- **The relay stays attached for the path's lifetime.** The server closes a relay socket that
+  has carried nothing for thirty seconds, and a healthy direct path sends the relay nothing —
+  so the path pings its relay every `PathConfig::relay_keepalive_interval` (10 s by default,
+  a third of the server's timeout) from the moment the relay attaches until `shutdown`. A
+  `WebSocketRelay` sends a WebSocket ping, which the server answers itself: it is never
+  forwarded, never queued, and never consumes a sequence number, unlike a keepalive *frame*.
+  Without it the fallback would quietly die about thirty seconds into every healthy session,
+  and a later one-way fault would have nothing to recover onto.
+- **A relay that dies is not reported as delivery.** The first observed relay fault (`Closed`,
+  `Malformed`, or `Unavailable`) is remembered, and from then on a send that needs the relay
+  returns it instead of handing a frame to a half-open socket and reporting `Ok`. An idle
+  read on a healthy direct path reports `HolePunch(ReceiveTimeout)` — never the relay's
+  closure, which per the server's documentation would read as "create a new session" and tear
+  down a path that is delivering. The fault is reported only where it changes the outcome: a
+  send that needs the relay, or a read with no direct path left to wait on.
 - Loss is reported, not hidden: `ConnectedPath::dropped_frames` counts frames the bounded
   inbound ring dropped for a stalled reader (monotonic, including after shutdown), and the
   next receive reports the gap as `PathError::FramesLost { count }` — non-fatal and local,
   never as the `CounterRegression` a broken peer would produce. `relay_backpressure_events`
   counts relay copies the relay refused.
+- A relay frame that lost its race with the direct copy of the same frame is held as one
+  frame and delivered **before** the direct ring, because it is older than everything the ring
+  holds. A copy that can no longer be delivered inside the AEAD replay window (64 counters) is
+  dropped and reported as `FramesLost`; it is our own scheduling, not a peer whose counter
+  went backwards. A malformed relay copy is decoded before any direct frame is consumed, so it
+  costs the relay (recorded as a fault) and never a datagram that already arrived.
 - `WebSocketRelay` attaches to the server's framed relay route. A `409 relay_unavailable`
   is terminal for that session id: create a new session, never retry on the old one, and
   read revocation from the stream close reason rather than from the lease status.
