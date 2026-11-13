@@ -18,8 +18,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import java.io.IOException
-import java.net.DatagramSocket
-import java.net.SocketException
 
 /**
  * Establishes and runs one real session against the hub.
@@ -71,26 +69,15 @@ class TransportSessionRunner(
         if (ticket.sessionId != session.sessionId || ticket.deviceId != deviceId) {
             return SessionEnd.Failed(ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR))
         }
-        // The two ticket nonces are the per-connection epoch, and each peer publishes its
-        // nonce by redeeming its ticket. Without the peer's nonce there is no key to derive,
-        // so waiting is the only correct behaviour.
-        val rendezvousSocket = try {
-            DatagramSocket(0)
-        } catch (error: SocketException) {
-            return SessionEnd.Failed(ConnectionFailure.Retryable(ReconnectReason.NETWORK_UNAVAILABLE))
+        // The two ticket nonces are the per-connection epoch. This device has no direct path,
+        // so it publishes no candidate endpoint (a wildcard address would be advertised to the
+        // peer as a direct candidate that can never answer); it only reads the opposite
+        // peer's nonce once that peer has registered.
+        val candidates = when (val rendezvous = awaitPeerNonce(credential, session.sessionId)) {
+            is RendezvousWait.Rendezvous -> rendezvous.candidates
+            is RendezvousWait.Ended -> return rendezvous.end
         }
-        try {
-            val endpoint = "0.0.0.0:${rendezvousSocket.localPort}"
-            val candidates = when (
-                val rendezvous = awaitPeerNonce(credential, session.sessionId, ticket, endpoint)
-            ) {
-                is RendezvousWait.Rendezvous -> rendezvous.candidates
-                is RendezvousWait.Ended -> return rendezvous.end
-            }
-            return connectOverRelay(identity, credential, deviceId, session, ticket, candidates, onConnected)
-        } finally {
-            rendezvousSocket.close()
-        }
+        return connectOverRelay(identity, credential, deviceId, session, ticket, candidates, onConnected)
     }
 
     /**
@@ -162,16 +149,11 @@ class TransportSessionRunner(
         }
     }
 
-    private suspend fun awaitPeerNonce(
-        credential: String,
-        sessionId: String,
-        ticket: RendezvousTicket,
-        endpoint: String,
-    ): RendezvousWait {
+    private suspend fun awaitPeerNonce(credential: String, sessionId: String): RendezvousWait {
         var pause = pollIntervalMs
         while (true) {
             currentCoroutineContext().ensureActive()
-            val result = hub.registerCandidate(credential, sessionId, ticket, endpoint)
+            val result = hub.candidates(credential, sessionId)
             val candidates = result.getOrElse { error -> return RendezvousWait.Ended(SessionEnd.Failed(error.toFailure())) }
             if (candidates.peerNonce != null) {
                 return RendezvousWait.Rendezvous(candidates)
@@ -181,14 +163,39 @@ class TransportSessionRunner(
         }
     }
 
+    /**
+     * Classifies a hub answer by its machine-readable code first, then by status.
+     *
+     * Status alone is not enough: the hub answers `401`/`403` for expired tickets and
+     * revoked sessions as well as for bad credentials. Treating those as "not enrolled"
+     * would delete a perfectly good credential when a 30-second ticket expires, and the user
+     * cannot mint a new one-time enrollment token from the device.
+     */
     private fun Throwable.toFailure(): ConnectionFailure = when (this) {
-        is HubFailure.Rejected -> when {
-            code == "device_revoked" -> ConnectionFailure.DeviceRevoked
-            code == "relay_unavailable" || status == 409 -> ConnectionFailure.RelayUnavailable
-            status == 404 || status == 410 -> ConnectionFailure.SessionEnded
-            status == 401 || status == 403 -> ConnectionFailure.NotEnrolled
-            status >= 500 -> ConnectionFailure.Retryable(ReconnectReason.SERVER_UNREACHABLE)
-            else -> ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR)
+        is HubFailure.Rejected -> when (code) {
+            // Only these two mean the stored device credential is unusable.
+            "invalid_credential", "device_unknown" -> ConnectionFailure.NotEnrolled
+            "device_revoked" -> ConnectionFailure.DeviceRevoked
+
+            // The session is over; the enrollment is not. The supervisor starts a new session.
+            "session_expired", "session_revoked", "session_unknown",
+            "session_scope_mismatch", "device_scope_mismatch", "ticket_scope_mismatch",
+            "ticket_identity_missing",
+            -> ConnectionFailure.SessionEnded
+
+            // A stale ticket is worth one more try with a fresh one; nothing is invalidated.
+            "ticket_expired", "ticket_replayed" ->
+                ConnectionFailure.Retryable(ReconnectReason.TICKET_EXPIRED)
+
+            "relay_unavailable" -> ConnectionFailure.RelayUnavailable
+
+            else -> when {
+                status == 404 || status == 410 -> ConnectionFailure.SessionEnded
+                status >= 500 -> ConnectionFailure.Retryable(ReconnectReason.SERVER_UNREACHABLE)
+                // An auth failure with an unknown code must never wipe the credential.
+                status == 401 || status == 403 -> ConnectionFailure.SessionEnded
+                else -> ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR)
+            }
         }
 
         is HubFailure.Unreachable, is IOException ->

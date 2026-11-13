@@ -39,22 +39,26 @@ class NotificationController(
     }
 
     /** Updates the one notification. It can never add another one. */
-    fun update(status: ConnectionStatus) {
-        manager.notify(NOTIFICATION_ID, build(status))
+    fun update(status: ConnectionStatus, ongoing: Boolean = true) {
+        manager.notify(NOTIFICATION_ID, build(status, ongoing))
     }
 
     fun clear() {
         manager.cancel(NOTIFICATION_ID)
     }
 
-    fun build(status: ConnectionStatus): Notification {
+    /**
+     * The notification for [status]. [ongoing] is false for a final status the service is
+     * about to detach: the reason must stay readable, and the user must be able to dismiss it.
+     */
+    fun build(status: ConnectionStatus, ongoing: Boolean = true): Notification {
         val text = text(status)
         return NotificationCompat.Builder(appContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_connection)
             .setContentTitle(appContext.getString(R.string.connection_notification_title))
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setOngoing(true)
+            .setOngoing(ongoing)
             .setSilent(true)
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -104,6 +108,7 @@ class NotificationController(
         ReconnectReason.NETWORK_UNAVAILABLE -> "no network"
         ReconnectReason.SERVER_UNREACHABLE -> "server unreachable"
         ReconnectReason.TRANSPORT_CLOSED -> "connection closed"
+        ReconnectReason.TICKET_EXPIRED -> "rendezvous ticket expired"
         ReconnectReason.PROTOCOL_ERROR -> "protocol error"
     }
 

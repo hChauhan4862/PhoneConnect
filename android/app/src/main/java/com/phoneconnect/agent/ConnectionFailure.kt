@@ -5,6 +5,7 @@ enum class ReconnectReason {
     NETWORK_UNAVAILABLE,
     SERVER_UNREACHABLE,
     TRANSPORT_CLOSED,
+    TICKET_EXPIRED,
     PROTOCOL_ERROR,
 }
 

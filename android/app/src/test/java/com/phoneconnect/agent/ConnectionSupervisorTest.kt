@@ -68,6 +68,32 @@ class ConnectionSupervisorTest {
     }
 
     @Test
+    fun `a stale ticket is retried with fresh material and keeps the enrollment`() = runTest {
+        val store = FakeEnrollmentStore()
+        val runner = ScriptedRunner(
+            listOf(
+                Step(end = failed(ReconnectReason.TICKET_EXPIRED)),
+                Step(end = SessionEnd.Failed(ConnectionFailure.DeviceRevoked)),
+            ),
+        )
+        val statuses = mutableListOf<ConnectionStatus>()
+
+        val outcome = supervisor(store, runner, statuses).run()
+
+        assertEquals(SupervisorOutcome.Terminal(ConnectionFailure.DeviceRevoked), outcome)
+        assertEquals("a stale ticket must be retried, not treated as revocation", 2, runner.starts)
+        assertEquals(
+            listOf(ConnectionStatus.Reconnecting(1, 1_000L, ReconnectReason.TICKET_EXPIRED)),
+            statuses.filterIsInstance<ConnectionStatus.Reconnecting>(),
+        )
+        assertEquals(
+            "only the terminal revocation may clear the credential",
+            listOf(ClearReason.REVOKED),
+            store.clears,
+        )
+    }
+
+    @Test
     fun `no enrollment stops without retrying or touching storage`() = runTest {
         val store = FakeEnrollmentStore(initial = null)
         val runner = ScriptedRunner(emptyList())

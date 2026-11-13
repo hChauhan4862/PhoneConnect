@@ -138,6 +138,12 @@ class ConnectionServiceTest {
         assertEquals("the revoked device credential must be cleared", listOf(ClearReason.REVOKED), TestConnectionService.store.clears)
         val text = notificationText() ?: ""
         assertTrue("the reason must stay readable, got '$text'", text.contains("revoked", ignoreCase = true))
+        val notification = shadowOf(manager).getNotification(NotificationController.NOTIFICATION_ID)
+        assertEquals(
+            "a final status must be dismissible, not permanently ongoing",
+            0,
+            notification.flags and Notification.FLAG_ONGOING_EVENT,
+        )
 
         // A later enrollment (which restores the credential) starts a fresh service instance.
         TestConnectionService.store.enrolled = true

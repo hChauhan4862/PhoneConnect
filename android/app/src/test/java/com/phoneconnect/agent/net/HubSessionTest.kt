@@ -9,7 +9,9 @@ import com.phoneconnect.agent.EnrollmentRequest
 import com.phoneconnect.agent.EnrollmentState
 import com.phoneconnect.agent.EnrollmentStore
 import com.phoneconnect.agent.IdentityBoundary
+import com.phoneconnect.agent.Invalidation
 import com.phoneconnect.agent.SessionEnd
+import com.phoneconnect.agent.invalidation
 import com.phoneconnect.agent.crypto.Epoch
 import com.phoneconnect.agent.crypto.EpochClaims
 import com.phoneconnect.agent.crypto.IdentityKey
@@ -103,13 +105,11 @@ class HubSessionTest {
         assertEquals("/api/sessions/sess_1/ticket", server.takeRequest().path)
         val rendezvous = server.takeRequest()
         assertEquals("/api/sessions/sess_1/candidates", rendezvous.path)
-        assertEquals("a device redeems its ticket to publish its nonce", "POST", rendezvous.method)
-        val rendezvousBody = JSONObject(rendezvous.body.readUtf8())
-        assertTrue(
-            "the device must publish a dialable endpoint, was ${rendezvousBody.getString("endpoint")}",
-            Regex("""^\d{1,3}(\.\d{1,3}){3}:\d+$""").matches(rendezvousBody.getString("endpoint")),
+        assertEquals(
+            "a relay-only device must not publish a direct candidate endpoint",
+            "GET",
+            rendezvous.method,
         )
-        assertEquals("the ticket nonce must be redeemed", DEVICE_NONCE, rendezvousBody.getJSONObject("ticket").getString("nonce"))
         val relayRequest = server.takeRequest()
         assertEquals("/api/sessions/sess_1/relay", relayRequest.path)
         assertEquals("Bearer pcdev_test", relayRequest.headers["Authorization"])
@@ -300,6 +300,95 @@ class HubSessionTest {
         assertEquals(10L, RelayFrameChannel.KEEPALIVE_INTERVAL_SECONDS)
     }
 
+    @Test
+    fun `the device-first ordering completes without redeeming a ticket twice`() = runBlocking {
+        val dispatcher = OneShotNonceDispatcher(server.url("/api/sessions/sess_1/relay").toString())
+        server.dispatcher = dispatcher
+
+        val end = withTimeout(20_000) {
+            TransportSessionRunner(hub, pollIntervalMs = 0).run(store) { }
+        }
+
+        assertEquals(
+            SessionEnd.Failed(ConnectionFailure.Retryable(com.phoneconnect.agent.ReconnectReason.TRANSPORT_CLOSED)),
+            end,
+        )
+        assertEquals("a relay-only device must never POST a candidate", 0, dispatcher.candidatePosts.get())
+        assertTrue("the device must poll until the peer registers", dispatcher.candidatePolls.get() >= 3)
+    }
+
+    @Test
+    fun `an expired ticket is retried with a fresh one and keeps the enrollment`() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
+        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"ticket_expired"}"""))
+
+        val end = withTimeout(20_000) {
+            TransportSessionRunner(hub, pollIntervalMs = 0).run(store) { }
+        }
+
+        val failure = (end as SessionEnd.Failed).failure
+        assertEquals(
+            ConnectionFailure.Retryable(com.phoneconnect.agent.ReconnectReason.TICKET_EXPIRED),
+            failure,
+        )
+        assertEquals(
+            "a stale ticket must not invalidate the credential",
+            Invalidation.NONE,
+            failure.invalidation,
+        )
+    }
+
+    @Test
+    fun `session codes end the session, never the enrollment`() = runBlocking {
+        val cases = listOf(
+            401 to "session_expired",
+            401 to "session_revoked",
+            404 to "session_unknown",
+            403 to "session_scope_mismatch",
+            401 to "ticket_scope_mismatch",
+            409 to "device_scope_mismatch",
+        )
+        for ((status, code) in cases) {
+            server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
+            server.enqueue(MockResponse().setBody("""{"ticket":${ticketJson()},"verification_key":"vk"}"""))
+            server.enqueue(MockResponse().setResponseCode(status).setBody("""{"error":"$code"}"""))
+
+            val end = withTimeout(20_000) {
+                TransportSessionRunner(hub, pollIntervalMs = 0).run(store) { }
+            }
+
+            assertEquals("$code must end the session", SessionEnd.Failed(ConnectionFailure.SessionEnded), end)
+            assertEquals(
+                "$code must not delete the credential",
+                Invalidation.SESSION,
+                (end as SessionEnd.Failed).failure.invalidation,
+            )
+        }
+    }
+
+    @Test
+    fun `only credential codes invalidate the enrollment`() = runBlocking {
+        val cases = listOf(
+            Triple(401, "invalid_credential", ConnectionFailure.NotEnrolled),
+            Triple(404, "device_unknown", ConnectionFailure.NotEnrolled),
+            Triple(401, "device_revoked", ConnectionFailure.DeviceRevoked),
+        )
+        for ((status, code, expected) in cases) {
+            server.enqueue(MockResponse().setResponseCode(status).setBody("""{"error":"$code"}"""))
+
+            val end = withTimeout(20_000) {
+                TransportSessionRunner(hub, pollIntervalMs = 0).run(store) { }
+            }
+
+            assertEquals("$code must be classified", SessionEnd.Failed(expected), end)
+            assertEquals(
+                "$code must invalidate the enrollment",
+                Invalidation.ENROLLMENT,
+                expected.invalidation,
+            )
+        }
+    }
+
     private fun enqueueDiscovery() {
         server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
         server.enqueue(MockResponse().setBody("""{"ticket":${ticketJson()},"verification_key":"vk"}"""))
@@ -381,6 +470,68 @@ class HubSessionTest {
         )
 
         override suspend fun clear(reason: ClearReason): Boolean = true
+    }
+
+    /**
+     * A hub that models the server's one-time redemption: a second POST with the same ticket
+     * nonce answers `409 ticket_replayed`, exactly like `Rendezvous::observe`. The peer
+     * registers after a few polls, which is the device-first ordering that used to stop the
+     * agent permanently.
+     */
+    private class OneShotNonceDispatcher(private val relayUrl: String) : okhttp3.mockwebserver.Dispatcher() {
+        private val redeemed = mutableSetOf<String>()
+        private var polls = 0
+        val candidatePosts = java.util.concurrent.atomic.AtomicInteger()
+        val candidatePolls = java.util.concurrent.atomic.AtomicInteger()
+
+        override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse = when {
+            request.path?.endsWith("/sessions/next") == true ->
+                MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}""")
+
+            request.path?.endsWith("/ticket") == true ->
+                MockResponse().setBody(
+                    """{"ticket":{"session_id":"sess_1","device_id":"dev_1","role":"device","nonce":"$DEVICE_NONCE","probe_key":"probe","own_identity_key":"${IdentityKey.fromBytes(ByteArray(32) { 0x33 }).getOrThrow().publicKeyBase64Url()}","peer_identity_key":"${IdentityKey.fromBytes(ByteArray(32) { 0x44 }).getOrThrow().publicKeyBase64Url()}","expires_at":1760000000000,"signature":"sig"},"verification_key":"vk"}""",
+                )
+
+            request.path?.endsWith("/candidates") == true && request.method == "POST" -> {
+                candidatePosts.incrementAndGet()
+                val nonce = JSONObject(request.body.readUtf8()).getJSONObject("ticket").getString("nonce")
+                if (!redeemed.add(nonce)) {
+                    MockResponse().setResponseCode(409).setBody("""{"error":"ticket_replayed"}""")
+                } else {
+                    candidatesBody(peerNonce = null)
+                }
+            }
+
+            request.path?.endsWith("/candidates") == true -> {
+                candidatePolls.incrementAndGet()
+                polls += 1
+                candidatesBody(peerNonce = if (polls >= 3) PEER_NONCE else null)
+            }
+
+            request.path?.endsWith("/relay") == true -> MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        webSocket.close(1008, "peer_closed")
+                    }
+                },
+            )
+
+            else -> MockResponse().setResponseCode(404).setBody("""{"error":"not_found"}""")
+        }
+
+        private fun candidatesBody(peerNonce: String?): MockResponse {
+            val candidates = org.json.JSONArray().put(
+                JSONObject().put("kind", "relay").put("endpoint", relayUrl).put("priority", 100),
+            )
+            val json = JSONObject()
+                .put("session_id", "sess_1")
+                .put("expires_at", 1_760_000_000_000L)
+                .put("verification_key", "vk")
+                .put("candidates", candidates)
+            if (peerNonce != null) json.put("peer_nonce", peerNonce)
+            return MockResponse().setBody(json.toString())
+        }
     }
 
     private companion object {

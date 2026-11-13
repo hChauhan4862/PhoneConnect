@@ -53,6 +53,7 @@ open class ConnectionService : Service() {
     private var loop: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var detachedStatus = false
+    private var lastStatus: ConnectionStatus? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -136,6 +137,7 @@ open class ConnectionService : Service() {
                 sessions = runner,
                 policy = ReconnectPolicy(),
                 status = { status ->
+                    lastStatus = status
                     ConnectionStatusBus.publish(status)
                     notifications.update(status)
                 },
@@ -153,6 +155,9 @@ open class ConnectionService : Service() {
     private fun handleOutcome(outcome: SupervisorOutcome) {
         when (outcome) {
             is SupervisorOutcome.Terminal, SupervisorOutcome.Unenrolled -> {
+                // Leave the reason visible but dismissible: an ongoing notification would
+                // stay pinned forever because nothing is left to clear it.
+                lastStatus?.let { notifications.update(it, ongoing = false) }
                 detachedStatus = true
                 stopForeground(STOP_FOREGROUND_DETACH)
                 stopSelf()

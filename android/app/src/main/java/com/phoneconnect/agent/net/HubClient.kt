@@ -135,25 +135,16 @@ class HubClient(
     }.mapFailure()
 
     /**
-     * Publishes this device's endpoint for the rendezvous round, redeeming its ticket, and
-     * returns the candidates for the opposite peer. Both peers must register for either to
-     * learn the other's nonce, which is half of the connection epoch.
+     * Rendezvous data for this session: the relay route and the opposite peer's redemption
+     * nonce once that peer has registered. Read-only on purpose — a device that has no direct
+     * path must not publish a candidate endpoint, and must not redeem its ticket repeatedly.
      */
-    suspend fun registerCandidate(
-        credential: String,
-        sessionId: String,
-        ticket: RendezvousTicket,
-        endpoint: String,
-    ): Result<SessionCandidates> = runCatching {
-        val body = JSONObject()
-            .put("ticket", ticketJson(ticket))
-            .put("endpoint", endpoint)
-            .toString()
+    suspend fun candidates(credential: String, sessionId: String): Result<SessionCandidates> = runCatching {
         val json = execute(
             Request.Builder()
                 .url(url("api", "sessions", sessionId, "candidates"))
                 .header("Authorization", "Bearer $credential")
-                .post(body.toRequestBody(JSON))
+                .get()
                 .build(),
         )
         parseCandidates(json)
@@ -175,18 +166,6 @@ class HubClient(
             }
         },
     )
-
-    /** The ticket exactly as the hub serialized it, for redeeming in a candidate update. */
-    private fun ticketJson(ticket: RendezvousTicket): JSONObject = JSONObject()
-        .put("session_id", ticket.sessionId)
-        .put("device_id", ticket.deviceId)
-        .put("role", ticket.role)
-        .put("nonce", ticket.nonce)
-        .put("probe_key", ticket.probeKey)
-        .put("own_identity_key", ticket.ownIdentityKey)
-        .put("peer_identity_key", ticket.peerIdentityKey)
-        .put("expires_at", ticket.expiresAtMs)
-        .put("signature", ticket.signature)
 
     private fun parseTicket(json: JSONObject): RendezvousTicket = RendezvousTicket(
         sessionId = json.getString("session_id"),
