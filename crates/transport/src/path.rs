@@ -94,6 +94,8 @@ pub enum TicketError {
     SessionMismatch { found: String, expected: String },
     #[error("ticket names peer identity {found}, not the expected pinned identity {expected}")]
     PeerIdentityMismatch { found: String, expected: String },
+    #[error("ticket {nonce} was already used by this process; fetch a fresh ticket per connect")]
+    AlreadyUsed { nonce: String },
     #[error("session id {session_id} is invalid: {reason}")]
     InvalidSession { session_id: String, reason: String },
 }
@@ -283,9 +285,12 @@ pub struct PathConfig {
     pub probe: ProbeConfig,
     /// Bounded switch confirmation.
     pub switch: SwitchConfig,
-    /// A committed direct path with no inbound frame for this long is demoted to the relay,
-    /// so a path that stops delivering can never black-hole frames.
+    /// A committed direct path with no authenticated datagram from the peer for this long is
+    /// demoted to the relay, so a path that stops delivering can never black-hole frames.
     pub direct_health_timeout: Duration,
+    /// How often an idle direct path sends a probe the peer acknowledges. This is what keeps
+    /// an idle-but-working path healthy instead of demoting it for silence.
+    pub keepalive_interval: Duration,
     /// Frame profile. Control paths must use [`FrameLimits::control_only`].
     pub frame_limits: FrameLimits,
     /// Largest sealed frame the direct datagram path accepts.
@@ -302,6 +307,7 @@ impl Default for PathConfig {
             probe: ProbeConfig::default(),
             switch: SwitchConfig::default(),
             direct_health_timeout: Duration::from_secs(2),
+            keepalive_interval: Duration::from_millis(500),
             frame_limits: FrameLimits::control_only(),
             direct_frame_limit: MAX_DIRECT_FRAME_BYTES,
             recv_timeout: Duration::from_secs(5),
@@ -335,6 +341,15 @@ impl PathConfig {
         if self.recv_timeout.is_zero() || self.direct_health_timeout.is_zero() {
             return Err(PathError::InvalidConfig {
                 reason: "recv_timeout and direct_health_timeout must be non-zero".to_owned(),
+            });
+        }
+        if self.keepalive_interval.is_zero()
+            || self.keepalive_interval >= self.direct_health_timeout
+        {
+            return Err(PathError::InvalidConfig {
+                reason:
+                    "keepalive_interval must be non-zero and shorter than direct_health_timeout"
+                        .to_owned(),
             });
         }
         Ok(())
@@ -489,11 +504,11 @@ struct DirectState {
     socket: Arc<DirectSocket>,
     peer: SocketAddr,
     rtt: Duration,
-    /// Last authenticated inbound frame, used to demote a path that stopped delivering.
-    last_inbound: std::sync::Mutex<std::time::Instant>,
 }
 
 struct PathState {
+    /// The probe and data socket. Kept across a demotion so the path can be re-promoted and
+    /// so a caller's next upgrade can succeed.
     direct: Option<DirectState>,
     relay: Option<Arc<dyn RelayChannel>>,
     closed: bool,
@@ -501,6 +516,71 @@ struct PathState {
 
 const DIRECT: u8 = 0;
 const RELAY: u8 = 1;
+/// Both paths are live: frames go out on both and are read from either. This is the state a
+/// freshly confirmed direct path starts in, and it exists so that neither side can commit
+/// alone: a frame sent while the peer is still on the relay still arrives, because the peer
+/// drains both.
+const PENDING: u8 = 2;
+
+/// Tickets this process has already opened a path with, per session and role.
+///
+/// The real safety property is "one fresh ticket per connect": the server mints a fresh
+/// single-use nonce per ticket, and the connection epoch is built from it. Reusing a ticket
+/// would reuse the epoch, so it is refused here with an explicit error instead of failing
+/// later as a key-reuse rejection.
+type UsedTicket = (String, u8, String);
+
+/// How long a used ticket is remembered. A session lives for five minutes, so an older
+/// ticket can never be presented again.
+const USED_TICKET_TTL: Duration = Duration::from_secs(600);
+
+/// Largest number of used tickets remembered; the oldest are pruned first.
+const MAX_USED_TICKETS: usize = 8192;
+
+fn used_tickets()
+-> &'static std::sync::Mutex<std::collections::HashMap<UsedTicket, std::time::Instant>> {
+    static USED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<UsedTicket, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    USED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn claim_ticket(session_id: &str, role: TicketRole, nonce: &str) -> Result<(), TicketError> {
+    let role_byte = match role {
+        TicketRole::Client => 1u8,
+        TicketRole::Device => 2u8,
+    };
+    let mut used = used_tickets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    used.retain(|_, seen| now.duration_since(*seen) < USED_TICKET_TTL);
+    if used.len() >= MAX_USED_TICKETS {
+        if let Some(oldest) = used
+            .iter()
+            .min_by_key(|(_, seen)| **seen)
+            .map(|(key, _)| key.clone())
+        {
+            used.remove(&oldest);
+        }
+    }
+    if used
+        .insert((session_id.to_owned(), role_byte, nonce.to_owned()), now)
+        .is_some()
+    {
+        return Err(TicketError::AlreadyUsed {
+            nonce: nonce.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn direct_snapshot(state: &PathState) -> Option<(Arc<DirectSocket>, SocketAddr)> {
+    state
+        .direct
+        .as_ref()
+        .map(|direct| (Arc::clone(&direct.socket), direct.peer))
+}
 
 fn path_kind_byte(kind: PathKind) -> u8 {
     match kind {
@@ -586,7 +666,9 @@ impl ConnectedPath {
 
     pub fn path_kind(&self) -> PathKind {
         match self.kind.load(Ordering::SeqCst) {
-            DIRECT => PathKind::Direct,
+            // A transition path sends and reads both, so the session is already using the
+            // direct path; the relay is only its safety net.
+            DIRECT | PENDING => PathKind::Direct,
             _ => PathKind::Relay,
         }
     }
@@ -619,91 +701,207 @@ impl ConnectedPath {
     pub async fn send_frame(&self, envelope: &Envelope) -> Result<(), PathError> {
         validate_envelope_identity(envelope, &self.session_id, &self.device_id)?;
         let sealed = self.cipher.seal(envelope)?;
-        let (kind, direct, relay) = {
+        let (state, direct, relay) = {
             let state = self.state.read().await;
             if state.closed {
                 return Err(PathError::Shutdown);
             }
             (
-                self.path_kind(),
-                state
-                    .direct
-                    .as_ref()
-                    .map(|direct| (Arc::clone(&direct.socket), direct.peer)),
+                self.state_byte(),
+                direct_snapshot(&state),
                 state.relay.clone(),
             )
         };
-        // A committed direct path that stopped delivering is demoted to the relay before a
-        // frame is written to it, so frames are never black-holed.
-        let kind = if kind == PathKind::Direct && !self.direct_is_healthy().await {
-            self.kind.store(RELAY, Ordering::SeqCst);
-            PathKind::Relay
-        } else {
-            kind
-        };
-        match kind {
-            PathKind::Direct => {
+
+        match state {
+            DIRECT => {
                 let (socket, peer) = direct.ok_or(PathError::Shutdown)?;
-                if sealed.len() > self.config.direct_frame_limit {
-                    return Err(PathError::DirectFrameTooLarge {
-                        length: sealed.len(),
-                        limit: self.config.direct_frame_limit,
-                    });
+                if !socket.is_alive(self.config.direct_health_timeout) && relay.is_some() {
+                    // The peer stopped answering, so hand the frame to the relay. The socket
+                    // stays usable: its keepalive keeps probing, and the next inbound frame
+                    // re-promotes it.
+                    self.kind.store(RELAY, Ordering::SeqCst);
+                    return self.send_via_relay(relay, &sealed).await;
                 }
+                self.check_direct_size(&sealed)?;
                 socket.send_frame(peer, &sealed).await?;
                 Ok(())
             }
-            PathKind::Relay => {
-                let relay = relay.ok_or(PathError::NoPath)?;
-                let frame = self.relay_envelope(&sealed)?;
-                relay.send_frame(&frame).await?;
-                Ok(())
+            PENDING => {
+                if !direct
+                    .as_ref()
+                    .map(|(socket, _)| socket.is_alive(self.config.direct_health_timeout))
+                    .unwrap_or(false)
+                    && relay.is_some()
+                {
+                    self.kind.store(RELAY, Ordering::SeqCst);
+                    return self.send_via_relay(relay, &sealed).await;
+                }
+                // Both copies go out while the peer may still be reading the relay; its
+                // replay window drops the duplicate. Success on either path is delivery.
+                let direct_sent = match &direct {
+                    Some((socket, peer)) if sealed.len() <= self.config.direct_frame_limit => {
+                        socket.send_frame(*peer, &sealed).await.is_ok()
+                    }
+                    _ => false,
+                };
+                let relay_result = match relay {
+                    Some(relay) => self.send_via_relay(Some(relay), &sealed).await,
+                    None => Err(PathError::NoPath),
+                };
+                if direct_sent || relay_result.is_ok() {
+                    Ok(())
+                } else {
+                    relay_result
+                }
             }
+            _ => match relay {
+                Some(relay) => self.send_via_relay(Some(relay), &sealed).await,
+                // A path built without a relay is direct or it is nothing: silence never
+                // turns a usable direct socket into `NoPath`.
+                None => match direct {
+                    Some((socket, peer)) => {
+                        self.check_direct_size(&sealed)?;
+                        socket.send_frame(peer, &sealed).await?;
+                        Ok(())
+                    }
+                    None => Err(PathError::NoPath),
+                },
+            },
         }
     }
 
     /// Receives one frame from the current path and opens it, bounded by `recv_timeout`.
+    ///
+    /// A duplicate that arrives on the other path during a transition, or twice from the
+    /// network, is skipped rather than surfaced: the AEAD replay window already rejected it,
+    /// and it is not an application error.
     pub async fn recv_frame(&self) -> Result<Envelope, PathError> {
-        let (kind, direct, relay) = {
+        let deadline = std::time::Instant::now() + self.config.recv_timeout;
+        loop {
+            let sealed = self.next_sealed(deadline).await?;
+            match self.cipher.open(&sealed) {
+                Ok(envelope) => return Ok(envelope),
+                Err(AeadError::Replayed { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    async fn next_sealed(&self, deadline: std::time::Instant) -> Result<Vec<u8>, PathError> {
+        let (state, direct, relay) = {
             let state = self.state.read().await;
             if state.closed {
                 return Err(PathError::Shutdown);
             }
-            (
-                self.path_kind(),
-                state
-                    .direct
-                    .as_ref()
-                    .map(|direct| Arc::clone(&direct.socket)),
-                state.relay.clone(),
-            )
-        };
-        let kind = if kind == PathKind::Direct && !self.direct_is_healthy().await {
-            self.kind.store(RELAY, Ordering::SeqCst);
-            PathKind::Relay
-        } else {
-            kind
-        };
-        let sealed = match kind {
-            PathKind::Direct => {
-                let socket = direct.ok_or(PathError::Shutdown)?;
-                let frame = socket.recv_frame(self.config.recv_timeout).await?;
-                self.mark_direct_inbound().await;
-                frame
-            }
-            PathKind::Relay => {
-                let relay = relay.ok_or(PathError::NoPath)?;
-                let frame = relay.recv_frame().await?;
-                let outer = decode_frame(&frame, &self.config.frame_limits)?;
-                if outer.consumed != frame.len() {
-                    return Err(PathError::Relay(RelayError::Malformed {
-                        reason: "relay frame carried trailing bytes".to_owned(),
-                    }));
+            let mut current = self.state_byte();
+            // A transition path lives as long as the peer answers keepalives. Only a dead
+            // socket demotes it; an idle session must not lose its direct path.
+            if current == PENDING {
+                let dead = direct_snapshot(&state)
+                    .map(|(socket, _)| !socket.is_alive(self.config.direct_health_timeout))
+                    .unwrap_or(true);
+                if dead && state.relay.is_some() {
+                    self.kind.store(RELAY, Ordering::SeqCst);
+                    current = RELAY;
                 }
-                outer.envelope.payload
             }
+            (current, direct_snapshot(&state), state.relay.clone())
         };
-        Ok(self.cipher.open(&sealed)?)
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+
+        match state {
+            DIRECT => {
+                let (socket, _) = direct.ok_or(PathError::Shutdown)?;
+                // With a relay to fall back to, never wait longer than the health bound: a
+                // dead path must hand over promptly instead of blocking the caller.
+                let wait = if relay.is_some() {
+                    remaining().min(self.config.direct_health_timeout)
+                } else {
+                    remaining()
+                };
+                match socket.recv_frame(wait).await {
+                    Ok(frame) => Ok(frame),
+                    Err(HolePunchError::ReceiveTimeout) if relay.is_some() => {
+                        self.kind.store(RELAY, Ordering::SeqCst);
+                        self.recv_relay(relay).await
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            PENDING => {
+                // The direct path is preferred and the relay is the safety net: wait for a
+                // direct frame first, and fall back to the relay copy only if none arrives
+                // within the health bound. A direct frame is the proof that commits the path.
+                let (socket, _) = direct.ok_or(PathError::Shutdown)?;
+                let wait = if relay.is_some() {
+                    remaining().min(self.config.direct_health_timeout)
+                } else {
+                    remaining()
+                };
+                match socket.recv_frame(wait).await {
+                    Ok(frame) => {
+                        self.kind.store(DIRECT, Ordering::SeqCst);
+                        Ok(frame)
+                    }
+                    Err(HolePunchError::ReceiveTimeout) => self.recv_relay(relay).await,
+                    Err(error) => Err(error.into()),
+                }
+            }
+            _ => {
+                // A frame already queued on the direct socket means the peer is using direct
+                // again; re-promote instead of leaving a working path idle.
+                if let Some((socket, _)) = &direct {
+                    if let Some(frame) = socket.try_recv_frame() {
+                        self.kind.store(DIRECT, Ordering::SeqCst);
+                        return Ok(frame);
+                    }
+                }
+                match relay {
+                    Some(relay) => self.recv_relay(Some(relay)).await,
+                    None => match direct {
+                        Some((socket, _)) => Ok(socket.recv_frame(remaining()).await?),
+                        None => Err(PathError::NoPath),
+                    },
+                }
+            }
+        }
+    }
+
+    async fn recv_relay(&self, relay: Option<Arc<dyn RelayChannel>>) -> Result<Vec<u8>, PathError> {
+        let relay = relay.ok_or(PathError::NoPath)?;
+        let frame = relay.recv_frame().await?;
+        let outer = decode_frame(&frame, &self.config.frame_limits)?;
+        if outer.consumed != frame.len() {
+            return Err(PathError::Relay(RelayError::Malformed {
+                reason: "relay frame carried trailing bytes".to_owned(),
+            }));
+        }
+        Ok(outer.envelope.payload)
+    }
+
+    async fn send_via_relay(
+        &self,
+        relay: Option<Arc<dyn RelayChannel>>,
+        sealed: &[u8],
+    ) -> Result<(), PathError> {
+        let relay = relay.ok_or(PathError::NoPath)?;
+        let frame = self.relay_envelope(sealed)?;
+        relay.send_frame(&frame).await.map_err(PathError::from)
+    }
+
+    fn check_direct_size(&self, sealed: &[u8]) -> Result<(), PathError> {
+        if sealed.len() > self.config.direct_frame_limit {
+            return Err(PathError::DirectFrameTooLarge {
+                length: sealed.len(),
+                limit: self.config.direct_frame_limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn state_byte(&self) -> u8 {
+        self.kind.load(Ordering::SeqCst)
     }
 
     /// Repeats direct negotiation with the caller's fresh ticket and moves to the direct
@@ -743,6 +941,7 @@ impl ConnectedPath {
             &candidates.direct(),
             self.config.probe,
             self.config.switch,
+            self.config.keepalive_interval,
         )
         .await?;
         if let Some((socket, _)) = &negotiated {
@@ -766,12 +965,8 @@ impl ConnectedPath {
             PathController::select(direct_latency, relay_latency).ok_or(PathError::NoPath)?;
         if selection == PathKind::Direct {
             if let Some((socket, HolePunchOutcome { peer, rtt })) = direct {
-                state.direct = Some(DirectState {
-                    socket,
-                    peer,
-                    rtt,
-                    last_inbound: std::sync::Mutex::new(std::time::Instant::now()),
-                });
+                state.direct = Some(DirectState { socket, peer, rtt });
+                self.kind.store(PENDING, Ordering::SeqCst);
             }
         }
         self.kind.store(path_kind_byte(selection), Ordering::SeqCst);
@@ -836,27 +1031,6 @@ impl ConnectedPath {
             .take()
     }
 
-    async fn direct_is_healthy(&self) -> bool {
-        let state = self.state.read().await;
-        match state.direct.as_ref() {
-            Some(direct) => direct
-                .last_inbound
-                .lock()
-                .map(|last| last.elapsed() <= self.config.direct_health_timeout)
-                .unwrap_or(true),
-            None => false,
-        }
-    }
-
-    async fn mark_direct_inbound(&self) {
-        let state = self.state.read().await;
-        if let Some(direct) = state.direct.as_ref() {
-            if let Ok(mut last) = direct.last_inbound.lock() {
-                *last = std::time::Instant::now();
-            }
-        }
-    }
-
     fn relay_latency(&self, state: &PathState) -> Option<Duration> {
         state.relay.as_ref().map(|relay| {
             relay
@@ -909,6 +1083,7 @@ async fn negotiate_direct(
     candidates: &[SocketAddr],
     probe: ProbeConfig,
     switch: SwitchConfig,
+    keepalive_interval: Duration,
 ) -> Result<Option<(Arc<DirectSocket>, Option<HolePunchOutcome>)>, PathError> {
     if candidates.is_empty() {
         return Ok(None);
@@ -922,7 +1097,7 @@ async fn negotiate_direct(
             }
             existing
         }
-        None => Arc::new(DirectSocket::open(udp, credentials).await?),
+        None => Arc::new(DirectSocket::open(udp, credentials, keepalive_interval).await?),
     };
     let outcome = match socket.punch(candidates, probe).await {
         Ok(outcome) => outcome,
@@ -937,11 +1112,11 @@ async fn negotiate_direct(
     match socket.negotiate_switch(outcome.peer, switch).await {
         Ok(()) => {
             // Both switches completed; each side now says it is reading the direct path and
-            // waits for the peer to say the same. A side that is not reading never confirms,
-            // so asymmetric loss can never commit one peer alone.
-            socket.send_confirm(outcome.peer).await?;
+            // waits for the peer to say the same. Confirmations are retransmitted and
+            // acknowledged, so a single lost datagram costs a retry instead of committing
+            // one peer alone.
             if socket
-                .await_confirmation(&mut events, outcome.peer, switch.confirmation_timeout)
+                .confirm_both_ways(&mut events, outcome.peer, switch)
                 .await
             {
                 Ok(Some((socket, Some(outcome))))
@@ -982,20 +1157,8 @@ impl PathController {
             }
             .into());
         }
-
-        // The epoch is the two peers' single-use ticket nonces. Without the peer's nonce a
-        // second connection on the same session would derive the same keys and the same
-        // nonces, so this refuses to build a path until rendezvous has exchanged them.
-        let peer_nonce = candidates.peer_nonce().ok_or(PathError::EpochUnavailable)?;
-        let epoch = Epoch::split(&ticket.nonce, peer_nonce, ticket.role)?;
-        let cipher = SessionCipher::new(
-            &setup.identity,
-            verified.peer_identity_key,
-            candidates.session_id(),
-            ticket.role,
-            &epoch,
-        )?;
-
+        // Everything that can refuse the caller is checked before any state is claimed, so a
+        // corrected retry with the same ticket still works.
         if let Some(expected) = setup.expected_peer_identity {
             if expected != verified.peer_identity_key {
                 return Err(TicketError::PeerIdentityMismatch {
@@ -1005,6 +1168,20 @@ impl PathController {
                 .into());
             }
         }
+        let peer_nonce = candidates.peer_nonce().ok_or(PathError::EpochUnavailable)?;
+        claim_ticket(candidates.session_id(), ticket.role, &ticket.nonce)?;
+
+        // The epoch is the two peers' single-use ticket nonces. Without the peer's nonce a
+        // second connection on the same session would derive the same keys and the same
+        // nonces, so this refuses to build a path until rendezvous has exchanged them.
+        let epoch = Epoch::split(&ticket.nonce, peer_nonce, ticket.role)?;
+        let cipher = SessionCipher::new(
+            &setup.identity,
+            verified.peer_identity_key,
+            candidates.session_id(),
+            ticket.role,
+            &epoch,
+        )?;
 
         let PathSetup {
             socket,
@@ -1036,6 +1213,7 @@ impl PathController {
             &candidates.direct(),
             config.probe,
             config.switch,
+            config.keepalive_interval,
         )
         .await?;
         if let Some((probe_socket, _)) = &negotiated {
@@ -1059,13 +1237,13 @@ impl PathController {
 
         if kind == PathKind::Direct {
             if let Some((direct_socket, HolePunchOutcome { peer, rtt })) = direct {
-                path.state.write().await.direct = Some(DirectState {
+                let mut state = path.state.write().await;
+                state.direct = Some(DirectState {
                     socket: direct_socket,
                     peer,
                     rtt,
-                    last_inbound: std::sync::Mutex::new(std::time::Instant::now()),
                 });
-                path.kind.store(DIRECT, Ordering::SeqCst);
+                path.kind.store(PENDING, Ordering::SeqCst);
             }
         }
 

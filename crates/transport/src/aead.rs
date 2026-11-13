@@ -23,7 +23,7 @@
 //! frame cannot be replayed, a lower counter is a regression, a reflected frame carries the
 //! wrong direction, and a frame for another identity pair carries an unknown key id.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -539,9 +539,15 @@ impl SessionCipher {
 /// Session, role, and the two ticket nonces.
 type ClaimedEpoch = (String, u8, String, String);
 
-fn claimed_epochs() -> &'static Mutex<HashSet<ClaimedEpoch>> {
-    static CLAIMED: OnceLock<Mutex<HashSet<ClaimedEpoch>>> = OnceLock::new();
-    CLAIMED.get_or_init(|| Mutex::new(HashSet::new()))
+/// How long a claimed epoch is remembered; it only has to outlive the session's lifetime.
+const CLAIMED_EPOCH_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Largest number of claimed epochs remembered; the oldest are pruned first.
+const MAX_CLAIMED_EPOCHS: usize = 8192;
+
+fn claimed_epochs() -> &'static Mutex<HashMap<ClaimedEpoch, std::time::Instant>> {
+    static CLAIMED: OnceLock<Mutex<HashMap<ClaimedEpoch, std::time::Instant>>> = OnceLock::new();
+    CLAIMED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn claim_epoch(session_id: &str, role: TicketRole, epoch: &Epoch) -> Result<(), AeadError> {
@@ -554,7 +560,18 @@ fn claim_epoch(session_id: &str, role: TicketRole, epoch: &Epoch) -> Result<(), 
     let mut claimed = claimed_epochs()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !claimed.insert(key) {
+    let now = std::time::Instant::now();
+    claimed.retain(|_, seen| now.duration_since(*seen) < CLAIMED_EPOCH_TTL);
+    if claimed.len() >= MAX_CLAIMED_EPOCHS {
+        if let Some(oldest) = claimed
+            .iter()
+            .min_by_key(|(_, seen)| **seen)
+            .map(|(key, _)| key.clone())
+        {
+            claimed.remove(&oldest);
+        }
+    }
+    if claimed.insert(key, now).is_some() {
         return Err(AeadError::EpochReused);
     }
     Ok(())

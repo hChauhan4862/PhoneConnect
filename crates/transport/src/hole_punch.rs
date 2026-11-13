@@ -24,7 +24,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -213,6 +213,9 @@ pub enum ProbePacket {
     /// "I have validated this path and will read it." A side only sends this after its own
     /// switch completed, so the peer commits only when the sender really is reading.
     Confirm { seq: u32 },
+    /// "I received your confirmation." Without this, a lost `Confirm` would leave one side
+    /// believing both agreed while the other never heard it.
+    ConfirmAck { seq: u32, echo: u32 },
 }
 
 const KIND_PROBE: u8 = 1;
@@ -221,6 +224,7 @@ const KIND_FRAME: u8 = 3;
 const KIND_SWITCH: u8 = 4;
 const KIND_SWITCH_ACK: u8 = 5;
 const KIND_CONFIRM: u8 = 6;
+const KIND_CONFIRM_ACK: u8 = 7;
 
 impl ProbePacket {
     pub fn probe(seq: u32) -> Self {
@@ -253,6 +257,10 @@ impl ProbePacket {
         Self::Confirm { seq }
     }
 
+    pub fn confirm_ack(seq: u32, echo: u32) -> Self {
+        Self::ConfirmAck { seq, echo }
+    }
+
     pub fn seq(&self) -> u32 {
         match self {
             Self::Probe { seq }
@@ -260,7 +268,8 @@ impl ProbePacket {
             | Self::Frame { seq, .. }
             | Self::Switch { seq }
             | Self::SwitchAck { seq, .. }
-            | Self::Confirm { seq } => *seq,
+            | Self::Confirm { seq }
+            | Self::ConfirmAck { seq, .. } => *seq,
         }
     }
 
@@ -273,6 +282,7 @@ impl ProbePacket {
             Self::Switch { .. } => (KIND_SWITCH, Vec::new()),
             Self::SwitchAck { echo, .. } => (KIND_SWITCH_ACK, echo.to_be_bytes().to_vec()),
             Self::Confirm { .. } => (KIND_CONFIRM, Vec::new()),
+            Self::ConfirmAck { echo, .. } => (KIND_CONFIRM_ACK, echo.to_be_bytes().to_vec()),
         };
         let mut datagram = Vec::with_capacity(HEADER_LEN + body.len() + MAC_LEN);
         datagram.extend_from_slice(MAGIC);
@@ -343,6 +353,7 @@ impl ProbePacket {
             KIND_SWITCH if body.is_empty() => Ok(Self::Switch { seq }),
             KIND_SWITCH_ACK => Ok(Self::SwitchAck { seq, echo: echo()? }),
             KIND_CONFIRM if body.is_empty() => Ok(Self::Confirm { seq }),
+            KIND_CONFIRM_ACK => Ok(Self::ConfirmAck { seq, echo: echo()? }),
             _ => Err(HolePunchError::Malformed),
         }
     }
@@ -437,8 +448,11 @@ pub enum DirectEvent {
     Switch { from: SocketAddr, echo: u32 },
     /// The peer confirmed our switch request.
     SwitchAck { from: SocketAddr, echo: u32 },
-    /// The peer says it is reading the direct path.
-    Confirmed { from: SocketAddr },
+    /// The peer says it is reading the direct path. `echo` is its confirmation sequence,
+    /// which this side acknowledges so the peer knows its confirmation arrived.
+    Confirmed { from: SocketAddr, echo: u32 },
+    /// The peer received our confirmation.
+    ConfirmAcked { from: SocketAddr, echo: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -455,8 +469,12 @@ struct DirectInner {
     peer: Mutex<Option<SocketAddr>>,
     acks: broadcast::Sender<AckEvent>,
     events: broadcast::Sender<DirectEvent>,
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: Arc<FrameQueue>,
     closed: AtomicBool,
+    /// Last authenticated datagram from the peer, whatever its kind. This is what proves the
+    /// path is alive: a peer that is merely quiet still answers keepalive probes.
+    last_inbound: Mutex<Option<Instant>>,
+    dropped_frames: AtomicU32,
 }
 
 /// One authenticated UDP socket, with exactly one task reading it.
@@ -467,9 +485,75 @@ struct DirectInner {
 /// a punch is running is queued rather than discarded.
 pub struct DirectSocket {
     inner: Arc<DirectInner>,
-    frames: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    frames: Arc<FrameQueue>,
     reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
     responder: tokio::task::JoinHandle<()>,
+}
+
+/// Bounded ring of inbound frames.
+///
+/// The reader must never block on the application: a stalled reader would stop answering
+/// probes, switches, and confirmations. So a full ring drops its oldest frame, counts the
+/// drop, and keeps the path responsive.
+#[derive(Default)]
+struct FrameQueue {
+    frames: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    notify: tokio::sync::Notify,
+    closed: AtomicBool,
+}
+
+impl FrameQueue {
+    fn push(&self, frame: Vec<u8>) -> bool {
+        let mut frames = self
+            .frames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dropped = if frames.len() >= DIRECT_FRAME_QUEUE {
+            frames.pop_front();
+            true
+        } else {
+            false
+        };
+        frames.push_back(frame);
+        drop(frames);
+        self.notify.notify_one();
+        dropped
+    }
+
+    async fn pop(&self, timeout: Duration) -> Result<Vec<u8>, HolePunchError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(frame) = self.pop_now() {
+                return Ok(frame);
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(HolePunchError::Closed);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(HolePunchError::ReceiveTimeout);
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Re-check after registering so a push between the check and the wait is seen.
+            if let Some(frame) = self.pop_now() {
+                return Ok(frame);
+            }
+            let _ = tokio::time::timeout(remaining, &mut notified).await;
+        }
+    }
+
+    fn pop_now(&self) -> Option<Vec<u8>> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
 }
 
 impl std::fmt::Debug for DirectSocket {
@@ -489,10 +573,11 @@ impl DirectSocket {
     pub async fn open(
         socket: Arc<UdpSocket>,
         credentials: ProbeCredentials,
+        keepalive_interval: Duration,
     ) -> Result<Self, HolePunchError> {
         let (acks, _) = broadcast::channel(DIRECT_ACK_FANOUT);
         let (events, _) = broadcast::channel(DIRECT_CONTROL_QUEUE);
-        let (frames, frame_receiver) = mpsc::channel(DIRECT_FRAME_QUEUE);
+        let frames = Arc::new(FrameQueue::default());
         let inner = Arc::new(DirectInner {
             socket,
             authenticators: std::sync::RwLock::new(AuthenticatorRing::new(&credentials)),
@@ -501,14 +586,19 @@ impl DirectSocket {
             peer: Mutex::new(None),
             acks,
             events,
-            frames,
+            frames: Arc::clone(&frames),
             closed: AtomicBool::new(false),
+            last_inbound: Mutex::new(Some(Instant::now())),
+            dropped_frames: AtomicU32::new(0),
         });
         let reader = tokio::spawn(read_loop(Arc::clone(&inner)));
         let responder = tokio::spawn(switch_responder(Arc::clone(&inner)));
+        if !keepalive_interval.is_zero() {
+            tokio::spawn(keepalive_loop(Arc::clone(&inner), keepalive_interval));
+        }
         Ok(Self {
             inner,
-            frames: tokio::sync::Mutex::new(frame_receiver),
+            frames,
             reader: Mutex::new(Some(reader)),
             responder,
         })
@@ -563,9 +653,37 @@ impl DirectSocket {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
+    /// True when the peer sent an authenticated datagram within `threshold`.
+    pub fn is_alive(&self, threshold: Duration) -> bool {
+        self.inner
+            .last_inbound
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|last| last.elapsed() <= threshold)
+            .unwrap_or(false)
+    }
+
+    /// Frames dropped because the application was not reading and the bounded queue was
+    /// full. Reported so a caller can see loss instead of guessing.
+    pub fn dropped_frames(&self) -> u32 {
+        self.inner.dropped_frames.load(Ordering::SeqCst)
+    }
+
+    /// Sends one keepalive probe. The peer's reader answers with an acknowledgement, which
+    /// refreshes [`Self::is_alive`] even when no data is flowing.
+    pub async fn send_keepalive(&self) -> Result<(), HolePunchError> {
+        let Some(peer) = self.peer() else {
+            return Ok(());
+        };
+        let seq = self.inner.next_seq()?;
+        let probe = ProbePacket::probe(seq).encode(&self.credentials());
+        self.inner.send_datagram(&probe, peer).await
+    }
+
     /// Stops the reader and the switch responder. Idempotent.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.frames.close();
         if let Some(reader) = self
             .reader
             .lock()
@@ -673,7 +791,11 @@ impl DirectSocket {
                 {
                     return Ok(());
                 }
-                Ok(Ok(DirectEvent::SwitchAck { .. } | DirectEvent::Confirmed { .. })) => {}
+                Ok(Ok(
+                    DirectEvent::SwitchAck { .. }
+                    | DirectEvent::Confirmed { .. }
+                    | DirectEvent::ConfirmAcked { .. },
+                )) => {}
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
                     return Err(HolePunchError::Closed);
@@ -702,40 +824,70 @@ impl DirectSocket {
             .await
     }
 
-    /// Tells the peer this side now reads the direct path, after its own switch completed.
-    pub async fn send_confirm(&self, peer: SocketAddr) -> Result<(), HolePunchError> {
-        let seq = self.inner.next_seq()?;
-        self.inner
-            .send_datagram(&ProbePacket::confirm(seq).encode(&self.credentials()), peer)
-            .await
-    }
-
     /// Subscribes to switch and confirmation events. Subscribe *before* sending anything a
     /// peer may answer, so a fast answer is never missed.
     pub fn subscribe(&self) -> broadcast::Receiver<DirectEvent> {
         self.inner.events.subscribe()
     }
 
-    /// Waits on an already-subscribed event stream for the peer's confirmation, bounded. A
-    /// peer that is not reading the direct path never sends one, and the caller must keep
-    /// the relay as the delivery path.
-    pub async fn await_confirmation(
+    /// Tells the peer this side now reads the direct path, after its own switch completed.
+    /// Returns the confirmation sequence so the caller can match the acknowledgement.
+    pub async fn send_confirm(&self, peer: SocketAddr) -> Result<u32, HolePunchError> {
+        let seq = self.inner.next_seq()?;
+        self.inner
+            .send_datagram(&ProbePacket::confirm(seq).encode(&self.credentials()), peer)
+            .await?;
+        Ok(seq)
+    }
+
+    /// Both peers must observe each other's confirmation before either commits.
+    ///
+    /// Confirmations are retransmitted on the retry schedule, and each received confirmation
+    /// is acknowledged, so a single lost datagram costs one retry instead of leaving one side
+    /// committed and the other on the relay. Returns `false` when the budget expires, which
+    /// means the caller must keep using the relay.
+    pub async fn confirm_both_ways(
         &self,
         events: &mut broadcast::Receiver<DirectEvent>,
         peer: SocketAddr,
-        timeout: Duration,
+        config: SwitchConfig,
     ) -> bool {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + config.confirmation_timeout;
+        let mut pending: Vec<u32> = Vec::new();
+        let mut peer_confirmed = false;
+        let mut peer_acked = false;
+        let mut next_send = Instant::now();
+
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let now = Instant::now();
+            if peer_confirmed && peer_acked {
+                return true;
+            }
+            if now >= deadline {
                 return false;
             }
+            if now >= next_send {
+                match self.send_confirm(peer).await {
+                    Ok(seq) => pending.push(seq),
+                    Err(_) => return false,
+                }
+                next_send = now + config.timeout;
+            }
+
+            let wake_at = next_send.min(deadline);
+            let remaining = wake_at.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Ok(DirectEvent::Confirmed { from })) if from == peer => return true,
-                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Ok(DirectEvent::Confirmed { from, .. })) if from == peer => {
+                    peer_confirmed = true;
+                }
+                Ok(Ok(DirectEvent::ConfirmAcked { from, echo }))
+                    if from == peer && pending.contains(&echo) =>
+                {
+                    peer_acked = true;
+                }
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(broadcast::error::RecvError::Closed)) => return false,
-                Err(_) => return false,
+                Err(_) => {}
             }
         }
     }
@@ -754,20 +906,26 @@ impl DirectSocket {
             .await
     }
 
+    /// Pops a queued frame without waiting. Used to notice that the peer is reading the
+    /// direct path again after a demotion.
+    pub fn try_recv_frame(&self) -> Option<Vec<u8>> {
+        self.frames.pop_now()
+    }
+
+    /// True when a frame from the peer is already queued, without consuming it. This is what
+    /// proves the peer is sending on the direct path even if the relay copy arrived first.
+    pub fn has_queued_frame(&self) -> bool {
+        self.frames
+            .frames
+            .lock()
+            .map(|frames| !frames.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Waits for one sealed frame from the validated peer. Probing and switch traffic never
     /// appears here, and a replay or a failed tag never surfaces as data.
     pub async fn recv_frame(&self, timeout: Duration) -> Result<Vec<u8>, HolePunchError> {
-        let mut frames = self.frames.lock().await;
-        match tokio::time::timeout(timeout, frames.recv()).await {
-            Ok(Some(frame)) => {
-                if self.inner.closed.load(Ordering::SeqCst) && frame.is_empty() {
-                    return Err(HolePunchError::Closed);
-                }
-                Ok(frame)
-            }
-            Ok(None) => Err(HolePunchError::Closed),
-            Err(_) => Err(HolePunchError::ReceiveTimeout),
-        }
+        self.frames.pop(timeout).await
     }
 }
 
@@ -885,6 +1043,26 @@ impl SwitchConfig {
     }
 }
 
+/// Sends a probe on an idle path so liveness reflects the peer, not traffic.
+async fn keepalive_loop(inner: Arc<DirectInner>, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let peer = *inner.peer();
+        let Some(peer) = peer else { continue };
+        let Ok(seq) = inner.next_seq() else { return };
+        let credentials = inner
+            .credentials
+            .read()
+            .map(|current| current.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        let probe = ProbePacket::probe(seq).encode(&credentials);
+        let _ = inner.socket.send_to(&probe, peer).await;
+    }
+}
+
 /// Answers the peer's switch request once this side has validated the path.
 ///
 /// It runs for the life of the socket, so a peer that asks to switch while the path is
@@ -908,7 +1086,22 @@ async fn switch_responder(inner: Arc<DirectInner>) {
                     let _ = inner.socket.send_to(&ack, from).await;
                 }
             }
-            Ok(DirectEvent::SwitchAck { .. } | DirectEvent::Confirmed { .. }) => {}
+            Ok(DirectEvent::SwitchAck { .. } | DirectEvent::ConfirmAcked { .. }) => {}
+            Ok(DirectEvent::Confirmed { from, echo }) => {
+                // Acknowledge every confirmation, including retransmissions, until the socket
+                // closes: the peer may have committed while its last confirm was still lost.
+                if *inner.peer() == Some(from) {
+                    if let Ok(seq) = inner.next_seq() {
+                        let credentials = inner
+                            .credentials
+                            .read()
+                            .map(|current| current.clone())
+                            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                        let ack = ProbePacket::confirm_ack(seq, echo).encode(&credentials);
+                        let _ = inner.socket.send_to(&ack, from).await;
+                    }
+                }
+            }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -933,7 +1126,14 @@ async fn read_loop(inner: Arc<DirectInner>) {
                 return;
             }
         };
-        match inner.accept(&buffer[..length]) {
+        let accepted = inner.accept(&buffer[..length]);
+        if accepted.is_ok() {
+            *inner
+                .last_inbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        }
+        match accepted {
             Ok(ProbePacket::Probe { seq }) => {
                 let credentials = inner
                     .credentials
@@ -956,18 +1156,21 @@ async fn read_loop(inner: Arc<DirectInner>) {
             Ok(ProbePacket::SwitchAck { echo, .. }) => {
                 let _ = inner.events.send(DirectEvent::SwitchAck { from, echo });
             }
-            Ok(ProbePacket::Confirm { .. }) => {
-                let _ = inner.events.send(DirectEvent::Confirmed { from });
+            Ok(ProbePacket::Confirm { seq }) => {
+                let _ = inner
+                    .events
+                    .send(DirectEvent::Confirmed { from, echo: seq });
+            }
+            Ok(ProbePacket::ConfirmAck { echo, .. }) => {
+                let _ = inner.events.send(DirectEvent::ConfirmAcked { from, echo });
             }
             Ok(ProbePacket::Frame { payload, .. }) => {
                 let known = *inner.peer() == Some(from);
                 if !known {
                     continue;
                 }
-                // Backpressure, not a silent drop: a full queue stalls the reader rather
-                // than discarding a frame the session already handed to the path.
-                if inner.frames.send(payload).await.is_err() {
-                    return;
+                if inner.frames.push(payload) {
+                    inner.dropped_frames.fetch_add(1, Ordering::SeqCst);
                 }
             }
             Err(HolePunchError::Replayed | HolePunchError::Unauthenticated) => {}

@@ -50,8 +50,13 @@ run the same negotiation:
   read revocation from the stream close reason rather than from the lease status.
 
 A direct path pins the peer's address for this milestone: `send_to` succeeding is not
-delivery, and a peer that changed NAT mapping is only noticed by the absence of its frames.
+delivery, and a peer that changed NAT mapping is only noticed by the absence of its frames
+(keepalives make that bounded, and a path with a relay demotes back to it automatically).
 Treat direct delivery as best-effort until the reconnect work renegotiates it.
+
+Every `connect` needs a fresh ticket and freshly read candidates: the ticket's single-use
+nonce is half the connection key epoch, and a ticket already used by this process is refused
+instead of silently reusing keys.
 
 `docker/transport-e2e/run.sh` runs the cross-process fallback test with the server and both
 peer stubs in Docker.

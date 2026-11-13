@@ -143,6 +143,10 @@ sessions from the last five minutes.
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
 | `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/sessions` | Relay route base advertised to peers; one session appends `/{session_id}/relay`. |
 
+A peer that reconnects fetches a fresh ticket and re-reads its candidates: each ticket's
+single-use nonce is half of that connection's key epoch, and the transport refuses to open a
+second path with a ticket it already used.
+
 The ticket signing key is generated at process start, so a restart invalidates outstanding
 tickets (30 s) and a multi-replica deployment would need shared key material. Identity keys
 are per device and per client and are stored as public values only.

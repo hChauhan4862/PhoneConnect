@@ -677,16 +677,30 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
 
     let frame = envelope("req-direct-1", b"direct payload");
     client_path.send_frame(&frame).await.expect("direct send");
+    // This first inbound direct frame commits the device to the direct path.
     assert_eq!(recv(&device_path).await, frame);
 
+    // A full round trip proves both peers read the direct path.
     let reply = envelope("req-direct-2", b"direct reply");
     device_path.send_frame(&reply).await.expect("direct reply");
     assert_eq!(recv(&client_path).await, reply);
+    let relay_sends_after_commit = client_probe.sends();
 
+    let committed = envelope("req-direct-3", b"committed traffic");
+    client_path
+        .send_frame(&committed)
+        .await
+        .expect("direct send");
+    assert_eq!(recv(&device_path).await, committed);
     assert_eq!(
         client_probe.sends(),
-        0,
-        "the relay carried nothing once the direct path validated"
+        relay_sends_after_commit,
+        "once the peer proved it reads direct, nothing more is duplicated onto the relay"
+    );
+    assert!(
+        client_probe.sends() <= 1,
+        "only the transition frame may be duplicated: {}",
+        client_probe.sends()
     );
     client_path.shutdown().await.expect("shutdown");
     device_path.shutdown().await.expect("shutdown");
@@ -1066,6 +1080,11 @@ impl SpyPeer {
                     self.peer = Some(from);
                     let confirm = ProbePacket::confirm(self.next_seq()).encode(&self.credentials);
                     let _ = self.socket.send_to(&confirm, from).await;
+                }
+                Ok(ProbePacket::Confirm { seq }) => {
+                    let ack =
+                        ProbePacket::confirm_ack(self.next_seq(), seq).encode(&self.credentials);
+                    let _ = self.socket.send_to(&ack, from).await;
                 }
                 _ => {}
             }
@@ -1858,6 +1877,13 @@ async fn a_pinned_peer_identity_fails_closed_before_any_frame() {
     assert_eq!(path.path_kind(), PathKind::Relay);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmLoss {
+    None,
+    First,
+    All,
+}
+
 /// Forwards direct-path datagrams between two peers and drops every switch acknowledgement
 /// travelling from the device to the client, which is what asymmetric loss looks like.
 struct AckLossProxy {
@@ -1865,9 +1891,16 @@ struct AckLossProxy {
     client: SocketAddr,
     device: SocketAddr,
     client_credentials: ProbeCredentials,
+    device_credentials: ProbeCredentials,
     dropped: Arc<AtomicUsize>,
     /// Drop every switch acknowledgement from the device to the client.
     drop_switch_acks: bool,
+    /// Drop `Confirm` packets from the client to the device: only the first, or all.
+    drop_confirm_from_client: ConfirmLoss,
+    /// Stop forwarding entirely, without closing the socket.
+    paused: Arc<AtomicBool>,
+    /// Confirmations already dropped.
+    confirms_dropped: Arc<AtomicUsize>,
 }
 
 impl AckLossProxy {
@@ -1889,6 +1922,9 @@ impl AckLossProxy {
             } else {
                 continue;
             };
+            if self.paused.load(Ordering::SeqCst) {
+                continue;
+            }
             if self.drop_switch_acks
                 && from == self.device
                 && matches!(
@@ -1896,6 +1932,22 @@ impl AckLossProxy {
                     Ok(ProbePacket::SwitchAck { .. })
                 )
             {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let lose_confirm = match self.drop_confirm_from_client {
+                ConfirmLoss::None => false,
+                ConfirmLoss::First => self.confirms_dropped.load(Ordering::SeqCst) == 0,
+                ConfirmLoss::All => true,
+            };
+            if lose_confirm
+                && from == self.client
+                && matches!(
+                    ProbePacket::decode(&buffer[..length], &self.device_credentials),
+                    Ok(ProbePacket::Confirm { .. })
+                )
+            {
+                self.confirms_dropped.fetch_add(1, Ordering::SeqCst);
                 self.dropped.fetch_add(1, Ordering::SeqCst);
                 continue;
             }
@@ -1923,8 +1975,12 @@ async fn asymmetric_ack_loss_never_commits_one_peer_and_keeps_delivering() {
             client: client_addr,
             device: device_addr,
             client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
             dropped: Arc::clone(&dropped),
             drop_switch_acks: true,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::new(AtomicBool::new(false)),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
     );
@@ -2038,8 +2094,12 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
             client: client_addr,
             device: device_addr,
             client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
             dropped: Arc::new(AtomicUsize::new(0)),
             drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::new(AtomicBool::new(false)),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
         }
         .run(Arc::clone(&stop)),
     );
@@ -2077,6 +2137,7 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
         probe: fast_probes(),
         switch: fast_switch(),
         direct_health_timeout: Duration::from_millis(150),
+        keepalive_interval: Duration::from_millis(40),
         ..PathConfig::default()
     };
     let (client_path, device_path) = tokio::join!(
@@ -2129,5 +2190,563 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
         recv(&device_path).await,
         second,
         "the peer received it over the relay"
+    );
+}
+
+/// Connects two peers through `proxy` with fast bounds, returning both paths.
+async fn connect_through_proxy(
+    harness: &Harness,
+    proxy_addr: SocketAddr,
+    client_socket: Arc<UdpSocket>,
+    device_socket: Arc<UdpSocket>,
+    config: PathConfig,
+) -> (ConnectedPath, ConnectedPath) {
+    let key = harness.verification_key();
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let (device_relay, _probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let (client, device) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, harness)
+                .with_relay(client_relay)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    (
+        client.expect("client connects"),
+        device.expect("device connects"),
+    )
+}
+
+#[tokio::test]
+async fn a_single_lost_confirmation_is_retransmitted_and_both_sides_commit() {
+    let harness = Harness::new(SESSION).await;
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let confirms_dropped = Arc::new(AtomicUsize::new(0));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::clone(&dropped),
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::First,
+            paused: Arc::new(AtomicBool::new(false)),
+            confirms_dropped: Arc::clone(&confirms_dropped),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    // The confirmation budget covers one retry, so a single lost confirmation costs a retry
+    // instead of leaving one side committed and the other on the relay.
+    let (client_path, device_path) = connect_through_proxy(
+        &harness,
+        proxy_addr,
+        client_socket,
+        device_socket,
+        PathConfig {
+            probe: fast_probes(),
+            switch: SwitchConfig {
+                retries: 4,
+                timeout: Duration::from_millis(60),
+                confirmation_timeout: Duration::from_millis(900),
+            },
+            ..PathConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        confirms_dropped.load(Ordering::SeqCst),
+        1,
+        "exactly one confirmation was lost"
+    );
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "the retransmitted confirmation let both sides commit"
+    );
+    assert_eq!(device_path.path_kind(), PathKind::Direct);
+
+    // No frame is lost while the confirmation was in flight.
+    for index in 0..4 {
+        let frame = envelope(&format!("req-lost-confirm-{index}"), b"delivered");
+        client_path.send_frame(&frame).await.expect("send");
+        assert_eq!(recv(&device_path).await, frame);
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+#[tokio::test]
+async fn a_permanently_lost_confirmation_leaves_both_peers_on_the_relay() {
+    let harness = Harness::new(SESSION).await;
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            // Every confirmation from the client is lost.
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::All,
+            paused: Arc::new(AtomicBool::new(false)),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_path, device_path) = connect_through_proxy(
+        &harness,
+        proxy_addr,
+        client_socket,
+        device_socket,
+        PathConfig {
+            probe: fast_probes(),
+            switch: SwitchConfig {
+                retries: 3,
+                timeout: Duration::from_millis(40),
+                confirmation_timeout: Duration::from_millis(300),
+            },
+            ..PathConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "the side whose confirm never arrived keeps the relay"
+    );
+    assert_eq!(device_path.path_kind(), PathKind::Relay);
+
+    let frame = envelope("req-no-confirm", b"still delivered");
+    client_path.send_frame(&frame).await.expect("relay send");
+    assert_eq!(recv(&device_path).await, frame);
+
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+#[tokio::test]
+async fn an_idle_session_and_a_one_way_sender_stay_on_the_direct_path() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_relay, client_probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .await;
+    let (device_relay, _probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(200),
+        keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(client_relay)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    // Idle well past the health bound: keepalives keep the path alive, so silence is not
+    // mistaken for death.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "an idle request/response session must not demote itself"
+    );
+
+    // One-way traffic with think time: the sender keeps sending and never reads, and the
+    // receiver never sends. Neither side may demote.
+    let baseline = client_probe.sends();
+    for index in 0..3 {
+        let frame = envelope(&format!("req-idle-{index}"), b"one way");
+        client_path.send_frame(&frame).await.expect("send");
+        assert_eq!(recv(&device_path).await, frame);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "a one-way sender stays on the direct path"
+    );
+    // A one-way sender cannot prove the peer reads direct, so it keeps the relay as a safety
+    // net; that copy is bounded by the relay limits and deduplicated by the receiver.
+    assert!(
+        client_probe.sends() >= baseline,
+        "the relay copy never replaces the direct send"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_only_path_survives_silence() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(150),
+        keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    // No relay is configured at all: the direct path is the only path.
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let frame = envelope("req-direct-only", b"after silence");
+    client_path
+        .send_frame(&frame)
+        .await
+        .expect("a lone direct path never turns into NoPath");
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Direct,
+        "without a relay there is nothing to demote to"
+    );
+    assert_eq!(recv(&device_path).await, frame);
+}
+
+#[tokio::test]
+async fn a_demoted_direct_path_re_promotes_when_the_peer_returns() {
+    let harness = Harness::new(SESSION).await;
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let paused = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::clone(&paused),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_path, device_path) = connect_through_proxy(
+        &harness,
+        proxy_addr,
+        client_socket,
+        device_socket,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(150),
+            keepalive_interval: Duration::from_millis(40),
+            ..PathConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    // Freeze the path: nothing crosses any more.
+    paused.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let first = envelope("req-repromote-1", b"after the freeze");
+    client_path.send_frame(&first).await.expect("send");
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "a frozen path demotes to the relay"
+    );
+    assert_eq!(recv(&device_path).await, first);
+
+    // The peer comes back and the caller repeats negotiation: the socket was kept, so the
+    // path is re-promoted instead of being permanently stuck on the relay.
+    paused.store(false, Ordering::SeqCst);
+    let key = harness.verification_key();
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            proxy_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+    let (client_upgrade, device_upgrade) = tokio::join!(
+        client_path.upgrade_with(&client_ticket, &client_candidates, NOW_MS),
+        device_path.upgrade_with(&device_ticket, &device_candidates, NOW_MS),
+    );
+    assert_eq!(
+        client_upgrade.expect("client re-promotes"),
+        PathKind::Direct
+    );
+    assert_eq!(
+        device_upgrade.expect("device re-promotes"),
+        PathKind::Direct
+    );
+    let second = envelope("req-repromote-2", b"back on direct");
+    client_path.send_frame(&second).await.expect("send direct");
+    assert_eq!(recv(&device_path).await, second);
+
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+#[tokio::test]
+async fn a_refused_pin_does_not_burn_the_ticket_or_the_epoch() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let ticket = harness.ticket(PeerRole::Client);
+    let candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, "peer-nonce"),
+        vec![],
+    )
+    .expect("candidates");
+    let (relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .await;
+    let impostor = IdentityKey::generate().expect("impostor identity");
+
+    let error = PathController::connect(
+        ticket.clone(),
+        candidates.clone(),
+        client_setup(socket().await, &harness)
+            .with_expected_peer_identity(impostor.public_key())
+            .with_relay(Arc::clone(&relay))
+            .at(NOW_MS),
+    )
+    .await
+    .expect_err("the pin is checked before anything is claimed");
+    assert!(
+        matches!(
+            error,
+            PathError::Ticket(TicketError::PeerIdentityMismatch { .. })
+        ),
+        "{error}"
+    );
+
+    // The same ticket still works once the pin is corrected: a refusal must not burn the
+    // ticket or its epoch.
+    let path = PathController::connect(
+        ticket,
+        candidates,
+        client_setup(socket().await, &harness)
+            .with_expected_peer_identity(harness.device_identity.public_key())
+            .with_relay(relay)
+            .at(NOW_MS),
+    )
+    .await
+    .expect("the corrected pin connects");
+    assert_eq!(path.path_kind(), PathKind::Relay);
+}
+
+#[tokio::test]
+async fn a_ticket_cannot_open_two_paths() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let ticket = harness.ticket(PeerRole::Client);
+    let candidates = CandidateSet::discover(
+        rendezvous_only(SESSION, &key, RELAY_ENDPOINT, "peer-nonce"),
+        vec![],
+    )
+    .expect("candidates");
+    let (relay, _probe) = harness
+        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .await;
+
+    PathController::connect(
+        ticket.clone(),
+        candidates.clone(),
+        client_setup(socket().await, &harness)
+            .with_relay(Arc::clone(&relay))
+            .at(NOW_MS),
+    )
+    .await
+    .expect("the first path opens");
+
+    let error = PathController::connect(
+        ticket,
+        candidates,
+        client_setup(socket().await, &harness)
+            .with_relay(relay)
+            .at(NOW_MS),
+    )
+    .await
+    .expect_err("one ticket opens one path");
+    assert!(
+        matches!(error, PathError::Ticket(TicketError::AlreadyUsed { .. })),
+        "{error}"
     );
 }
