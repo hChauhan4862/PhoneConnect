@@ -98,5 +98,12 @@ class ReconnectPolicyTest {
         assertTrue(rejected.isTerminal)
         assertEquals(null, rejected.retryReason)
         assertEquals(Invalidation.NONE, rejected.invalidation)
+
+        // A deterministic scope or identity refusal is also terminal, and also keeps the
+        // credential: re-enrolling would destroy the only evidence of the condition.
+        val refused = ConnectionFailure.SessionRefused("session_scope_mismatch")
+        assertTrue(refused.isTerminal)
+        assertEquals(null, refused.retryReason)
+        assertEquals(Invalidation.NONE, refused.invalidation)
     }
 }

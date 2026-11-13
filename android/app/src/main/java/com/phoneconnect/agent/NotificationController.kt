@@ -105,6 +105,10 @@ class NotificationController(
             "Stopped: the server rejected this device's credential (${failure.code}). " +
                 "Check the server configuration, then enroll this device again if the credential was rotated."
 
+        is ConnectionFailure.SessionRefused ->
+            "Stopped: the server refused this session (${failure.code}). The device stays " +
+                "enrolled; create a new session from the PhoneConnect server."
+
         is ConnectionFailure.Retryable -> "Stopped: ${describe(failure.reason)}."
     }
 

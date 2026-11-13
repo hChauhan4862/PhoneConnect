@@ -49,6 +49,14 @@ sealed interface ConnectionFailure {
      */
     data class CredentialRejected(val code: String) : ConnectionFailure
 
+    /**
+     * The server refuses this session's scope or peer identity deterministically
+     * (`*_scope_mismatch`, `ticket_identity_missing`). A new session cannot fix a credential
+     * scoped elsewhere, so retrying forever would only hide the condition; the agent stops
+     * with the code visible and keeps the enrollment so the operator can act.
+     */
+    data class SessionRefused(val code: String) : ConnectionFailure
+
     data class Retryable(val reason: ReconnectReason) : ConnectionFailure
 }
 
@@ -60,7 +68,7 @@ sealed interface ConnectionFailure {
 val ConnectionFailure.retryReason: ReconnectReason?
     get() = when (this) {
         ConnectionFailure.DeviceRevoked, ConnectionFailure.NotEnrolled,
-        is ConnectionFailure.CredentialRejected,
+        is ConnectionFailure.CredentialRejected, is ConnectionFailure.SessionRefused,
         -> null
 
         ConnectionFailure.RelayUnavailable, ConnectionFailure.SessionEnded ->

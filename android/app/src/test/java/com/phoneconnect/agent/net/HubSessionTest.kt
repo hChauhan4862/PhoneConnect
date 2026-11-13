@@ -12,6 +12,7 @@ import com.phoneconnect.agent.IdentityBoundary
 import com.phoneconnect.agent.Invalidation
 import com.phoneconnect.agent.SessionEnd
 import com.phoneconnect.agent.invalidation
+import com.phoneconnect.agent.isTerminal
 import com.phoneconnect.agent.crypto.Epoch
 import com.phoneconnect.agent.crypto.EpochClaims
 import com.phoneconnect.agent.crypto.IdentityKey
@@ -205,6 +206,33 @@ class HubSessionTest {
             0,
             paths.count { it.endsWith("/ticket") },
         )
+    }
+
+    @Test
+    fun `a successful poll between refusals resets the unknown-auth count`() = runBlocking {
+        // A 204 proves the credential is accepted. Without this reset, MAX-1 sporadic
+        // unknown-code refusals spread over hours would let one more stop an idle agent
+        // permanently, although no two were consecutive.
+        val runner = TransportSessionRunner(hub, pollIntervalMs = 0)
+        for (attempt in 1 until TransportSessionRunner.MAX_UNKNOWN_AUTH_REFUSALS) {
+            server.enqueue(
+                MockResponse().setResponseCode(401).setBody("""{"error":"unknown_auth_code_$attempt"}"""),
+            )
+            val end = withTimeout(20_000) { runner.run(store) { } }
+            assertEquals(SessionEnd.Failed(ConnectionFailure.SessionEnded), end)
+        }
+
+        // A 204 with nothing to join proves the credential is accepted and resets the run;
+        // the refusal in the same attempt is then the first of a new run, not the fifth.
+        server.enqueue(MockResponse().setResponseCode(204))
+        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"unknown_auth_code_after_reset"}"""))
+        val afterReset = withTimeout(20_000) { runner.run(store) { } }
+        assertEquals(SessionEnd.Failed(ConnectionFailure.SessionEnded), afterReset)
+        assertTrue(
+            "the count restarted, so nothing reached the terminal",
+            !(afterReset as SessionEnd.Failed).failure.isTerminal,
+        )
+        assertEquals("the credential survives", null, store.cleared)
     }
 
     @Test
@@ -455,9 +483,6 @@ class HubSessionTest {
             401 to "session_expired",
             401 to "session_revoked",
             404 to "session_unknown",
-            403 to "session_scope_mismatch",
-            401 to "ticket_scope_mismatch",
-            409 to "device_scope_mismatch",
         )
         for ((status, code) in cases) {
             server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
@@ -474,6 +499,33 @@ class HubSessionTest {
                 Invalidation.NONE,
                 (end as SessionEnd.Failed).failure.invalidation,
             )
+        }
+    }
+
+    @Test
+    fun `a scope or identity refusal is terminal and keeps the enrollment`() = runBlocking {
+        // A new session cannot fix a credential that is scoped elsewhere or a ticket with no
+        // pinned identity, so retrying forever would only hide the condition from the operator.
+        val cases = listOf(
+            403 to "session_scope_mismatch",
+            401 to "ticket_scope_mismatch",
+            409 to "device_scope_mismatch",
+            401 to "ticket_identity_missing",
+        )
+        for ((status, code) in cases) {
+            server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
+            server.enqueue(MockResponse().setBody("""{"ticket":${ticketJson()},"verification_key":"vk"}"""))
+            server.enqueue(MockResponse().setResponseCode(status).setBody("""{"error":"$code"}"""))
+
+            val end = withTimeout(20_000) {
+                TransportSessionRunner(hub, pollIntervalMs = 0).run(store) { }
+            }
+
+            val failure = (end as SessionEnd.Failed).failure
+            assertEquals("$code must stop with its own reason", ConnectionFailure.SessionRefused(code), failure)
+            assertTrue("$code must be terminal", failure.isTerminal)
+            assertEquals("$code must keep the credential", Invalidation.NONE, failure.invalidation)
+            assertEquals("$code must not clear the enrollment", null, store.cleared)
         }
     }
 
