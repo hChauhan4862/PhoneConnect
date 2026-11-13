@@ -4,7 +4,6 @@ docs
 target
 node_modules
 android
-native
 web/node_modules
 web/dist
 web/coverage

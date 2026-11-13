@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The server-served page may use the four bridge capabilities its host adapter declares: detached windows, tray status, loopback endpoints, and notifications. Nothing else is exposed.",
+  "windows": [
+    "*"
+  ],
+  "remote": {
+    "urls": [
+      "https://*",
+      "http://127.0.0.1:*",
+      "http://127.0.0.1/*",
+      "http://localhost:*",
+      "http://localhost/*"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "allow-open-window",
+    "allow-set-tray-status",
+    "allow-local-endpoints",
+    "allow-notify"
+  ]
+}

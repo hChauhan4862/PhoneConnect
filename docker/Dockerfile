@@ -24,6 +24,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY proto ./proto
 COPY server ./server
+COPY native ./native
 
 RUN cargo build --release --locked --bin phoneconnect-server
 

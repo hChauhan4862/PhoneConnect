@@ -1,111 +1,168 @@
 # PhoneConnect native shell
 
-Placeholder: this directory will hold the thin Tauri/Rust tray process for macOS, Windows,
-and Linux.
+The desktop client is a **thin Tauri/Rust shell over the one web UI**. It loads the
+server-served app at the configured URL in a webview and adds only what a browser cannot: a
+tray, detached OS windows, OS notifications, and loopback proxy endpoints. It does not bundle,
+fork, or reimplement the React app, and it does not rewrite its paths.
 
-Its intended responsibility is to open the server-served web UI URL in a webview, inject a
-documented host-context bridge (separate OS windows, tray state, notifications, local
-endpoints, external links) — the page-side contract is `web/README.md` and
-`web/src/host/hostContext.ts` — carry native transport when a peer is directly reachable,
-otherwise fall back to the authenticated server relay, allocate collision-safe loopback
-proxy ports per mapped stream, and verify/roll back its own updates.
+```sh
+# the headless logic: URL policy, host context, proxy pump, session client
+cargo test -p phoneconnect-native
 
-It deliberately contains no product screens: there is exactly one UI implementation, and
-native-only behavior is additive through the host adapter rather than a forked UI tree.
+# the real desktop binary (macOS was the built target; Windows/Linux are untested)
+cargo build -p phoneconnect-native --features shell
 
-## Transport
+# check what the shell would load and inject, without starting a webview
+PHONECONNECT_SERVER_URL=https://phoneconnect.example \
+  cargo run -q -p phoneconnect-native -- --print-context
+```
 
-Direct-path and relay transport live in the shared `crates/transport` crate
-(`phoneconnect-transport`), not in this shell, so the native client and the Android agent
-run the same negotiation:
+## What it loads
 
-- `SessionCipher` seals every frame with ChaCha20-Poly1305 keys agreed from the two pinned
-  identity keys (X25519 + HKDF-SHA256 over the session id and a per-connection epoch built
-  from both tickets' single-use nonces). The relay and a direct-path observer only ever see
-  ciphertext, and the server cannot derive the keys.
+`PHONECONNECT_SERVER_URL` names the server **origin**; the default is
+`http://127.0.0.1:8080`. `web_shell::resolve_url` accepts only:
 
-## Trust model
+- `https://` on any host, or
+- `http://127.0.0.1[:port]` / `http://localhost[:port]` for development,
 
-- The identity keys are the trust anchor: only the two peers hold private halves, and the
-  peer's public half is pinned by the server-signed ticket. This is TOFU through rendezvous:
-  a malicious or compromised rendezvous server can substitute a peer key and MITM, so TLS
-  authenticity to the server is assumed. A caller that learned the peer identity out of band
-  pins it with `PathSetup::with_expected_peer_identity`, and `connect` then fails closed.
-- The epoch makes every connection use fresh keys, so a second `ConnectedPath` for one
-  session id never reuses a ChaCha20-Poly1305 nonce. It is not forward secrecy: the static
-  identity keys are long-lived.
-- `CandidateSet::discover` merges the relay route with locally discovered and
-  server-observed endpoints.
-- `PathController::connect` verifies the signed rendezvous ticket, probes direct candidates
-  with bounded authenticated UDP, and selects the lower-latency validated path against the
-  relay. Relay latency is measured on attach, not assumed, and the configured estimate is
-  only the fallback.
-- A direct path commits only after both peers confirm the switch, so a one-sided punch
-  leaves the session on the relay instead of black-holing frames.
-- `ConnectedPath` carries bounded frames over either path, with `upgrade_with(ticket,
-  candidates, now)` for migrating a relay session to direct while keeping the relay as the
-  fallback, and `fallback_to_relay` for path degradation. A migration never closes the relay
-  session.
-- A freshly committed or re-promoted direct path duplicates every frame onto the relay until
-  a direct frame proves the peer reads direct. The duplication is bounded in time
-  (`PathConfig::transition_timeout`) and frames (`PathConfig::transition_max_frames`), and a
-  relay that refuses a copy — `Backpressure`, or the close the server sends instead when a
-  peer queue fills — ends it early: an unbounded transition would fill the relay's peer queue
-  until the server closed the sender's socket, destroying the fallback.
-- The transition bound ends the *duplication*, never the relay. A path that has a relay reads
-  it for the rest of its life, in every state, so a peer that demoted still reaches us; only
-  relay *sends* are limited, because they are what fills the bounded relay queue. A
-  relay-origin frame is proof the peer reads the relay, so it moves our sends there, and the
-  next direct frame moves them back. That is what makes a one-way outage degrade instead of
-  dying: our datagrams are lost, the peer demotes to the relay and sends there, we read the
-  relay and follow it, and the session keeps delivering until a fresh `upgrade_with` restores
-  a direct path.
-- A committed direct path is demoted only when the peer stops answering keepalives, never
-  because the application happened to be blocked in `recv_frame`. A receive longer than
-  `direct_health_timeout` keeps a live path direct, and a direct frame that arrives while
-  the relay is being read re-promotes the path and is surfaced to the caller. Every receive
-  is bounded by `PathConfig::recv_timeout`, including the relay wait. While a path is
-  duplicating, a relay frame waits up to `PathConfig::relay_frame_grace` for its own direct
-  copy, so a low-latency relay does not talk a healthy direct path out of the data it is
-  already delivering.
-- **The relay stays attached for the path's lifetime.** The server closes a relay socket that
-  has carried nothing for thirty seconds, and a healthy direct path sends the relay nothing —
-  so the path pings its relay every `PathConfig::relay_keepalive_interval` (10 s by default,
-  a third of the server's timeout) from the moment the relay attaches until `shutdown`. A
-  `WebSocketRelay` sends a WebSocket ping, which the server answers itself: it is never
-  forwarded, never queued, and never consumes a sequence number, unlike a keepalive *frame*.
-  Without it the fallback would quietly die about thirty seconds into every healthy session,
-  and a later one-way fault would have nothing to recover onto.
-- **A relay that dies is not reported as delivery.** The first observed relay fault (`Closed`,
-  `Malformed`, or `Unavailable`) is remembered, and from then on a send that needs the relay
-  returns it instead of handing a frame to a half-open socket and reporting `Ok`. An idle
-  read on a healthy direct path reports `HolePunch(ReceiveTimeout)` — never the relay's
-  closure, which per the server's documentation would read as "create a new session" and tear
-  down a path that is delivering. The fault is reported only where it changes the outcome: a
-  send that needs the relay, or a read with no direct path left to wait on.
-- Loss is reported, not hidden: `ConnectedPath::dropped_frames` counts frames the bounded
-  inbound ring dropped for a stalled reader (monotonic, including after shutdown), and the
-  next receive reports the gap as `PathError::FramesLost { count }` — non-fatal and local,
-  never as the `CounterRegression` a broken peer would produce. `relay_backpressure_events`
-  counts relay copies the relay refused.
-- A relay frame that lost its race with the direct copy of the same frame is held as one
-  frame and delivered **before** the direct ring, because it is older than everything the ring
-  holds. A copy that can no longer be delivered inside the AEAD replay window (64 counters) is
-  dropped and reported as `FramesLost`; it is our own scheduling, not a peer whose counter
-  went backwards. A malformed relay copy is decoded before any direct frame is consumed, so it
-  costs the relay (recorded as a fault) and never a datagram that already arrived.
-- `WebSocketRelay` attaches to the server's framed relay route. A `409 relay_unavailable`
-  is terminal for that session id: create a new session, never retry on the old one, and
-  read revocation from the stream close reason rather than from the lease status.
+and rejects userinfo, fragments, queries, a path other than `/`, and every other scheme. The
+rule is deliberate: the server serves the app at `/`, the shell must not rewrite a path, and
+plain HTTP to a remote host would carry the page's session cookie in the clear. A rejected URL
+names what is wrong; nothing is silently corrected.
 
-A direct path pins the peer's address for this milestone: `send_to` succeeding is not
-delivery, and a peer that changed NAT mapping is only noticed by the absence of its frames
-(keepalives make that bounded, and a path with a relay demotes back to it automatically).
-Treat direct delivery as best-effort until the reconnect work renegotiates it.
+The webview is created with `WebviewUrl::External(<that exact URL>)`. There is no
+`frontendDist` directory: no assets are compiled into the binary, so a build cannot drift from
+the server-served UI.
 
-Every `connect` needs a fresh ticket and freshly read candidates: the ticket's single-use
-nonce is half the connection key epoch, and a ticket already used by this process is refused
-instead of silently reusing keys.
+Server authentication is unchanged. The page uses the same session cookie or token it uses in
+a browser; the shell embeds no credential and has no privileged path into the API.
 
-`docker/transport-e2e/run.sh` runs the cross-process fallback test with the server and both
-peer stubs in Docker.
+## What the shell injects
+
+Before the page loads, both the embedded window and every detached window run two
+initialization scripts from `native/src/web_shell.rs`:
+
+```js
+// __PHONECONNECT_HOST__ — selects the native HostAdapter
+{ kind: "native", serverUrl: "https://phoneconnect.example/", proxyCapabilities: [...] }
+
+// __PHONECONNECT_BRIDGE__ — the capabilities this shell actually provides
+openWindow(route)        // detached OS window on the same origin
+setTrayStatus(status)    // { label, health, detail? }
+localEndpoints()         // [{ deviceId, stream, url }]
+notify({ title, body })  // OS notification
+```
+
+Field names and JSON shape match `web/src/host/hostContext.ts` exactly; a page that cannot
+read the context stays a browser, and each missing bridge method falls back to the page's
+in-page behavior. Strings are escaped as JavaScript literals, so a page-supplied value cannot
+break out of the injected script.
+
+`openWindow` accepts only a single-slash absolute path and re-resolves it against the
+configured origin; a protocol-relative path, a full URL, or a path that lands on another
+origin is refused. Detached windows are reused by a stable per-route label rather than
+duplicated.
+
+### Tauri IPC scope
+
+Tauri grants IPC to remote origins only through an explicit capability. `native/build.rs`
+declares the four application commands, so tauri-build generates `allow-open-window`,
+`allow-set-tray-status`, `allow-local-endpoints`, and `allow-notify`; `native/capabilities/
+default.json` grants exactly those (plus the standard `core:default` window/event set and
+`notification:default`) on any window label, for HTTPS origins and the two loopback HTTP
+origins. A compromised page can therefore open same-origin windows, set tray text, read the
+loopback endpoint list, and raise a notification; it cannot read files, spawn processes, or
+reach the local system beyond that.
+
+The webview also refuses to navigate off the configured origin (`on_navigation`), because a
+page on another origin would inherit the same capability.
+
+The server's CSP must let the page reach that IPC. `server/src/web.rs` therefore adds `ipc:`
+and `http://ipc.localhost` to `connect-src`; a reverse proxy that replaces the CSP with its own
+must keep those two sources, or every bridge call is blocked and native behavior silently
+degrades to browser behavior.
+
+Inputs are bounded before they reach the OS: tray label 128 bytes, detail 256, notification
+title 200, body 2,000.
+
+## Tray and windows
+
+- The tray has two items: *Show PhoneConnect* (focus the embedded window) and *Quit
+  PhoneConnect*. A left click on the icon also focuses the window.
+- Closing the window hides the shell; the tray keeps the process alive. Quit exits.
+- Tray status comes from the page: the tooltip is `label — health[: detail]`, and on macOS the
+  menu-bar title shows the label.
+- A notification failure is returned to the page as an error; it is never reported as
+  delivered.
+
+## Loopback proxy
+
+`native/src/proxy.rs` implements the native half of the localhost proxy:
+
+- `ProxyAllocator::bind(device_id, capability)` binds `127.0.0.1:0` — loopback only, OS-chosen
+  ephemeral port, never `0.0.0.0` and never a fixed port. Concurrent binds cannot collide; a
+  second endpoint for the same `device/stream` is refused.
+- `ProxyAllocator::serve(endpoint, ProxySession)` accepts one local TCP connection and pumps
+  it as `StreamKind::Proxy` envelopes over the session's `ConnectedPath`.
+- The request id is derived from the stream (`proxy-<stream>`), so the peer echoes it and a
+  frame for another stream is refused instead of written to the wrong local client.
+- Every frame carries `deadline_unix_ms`. A send that exceeds `send_timeout`, a transport
+  error, a wrong-stream frame, an idle connection, and capability expiry all close the local
+  socket immediately and return an explicit error. A capability that has expired is removed
+  from `endpoints()`, so the page never lists a dead port.
+- The uplink reads one chunk, sends it, and only then reads the next. A stalled transport
+  therefore stops the local socket with TCP backpressure instead of buffering.
+- **`send_frame` returning `Ok` is not proof of delivery.** It means the sealed frame was
+  handed to the direct socket or the relay; neither acknowledges the peer. `ProxySummary`
+  counts bytes *accepted by the transport*, never bytes delivered.
+
+Only loopback clients can reach an endpoint. There is no authentication on the endpoint itself
+— an ADB-shaped port accepts the local tool that connects to it — so it is a capability for
+this machine's local processes, not a network service. Opening one to `0.0.0.0` would turn a
+local capability into an unauthenticated remote one; the allocator cannot do that.
+
+### What is not implemented yet
+
+There is **no Android-side TCP bridge**, so nothing here claims ADB proxying works end to end.
+What is proven is the native half:
+
+- `native/tests/proxy.rs` binds real loopback ports and drives a real `ConnectedPath` over an
+  in-process relay, with a device-side stub that echoes `StreamKind::Proxy` envelopes. It
+  covers loopback-only binding, concurrent allocation, byte preservation across many frames,
+  per-frame deadlines, backpressure, failed sends, wrong-stream frames, idle deadlines,
+  capability expiry, and relay fallback (`PathKind::Relay`).
+- The same tests would run unchanged against the Android agent once it answers proxy frames;
+  the stub is the contract.
+
+Also not wired yet: the shell does not create a device session from the server, so
+`proxyCapabilities` starts empty and `localEndpoints()` returns `[]`. Binding a session
+(server ticket + candidates, then `SessionClient::connect`) and opening the endpoint is the
+next step, together with the Android bridge.
+
+## Session client
+
+`native/src/session_client.rs` wraps the shared transport:
+
+- `SessionClient::connect(ticket, candidates, setup)` runs `PathController::connect`, so the
+  ticket is verified, direct candidates are probed authenticated, and the lower-latency of
+  direct and relay wins.
+- `SessionClient::connect_relay_only(setup)` is the fallback when UDP is unavailable or direct
+  negotiation already failed. It still seals every frame.
+- `SessionPath::path_kind()` reports the path that was actually selected, and
+  `proxy_session(stream, limits)` builds the pump that rides it.
+- The data-path profile uses `FrameLimits::new()` instead of the control-only profile; a
+  configuration whose proxy frame limit cannot hold one full chunk is refused at construction.
+
+Direct-path and relay transport live in `crates/transport`, not here, so the native client and
+the Android agent run the same negotiation. A successful send on either path is best-effort
+until the peer answers; the transport's own README documents the handshake, keepalive, and
+fallback rules.
+
+## Packaging status
+
+The binary builds for macOS (`cargo build -p phoneconnect-native --features shell`, verified:
+a Mach-O arm64 executable) and its headless `--print-context` path runs. The GUI path — webview
+rendering, tray interaction, a detached window, an OS notification — was not exercised in this
+headless environment. Bundling a signed `.app`/`.dmg`, notarization, and the update channel are
+not part of this task. Windows and Linux have not been built or exercised; the tray,
+notification, and window code is Tauri's cross-platform API but only macOS was compiled here.

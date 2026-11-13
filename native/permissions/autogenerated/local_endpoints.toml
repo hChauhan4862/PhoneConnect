@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-endpoints"
+description = "Enables the local_endpoints command without any pre-configured scope."
+commands.allow = ["local_endpoints"]
+
+[[permission]]
+identifier = "deny-local-endpoints"
+description = "Denies the local_endpoints command without any pre-configured scope."
+commands.deny = ["local_endpoints"]

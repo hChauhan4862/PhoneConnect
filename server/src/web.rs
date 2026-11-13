@@ -22,8 +22,14 @@ pub const INDEX_DOCUMENT: &str = "index.html";
 
 /// Strict content policy: same-origin scripts and styles only, no framing, no object
 /// embedding, no inline or evaluated script.
+///
+/// `connect-src` also allows the Tauri IPC scheme and host. The native shell embeds this same
+/// document and installs its bridge before load; the bridge's `fetch("ipc://localhost/…")`
+/// is governed by this page policy, so leaving it out would silently disable every native
+/// capability. A browser has neither the scheme nor the host and is unaffected.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
-     style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+     style-src 'self'; img-src 'self' data:; font-src 'self'; \
+     connect-src 'self' ipc: http://ipc.localhost; \
      manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; \
      frame-ancestors 'none'";
 

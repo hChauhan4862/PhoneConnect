@@ -78,9 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(3);
     }
 
+    // The end-to-end session is read-only (it carries no control lease), and the relay
+    // refuses a client's control frame on such a session. The stub proves path fallback, not
+    // authorization, so it carries events, which a read-only session may relay.
     if role == "client" {
         let request = RequestId::new("req-docker-e2e")?;
-        let mut envelope = Envelope::new(StreamKind::Control, &device_id, &session_id, &request);
+        let mut envelope = Envelope::new(StreamKind::Events, &device_id, &session_id, &request);
         envelope.payload = format!("{target}:{payload}").into_bytes();
         path.send_frame(&envelope).await?;
         println!("SENT={}", envelope.request_id);
@@ -95,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if role == "device" {
         let reply = RequestId::new("req-docker-e2e-reply")?;
-        let mut envelope = Envelope::new(StreamKind::Control, &device_id, &session_id, &reply);
+        let mut envelope = Envelope::new(StreamKind::Events, &device_id, &session_id, &reply);
         envelope.payload = format!("{target}:echo").into_bytes();
         path.send_frame(&envelope).await?;
         println!("REPLIED={}", envelope.request_id);
