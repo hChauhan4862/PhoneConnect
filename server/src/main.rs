@@ -17,7 +17,7 @@ const RELAY_ENDPOINT_ENV: &str = "PHONECONNECT_RELAY_ENDPOINT";
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DATABASE_PATH: &str = "/data/phoneconnect.sqlite3";
-const DEFAULT_RELAY_ENDPOINT: &str = "http://localhost:8080/api/relay";
+const DEFAULT_RELAY_ENDPOINT: &str = "http://localhost:8080/api/sessions";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

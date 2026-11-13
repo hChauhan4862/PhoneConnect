@@ -111,9 +111,8 @@ async fn relay_upgrade_describes_bounded_limits() {
     let (status, body) = app.relay_upgrade(session_id, Some(capability)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["session_id"], session_id);
-    // The lease advertises the transport contract only; Task 3 binds the actual route,
-    // so nothing in this task serves `RELAY_ENDPOINT` yet.
-    assert_eq!(body["endpoint"], common::RELAY_ENDPOINT);
+    // The lease advertises the live per-session transport route.
+    assert_eq!(body["endpoint"], common::relay_url(session_id));
     assert_eq!(
         body["expires_at"].as_i64(),
         session["expires_at"].as_i64(),
@@ -1089,4 +1088,232 @@ async fn a_closed_relay_session_cannot_be_reopened_before_it_expires() {
         app.state.relay.attach(&session_id, PeerRole::Device).await,
         Err(RelayClose::SessionClosed)
     ));
+}
+
+// --------------------------------------------------------------------------------------
+// Framed relay transport: the route the lease advertises is actually served.
+// --------------------------------------------------------------------------------------
+
+mod transport {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use crate::common::TestApp;
+    use axum::http::StatusCode;
+    use futures_util::{SinkExt, StreamExt};
+    use phoneconnect::v1::{Envelope, FrameLimits, encode_frame};
+    use phoneconnect_server::relay::RelayClose;
+    use phoneconnect_server::store::DeviceStore;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// Serves the router on a loopback port and returns the `ws://` base.
+    async fn serve(app: &TestApp) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address: SocketAddr = listener.local_addr().expect("address");
+        let router = phoneconnect_server::build_router(app.state.clone());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("ws://{address}"), handle)
+    }
+
+    /// Rewrites the advertised `https://host/path` route onto the loopback test server.
+    fn loopback_route(base: &str, advertised: &str) -> String {
+        let path = advertised
+            .split_once("://")
+            .expect("an advertised scheme")
+            .1;
+        let path = &path[path.find('/').expect("an advertised path")..];
+        format!("{base}{path}")
+    }
+
+    async fn attach(url: &str, bearer: &str) -> Socket {
+        let mut request = url.into_client_request().expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {bearer}").parse().expect("bearer header"),
+        );
+        tokio_tungstenite::connect_async(request)
+            .await
+            .expect("relay transport accepts an authorized peer")
+            .0
+    }
+
+    fn frame(session_id: &str, payload: &[u8]) -> Vec<u8> {
+        let device = phoneconnect::v1::DeviceId::new("dev_ws").expect("device id");
+        let session = phoneconnect::v1::SessionId::new(session_id).expect("session id");
+        let request = phoneconnect::v1::RequestId::new("req-ws").expect("request id");
+        let mut envelope = Envelope::new(
+            phoneconnect::v1::StreamKind::Control,
+            &device,
+            &session,
+            &request,
+        );
+        envelope.payload = payload.to_vec();
+        encode_frame(&envelope, &FrameLimits::control_only()).expect("frame")
+    }
+
+    async fn next_binary(socket: &mut Socket) -> Vec<u8> {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a message arrives within the deadline")
+            .expect("the stream is open")
+            .expect("a valid frame");
+        match message {
+            Message::Binary(bytes) => bytes.to_vec(),
+            other => panic!("expected a binary frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_transport_forwards_frames_over_the_advertised_lease_endpoint() {
+        let app = TestApp::new();
+        let (device_id, credential) = app.enroll_new("user-a").await;
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_owned();
+        let capability = session["capability"]
+            .as_str()
+            .expect("capability")
+            .to_owned();
+
+        let (status, lease) = app.relay_upgrade(&session_id, Some(&capability)).await;
+        assert_eq!(status, StatusCode::OK, "{lease}");
+        let endpoint = lease["endpoint"].as_str().expect("endpoint");
+
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, endpoint);
+
+        let mut client = attach(&url, &capability).await;
+        let mut device = attach(&url, &credential).await;
+
+        let outbound = frame(&session_id, b"over the websocket relay");
+        client
+            .send(Message::Binary(outbound.clone().into()))
+            .await
+            .expect("client frame sent");
+        assert_eq!(
+            next_binary(&mut device).await,
+            outbound,
+            "the advertised route forwards the frame byte for byte"
+        );
+
+        let reply = frame(&session_id, b"and back");
+        device
+            .send(Message::Binary(reply.clone().into()))
+            .await
+            .expect("device frame sent");
+        assert_eq!(next_binary(&mut client).await, reply);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_transport_requires_session_credentials() {
+        let app = TestApp::new();
+        let (device_id, _) = app.enroll_new("user-a").await;
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"].as_str().expect("session_id");
+        let capability = session["capability"].as_str().expect("capability");
+        let (_, lease) = app.relay_upgrade(session_id, Some(capability)).await;
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, lease["endpoint"].as_str().expect("endpoint"));
+
+        let request = url.into_client_request().expect("websocket request");
+        let error = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("an unauthenticated peer never reaches the relay");
+        match error {
+            Error::Http(response) => assert_eq!(response.status(), 401),
+            other => panic!("expected an HTTP rejection, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_closed_relay_answers_relay_unavailable() {
+        let app = TestApp::new();
+        let (device_id, _) = app.enroll_new("user-a").await;
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"].as_str().expect("session_id");
+        let capability = session["capability"].as_str().expect("capability");
+        let (_, lease) = app.relay_upgrade(session_id, Some(capability)).await;
+        app.state
+            .relay
+            .close_session(session_id, RelayClose::SessionClosed);
+
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, lease["endpoint"].as_str().expect("endpoint"));
+        let mut request = url.into_client_request().expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {capability}").parse().expect("bearer"),
+        );
+        let error = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("a closed relay is terminal for this session id");
+        match error {
+            Error::Http(response) => assert_eq!(
+                response.status(),
+                409,
+                "409 relay_unavailable is the terminal answer"
+            ),
+            other => panic!("expected HTTP 409, got {other:?}"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_transport_reports_device_revocation_in_its_close_frame() {
+        let app = TestApp::new();
+        let (device_id, credential) = app.enroll_new("user-a").await;
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"].as_str().expect("session_id");
+        let capability = session["capability"].as_str().expect("capability");
+        let (_, lease) = app.relay_upgrade(session_id, Some(capability)).await;
+
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, lease["endpoint"].as_str().expect("endpoint"));
+        let mut client = attach(&url, capability).await;
+        let _device = attach(&url, &credential).await;
+
+        app.store
+            .revoke_device(&device_id, app.now())
+            .await
+            .expect("revocation persists");
+
+        let message = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("the close arrives without waiting for a frame")
+            .expect("the stream stays readable")
+            .expect("a close frame");
+        match message {
+            Message::Close(Some(frame)) => {
+                assert_eq!(
+                    u16::from(frame.code),
+                    1008,
+                    "policy close, not a generic drop"
+                );
+                assert_eq!(
+                    frame.reason.as_str(),
+                    "device_revoked",
+                    "the stream error carries the revocation"
+                );
+            }
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+
+        server.abort();
+    }
 }

@@ -15,10 +15,15 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 pub const ADMIN_TOKEN: &str = "test-admin-token";
-/// The relay address advertised in leases and candidates. It is a transport contract, not
-/// a route this task serves: Task 3 binds the transport at this value.
-pub const RELAY_ENDPOINT: &str = "https://relay.test/api/relay";
+/// Base of the relay transport route. One session's transport lives at
+/// [`relay_url`]`(session_id)`.
+pub const RELAY_ENDPOINT: &str = "https://relay.test/api/sessions";
 pub const NOW_MS: i64 = 1_760_000_000_000;
+
+/// The live relay route for one session, as advertised in leases and candidates.
+pub fn relay_url(session_id: &str) -> String {
+    format!("{RELAY_ENDPOINT}/{session_id}/relay")
+}
 
 pub struct TestApp {
     pub state: Arc<AppState>,
@@ -160,6 +165,32 @@ impl TestApp {
             &format!("/api/sessions/{session_id}/candidates"),
             bearer,
             None,
+        )
+        .await
+    }
+
+    pub async fn ticket(&self, session_id: &str, bearer: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/api/sessions/{session_id}/ticket"),
+            Some(bearer),
+            None,
+        )
+        .await
+    }
+
+    pub async fn register_candidate(
+        &self,
+        session_id: &str,
+        bearer: &str,
+        ticket: &Value,
+        endpoint: &str,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/sessions/{session_id}/candidates"),
+            Some(bearer),
+            Some(json!({ "ticket": ticket, "endpoint": endpoint })),
         )
         .await
     }

@@ -24,9 +24,11 @@ use axum::routing::{get, post};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+pub use relay::PeerRole;
+
 use auth::{AuthError, Authenticator};
 use relay::{Relay, RelayLimits};
-use rendezvous::Rendezvous;
+use rendezvous::{Rendezvous, TicketAuthority, TicketError};
 use store::{Clock, DeviceStore};
 
 /// Server-wide dependencies shared by the HTTP handlers.
@@ -38,16 +40,27 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
 }
 
+/// Startup failures. Both a missing admin token and an unavailable signature key stop the
+/// server: neither can be replaced with a weaker fallback.
+#[derive(Debug, thiserror::Error)]
+pub enum AppStateError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Ticket(#[from] TicketError),
+}
+
 impl AppState {
-    /// Builds the state from a store, bootstrap admin token, relay endpoint, relay limits,
-    /// and clock. The relay endpoint is the URL peers reach the relay through.
+    /// Builds the state from a store, bootstrap admin token, relay base endpoint, relay
+    /// limits, and clock. The relay endpoint is the URL peers reach the relay through; one
+    /// session's transport appends `/{session_id}/relay`.
     pub fn new(
         store: Arc<dyn DeviceStore>,
         admin_token: impl Into<String>,
         relay_endpoint: impl Into<String>,
         relay_limits: RelayLimits,
         clock: Arc<dyn Clock>,
-    ) -> Result<Self, AuthError> {
+    ) -> Result<Self, AppStateError> {
         let relay_endpoint = relay_endpoint.into();
         let auth = Arc::new(Authenticator::new(
             Arc::clone(&store),
@@ -60,10 +73,11 @@ impl AppState {
             Arc::clone(&store),
             Arc::clone(&clock),
         ));
+        let tickets = Arc::new(TicketAuthority::new()?);
         Ok(Self {
             store,
             auth,
-            rendezvous: Arc::new(Rendezvous::new(relay_endpoint)),
+            rendezvous: Arc::new(Rendezvous::new(relay_endpoint, tickets)),
             relay,
             clock,
         })
@@ -141,12 +155,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(admin::revoke_session),
         )
         .route(
+            "/api/sessions/{session_id}/ticket",
+            get(rendezvous::session_ticket),
+        )
+        .route(
             "/api/sessions/{session_id}/candidates",
-            get(rendezvous::session_candidates),
+            get(rendezvous::session_candidates).post(rendezvous::register_candidate),
         )
         .route(
             "/api/sessions/{session_id}/relay",
-            post(relay::upgrade_to_relay),
+            post(relay::upgrade_to_relay).get(relay::relay_socket),
         )
         .with_state(state)
 }

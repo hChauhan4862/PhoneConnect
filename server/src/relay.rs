@@ -16,20 +16,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::Json;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::{SinkExt, StreamExt};
 use phoneconnect::v1::{
     Envelope, FrameLimits, STREAM_FRAME_LIMIT, StreamKind, decode_frame, encode_frame,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::AppState;
-use crate::auth::AuthError;
+use crate::auth::{AuthError, SESSION_CAPABILITY_PREFIX, bearer_token};
 use crate::store::{Clock, DeviceStore, SessionRecord, StoreError, UnixMs};
 
 /// Frames a relay direction may hold before it reports backpressure.
@@ -124,21 +126,38 @@ pub enum RelayClose {
     StoreUnavailable { reason: String },
 }
 
-/// Which end of the session a handle represents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Which end of the session a handle represents. Serialized as `device` or `client` so a
+/// rendezvous ticket and the transport agree on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PeerRole {
     Device,
     Client,
+}
+
+impl PeerRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Client => "client",
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Device => Self::Client,
+            Self::Client => Self::Device,
+        }
+    }
 }
 
 /// Relay lease handed to a peer after `POST /api/sessions/{id}/relay`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RelayLease {
     pub session_id: String,
-    /// Transport contract, not a live route: this is the address peers are expected to
-    /// reach the relay through once the transport task binds it. Task 2 serves no route
-    /// at this value, so a lease is a statement of where relay traffic will go, and
-    /// nothing in this build may be probed there.
+    /// The live route for this session's framed relay transport: an HTTP(S) URL upgraded
+    /// to a WebSocket where each binary message is one PhoneConnect frame. It is served by
+    /// [`relay_socket`], so a peer that follows the lease really can relay frames.
     pub endpoint: String,
     pub expires_at: UnixMs,
     pub limits: RelayLimits,
@@ -212,10 +231,21 @@ impl Relay {
         }
         Ok(RelayLease {
             session_id: session.session_id.clone(),
-            endpoint: self.endpoint.clone(),
+            endpoint: self.endpoint_for(&session.session_id),
             expires_at: session.expires_at_ms,
             limits: self.limits,
         })
+    }
+
+    /// The advertised relay base. One session's transport route appends
+    /// `/{session_id}/relay`.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The live relay route for `session_id`.
+    pub fn endpoint_for(&self, session_id: &str) -> String {
+        format!("{}/{session_id}/relay", self.endpoint.trim_end_matches('/'))
     }
 
     /// Attaches one peer to an authorized session, re-reading the live record from the
@@ -629,4 +659,127 @@ pub async fn upgrade_to_relay(
         .open(&session, state.now_ms())
         .map_err(RelayUpgradeError::Refused)?;
     Ok((StatusCode::OK, Json(lease)))
+}
+
+/// The role a bearer credential proves for a relay transport: a session capability is the
+/// client end, a device credential is the device end.
+fn peer_role(headers: &HeaderMap) -> Result<PeerRole, AuthError> {
+    let token = bearer_token(headers)?;
+    if token.starts_with(SESSION_CAPABILITY_PREFIX) {
+        Ok(PeerRole::Client)
+    } else {
+        Ok(PeerRole::Device)
+    }
+}
+
+/// Stable machine-readable close reason for a relay transport. The close frame carries it
+/// so a peer learns *why* the stream ended: revocation is detected from this close, not
+/// from the status the lease reported when it was issued.
+fn close_code(reason: &RelayClose) -> &'static str {
+    match reason {
+        RelayClose::UnknownSession => "session_unknown",
+        RelayClose::SessionExpired => "session_expired",
+        RelayClose::SessionRevoked => "session_revoked",
+        RelayClose::DeviceRevoked { .. } => "device_revoked",
+        RelayClose::PeerClosed => "peer_closed",
+        RelayClose::MalformedFrame { .. } => "malformed_frame",
+        RelayClose::TrailingBytes { .. } => "trailing_bytes",
+        RelayClose::OversizedFrame { .. } => "oversized_frame",
+        RelayClose::Backpressure => "backpressure",
+        RelayClose::ByteBudgetExhausted => "byte_budget_exhausted",
+        RelayClose::IdleTimeout => "idle_timeout",
+        RelayClose::SessionClosed => "session_closed",
+        RelayClose::StoreUnavailable { .. } => "store_unavailable",
+    }
+}
+
+fn close_frame(reason: &RelayClose) -> CloseFrame {
+    CloseFrame {
+        code: 1008,
+        reason: close_code(reason).into(),
+    }
+}
+
+/// `GET /api/sessions/{id}/relay`: the framed relay transport for one session.
+///
+/// This is the route the relay lease advertises. Authorization happens before the HTTP
+/// upgrade, so an unauthorized peer never reaches the WebSocket. Each binary message is
+/// exactly one PhoneConnect frame; the relay forwards validated bytes without inspecting
+/// a payload. A relay failure ends the transport with a close frame that names the reason,
+/// so an attached peer sees `device_revoked` (or another explicit code) immediately.
+pub async fn relay_socket(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, RelayUpgradeError> {
+    let session = state
+        .auth
+        .authorize_session_access(&headers, &session_id)
+        .await?;
+    let role = peer_role(&headers)?;
+    let lease = state
+        .relay
+        .open(&session, state.now_ms())
+        .map_err(RelayUpgradeError::Refused)?;
+    let peer = state
+        .relay
+        .attach(&session_id, role)
+        .await
+        .map_err(RelayUpgradeError::Refused)?;
+    Ok(upgrade
+        .max_message_size(lease.limits.max_frame_bytes)
+        .max_frame_size(lease.limits.max_frame_bytes)
+        .on_upgrade(move |socket| relay_connection(socket, peer))
+        .into_response())
+}
+
+async fn relay_connection(socket: WebSocket, peer: RelayPeer) {
+    let (mut sink, mut stream) = socket.split();
+    loop {
+        tokio::select! {
+            outbound = peer.recv_bytes() => match outbound {
+                Ok(frame) => {
+                    if sink.send(Message::Binary(frame.into())).await.is_err() {
+                        let _ = peer.close_send();
+                        break;
+                    }
+                }
+                Err(reason) => {
+                    let _ = sink.send(Message::Close(Some(close_frame(&reason)))).await;
+                    break;
+                }
+            },
+            inbound = stream.next() => match inbound {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Err(reason) = peer.send_bytes(&bytes).await {
+                        let _ = sink.send(Message::Close(Some(close_frame(&reason)))).await;
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    if sink.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    let _ = peer.close_send();
+                    break;
+                }
+                Some(Ok(Message::Text(_))) => {
+                    let _ = sink
+                        .send(Message::Close(Some(close_frame(&RelayClose::MalformedFrame {
+                            reason: "text messages are not PhoneConnect frames".to_owned(),
+                        }))))
+                        .await;
+                    break;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Err(_)) => {
+                    let _ = peer.close_send();
+                    break;
+                }
+            }
+        }
+    }
 }

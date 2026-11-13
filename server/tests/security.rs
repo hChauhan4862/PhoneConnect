@@ -197,12 +197,32 @@ async fn session_issue_returns_a_short_lived_capability_and_ticket() {
     let ticket = &session["ticket"];
     assert_eq!(ticket["session_id"], session_id);
     assert_eq!(ticket["device_id"], device_id);
-    assert_eq!(ticket["expires_at"].as_i64(), Some(expires_at));
+    assert_eq!(
+        ticket["expires_at"].as_i64(),
+        Some(app.now() + 30_000),
+        "tickets are short-lived and cannot outlive their session: {ticket}"
+    );
+    assert!(
+        ticket["expires_at"].as_i64().unwrap() <= expires_at,
+        "a ticket never outlives the session"
+    );
+    assert_eq!(ticket["role"], "client");
     assert!(
         ticket["nonce"]
             .as_str()
             .is_some_and(|nonce| nonce.len() >= 16),
         "ticket carries a rendezvous nonce: {ticket}"
+    );
+    assert!(
+        ticket["probe_key"]
+            .as_str()
+            .is_some_and(|key| key.len() >= 43),
+        "ticket carries a 256-bit direct-path probe key: {ticket}"
+    );
+    assert_eq!(
+        ticket["signature"].as_str().map(str::len),
+        Some(128),
+        "ticket carries an Ed25519 signature over its own fields"
     );
 }
 
@@ -224,7 +244,7 @@ async fn session_candidates_are_only_returned_to_the_session_peers() {
         "task 2 publishes only the relay candidate: {body}"
     );
     assert_eq!(candidates[0]["kind"], "relay");
-    assert_eq!(candidates[0]["endpoint"], common::RELAY_ENDPOINT);
+    assert_eq!(candidates[0]["endpoint"], common::relay_url(session_id));
 
     // The owning device may fetch its own rendezvous data with its device credential.
     let (device_status, device_body) = app.candidates(session_id, Some(&credential)).await;
@@ -522,4 +542,226 @@ async fn revoking_an_unknown_id_is_a_not_found() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{kind}: {body}");
         assert_eq!(body["error"], code, "{kind}");
     }
+}
+
+#[tokio::test]
+async fn tickets_are_signed_and_bound_to_the_session_device_and_role() {
+    use phoneconnect_server::PeerRole;
+    use phoneconnect_server::rendezvous::{RendezvousTicket, TicketError};
+
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let verification_key = session["verification_key"]
+        .as_str()
+        .expect("verification key");
+    assert_eq!(verification_key.len(), 64, "Ed25519 public key is hex");
+
+    let client_ticket: RendezvousTicket =
+        serde_json::from_value(session["ticket"].clone()).expect("client ticket");
+    assert_eq!(client_ticket.role, PeerRole::Client);
+    assert_eq!(
+        client_ticket.signature.len(),
+        128,
+        "the ticket carries a hex Ed25519 signature"
+    );
+    assert_eq!(
+        client_ticket.expires_at,
+        app.now() + 30_000,
+        "tickets are short-lived and never outlive the session"
+    );
+
+    // The device fetches its own ticket; both peers share the rendezvous nonce that binds
+    // direct-path probes, while each ticket is signed for its own role.
+    let (status, issued) = app.ticket(session_id, &credential).await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    assert_eq!(issued["verification_key"], verification_key);
+    assert_eq!(issued["ticket"]["role"], "device");
+    assert_eq!(
+        issued["ticket"]["nonce"], session["ticket"]["nonce"],
+        "both peers must derive probes from one nonce"
+    );
+    let device_ticket: RendezvousTicket =
+        serde_json::from_value(issued["ticket"].clone()).expect("device ticket");
+
+    let authority = app.state.rendezvous.tickets();
+    authority
+        .verify(&client_ticket, session_id, PeerRole::Client, app.now())
+        .expect("the server verifies what it signed");
+    authority
+        .verify(&device_ticket, session_id, PeerRole::Device, app.now())
+        .expect("the device ticket verifies");
+
+    // Role, session, nonce, probe key, and expiry are all inside the signature.
+    assert_eq!(
+        authority.verify(&client_ticket, session_id, PeerRole::Device, app.now()),
+        Err(TicketError::RoleMismatch {
+            bound: PeerRole::Client,
+            requested: PeerRole::Device
+        })
+    );
+    let mut tampered = client_ticket.clone();
+    tampered.nonce = "attacker-chosen-nonce".to_owned();
+    assert_eq!(
+        authority.verify(&tampered, session_id, PeerRole::Client, app.now()),
+        Err(TicketError::InvalidSignature)
+    );
+    let mut swapped_session = client_ticket.clone();
+    swapped_session.session_id = "sess_other".to_owned();
+    assert_eq!(
+        authority.verify(&swapped_session, session_id, PeerRole::Client, app.now()),
+        Err(TicketError::SessionMismatch {
+            found: "sess_other".to_owned(),
+            expected: session_id.to_owned()
+        })
+    );
+
+    app.clock.advance_ms(30_000);
+    assert_eq!(
+        authority.verify(&client_ticket, session_id, PeerRole::Client, app.now()),
+        Err(TicketError::Expired {
+            expires_at: client_ticket.expires_at
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_ticket_is_rejected_before_candidates_are_exchanged() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let capability = session["capability"].as_str().expect("capability");
+    let client_ticket = session["ticket"].clone();
+
+    let (status, body) = app
+        .register_candidate(session_id, capability, &client_ticket, "203.0.113.5:51000")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The same ticket presented again never becomes a second candidate.
+    let (replay_status, replay) = app
+        .register_candidate(session_id, capability, &client_ticket, "203.0.113.99:51000")
+        .await;
+    assert_eq!(replay_status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["error"], "ticket_replayed");
+
+    // The opposite role has its own single redemption of the shared nonce.
+    let (_, issued) = app.ticket(session_id, &credential).await;
+    let device_ticket = issued["ticket"].clone();
+    let (device_status, device_body) = app
+        .register_candidate(session_id, &credential, &device_ticket, "203.0.113.6:51000")
+        .await;
+    assert_eq!(device_status, StatusCode::OK, "{device_body}");
+
+    // A ticket minted for the device cannot be redeemed by the client.
+    let (role_status, role_body) = app
+        .register_candidate(session_id, capability, &device_ticket, "203.0.113.7:51000")
+        .await;
+    assert_eq!(role_status, StatusCode::UNAUTHORIZED, "{role_body}");
+    assert_eq!(role_body["error"], "ticket_scope_mismatch");
+
+    // Nor does an unsigned ticket pass.
+    let mut forged = client_ticket.clone();
+    forged["signature"] = Value::String("00".repeat(64));
+    let (forged_status, forged_body) = app
+        .register_candidate(session_id, capability, &forged, "203.0.113.8:51000")
+        .await;
+    assert_eq!(forged_status, StatusCode::UNAUTHORIZED, "{forged_body}");
+    assert_eq!(forged_body["error"], "ticket_invalid");
+
+    // An expired ticket is refused without touching the observed endpoint.
+    let (_, fresh) = app.ticket(session_id, capability).await;
+    app.clock.advance_ms(30_000);
+    let (expired_status, expired_body) = app
+        .register_candidate(
+            session_id,
+            capability,
+            &fresh["ticket"],
+            "203.0.113.9:51000",
+        )
+        .await;
+    assert_eq!(expired_status, StatusCode::UNAUTHORIZED, "{expired_body}");
+    assert_eq!(expired_body["error"], "ticket_expired");
+}
+
+#[tokio::test]
+async fn candidate_registration_exchanges_the_endpoints_each_peer_reported() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let capability = session["capability"].as_str().expect("capability");
+
+    // Before anyone reports an endpoint, a peer only learns about the relay route.
+    let (status, body) = app.candidates(session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["candidates"].as_array().expect("candidates").len(), 1);
+    assert_eq!(body["candidates"][0]["kind"], "relay");
+    assert_eq!(
+        body["candidates"][0]["endpoint"],
+        common::relay_url(session_id)
+    );
+    assert_eq!(body["verification_key"].as_str().map(str::len), Some(64));
+
+    let (status, body) = app
+        .register_candidate(
+            session_id,
+            capability,
+            &session["ticket"],
+            "203.0.113.5:51000",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .all(|candidate| candidate["kind"] != "server_observed"),
+        "a peer is not told to probe itself: {body}"
+    );
+
+    let (_, issued) = app.ticket(session_id, &credential).await;
+    let (status, device_view) = app
+        .register_candidate(
+            session_id,
+            &credential,
+            &issued["ticket"],
+            "203.0.113.6:52000",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{device_view}");
+    let observed = device_view["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|candidate| candidate["kind"] == "server_observed")
+        .unwrap_or_else(|| panic!("the device learns the client endpoint: {device_view}"));
+    assert_eq!(observed["endpoint"], "203.0.113.5:51000");
+    assert_eq!(
+        observed["priority"].as_u64(),
+        Some(150),
+        "server-observed candidates outrank the relay"
+    );
+
+    // The client now learns the device endpoint.
+    let (status, client_view) = app.candidates(session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{client_view}");
+    let observed = client_view["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|candidate| candidate["kind"] == "server_observed")
+        .expect("client learns the device endpoint");
+    assert_eq!(observed["endpoint"], "203.0.113.6:52000");
+
+    // Something that is not an address is refused rather than advertised to a peer.
+    let (_, fresh) = app.ticket(session_id, capability).await;
+    let (status, body) = app
+        .register_candidate(session_id, capability, &fresh["ticket"], "not-an-address")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_endpoint");
 }

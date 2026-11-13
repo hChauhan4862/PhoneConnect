@@ -1,0 +1,59 @@
+# Transport end-to-end test: one server, one native-side stub, one Android-side stub.
+#
+# Both stubs receive a deliberately dead direct candidate, so direct negotiation must fail
+# and the session must continue over the relay without the caller noticing. The stubs are
+# started by `run.sh` once it has minted tickets for the session; they share the same
+# transport crate the native client and the Android adapter use.
+
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    image: phoneconnect-server:dev
+    environment:
+      PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:?set PHONECONNECT_ADMIN_TOKEN for the test run}
+      PHONECONNECT_RELAY_ENDPOINT: http://server:8080/api/sessions
+    ports:
+      - "127.0.0.1:18080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  client-stub:
+    build:
+      context: ../..
+      dockerfile: docker/transport-e2e/Dockerfile
+    image: phoneconnect-path-stub:dev
+    depends_on:
+      server:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  device-stub:
+    build:
+      context: ../..
+      dockerfile: docker/transport-e2e/Dockerfile
+    image: phoneconnect-path-stub:dev
+    depends_on:
+      server:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  native-stub:
+    build:
+      context: ../..
+      dockerfile: docker/transport-e2e/Dockerfile
+    image: phoneconnect-path-stub:dev
+    depends_on:
+      server:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true

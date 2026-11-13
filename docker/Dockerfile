@@ -33,7 +33,7 @@ WORKDIR /data
 
 ENV PHONECONNECT_LISTEN_ADDR=0.0.0.0:8080 \
     PHONECONNECT_DATABASE_PATH=/data/phoneconnect.sqlite3 \
-    PHONECONNECT_RELAY_ENDPOINT=http://localhost:8080/api/relay
+    PHONECONNECT_RELAY_ENDPOINT=http://localhost:8080/api/sessions
 
 EXPOSE 8080
 VOLUME ["/data"]

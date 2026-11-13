@@ -11,8 +11,10 @@ interprets relayed payloads.
 - `src/auth.rs` — credential classes, hashing, constant-time comparison, authorization checks.
 - `src/store.rs` — `DeviceStore` trait plus the SQLite implementation and the clock.
 - `src/enrollment.rs` — one-time enrollment tokens and device enrollment.
-- `src/rendezvous.rs` — session capabilities, rendezvous tickets, candidate endpoints.
-- `src/relay.rs` — bounded relay sessions, limits, and explicit close reasons.
+- `src/rendezvous.rs` — session capabilities, signed rendezvous tickets, ticket
+  redemption, and candidate exchange.
+- `src/relay.rs` — bounded relay sessions, limits, explicit close reasons, and the framed
+  relay transport route.
 - `src/admin.rs` — admin-guarded revocation of tokens, devices, and sessions.
 - `src/main.rs` — environment-driven configuration and process startup.
 
@@ -23,9 +25,12 @@ interprets relayed payloads.
 | `GET` | `/health` | none | Liveness only; never touches sessions. |
 | `POST` | `/api/enrollment-tokens` | admin | `{token, expires_at}` for one owner. |
 | `POST` | `/api/devices/enroll` | enrollment token | Consumes the token once, returns `{device_id, credential}`. |
-| `POST` | `/api/sessions` | admin | Authorizes a device session; returns `{session_id, capability, expires_at, ticket}`. |
-| `GET` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Authenticated endpoint candidates. |
+| `POST` | `/api/sessions` | admin | Authorizes a device session; returns `{session_id, capability, expires_at, ticket, verification_key}`. |
+| `GET` | `/api/sessions/{id}/ticket` | session capability or owning device credential | Fresh short-lived ticket for the calling role. |
+| `GET` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Relay route plus the endpoint observed for the opposite peer. |
+| `POST` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Redeems a ticket, records this peer's observed endpoint, returns the peer's view. |
 | `POST` | `/api/sessions/{id}/relay` | session capability or owning device credential | Bounded relay lease with explicit limits. |
+| `GET` (upgrade) | `/api/sessions/{id}/relay` | session capability (client end) or owning device credential (device end) | The framed relay transport: a WebSocket carrying one PhoneConnect frame per binary message. |
 | `POST` | `/api/enrollment-tokens/{token}/revoke` | admin | Revokes one unused enrollment token; idempotent. |
 | `POST` | `/api/devices/{id}/revoke` | admin | Revokes a device and its live sessions; closes their relays. |
 | `POST` | `/api/sessions/{id}/revoke` | admin | Revokes one session; closes its relay. |
@@ -49,11 +54,36 @@ access logging to drop that path, or revoke through a control plane that does no
 Secrets are stored only as SHA-256 hashes and compared in constant time. Enrollment tokens
 are single-use and consumed in the same transaction that creates the device.
 
-## Relay lease and live authorization
+## Rendezvous tickets and direct-path candidate exchange
 
-`POST /api/sessions/{id}/relay` returns a lease whose `endpoint` is a **transport
-contract**, not a live route. Task 2 serves nothing at that URL; the transport task binds
-it. The `expires_at` and `limits` fields are authoritative now.
+Each peer receives a signed, short-lived ticket: an Ed25519 signature over the session id,
+device id, role, rendezvous nonce, 256-bit probe key, and a 30-second expiry that never
+outlives the session. The public verification key travels with the ticket
+(`verification_key`) so a peer verifies the signature itself; only the server holds the
+private half, and the key is generated at startup, which invalidates outstanding tickets
+across a restart.
+
+Both roles of one rendezvous round receive the same nonce and probe key — that shared value
+is what authenticates direct-path probes — while each ticket is signed for its own role.
+Redemption is single-use per role: a replayed ticket answers `409 ticket_replayed`, a
+tampered or unsigned ticket `401 ticket_invalid`, an expired one `401 ticket_expired`, and
+a ticket presented by the wrong role or session `401 ticket_scope_mismatch`. None of these
+reaches candidate exchange, so a replayed ticket never establishes a path.
+
+`POST /api/sessions/{id}/candidates` redeems the caller's ticket and records the endpoint
+that peer reports for itself. `GET /api/sessions/{id}/candidates` (and the response to the
+`POST`) returns the relay route plus a `server_observed` candidate for the opposite peer
+once that peer has reported one. The relay route is `<PHONECONNECT_RELAY_ENDPOINT base>
+/{session_id}/relay`.
+
+## Relay transport and live authorization
+
+`POST /api/sessions/{id}/relay` returns a lease whose `endpoint` is the live transport route
+for that session. An HTTP `GET` upgrade on the same path is the framed relay transport: each
+binary WebSocket message is exactly one PhoneConnect frame, authorization is re-checked
+before the upgrade, and each peer attaches with the credential it holds (a session capability
+is the client end, a device credential is the device end). The advertised `expires_at` and
+`limits` fields bound the session.
 
 The relay re-reads authorization while a session is attached: every send and receive
 consults the clock and the store, and a blocked peer polls on a bounded interval. A session
@@ -66,8 +96,13 @@ A relay session is leased once. If its relay closes — the session byte budget 
 the transport closes it, or revocation ends it — the same session id cannot be leased again
 until the session expires: the close reason is sticky and the per-session byte budget counts
 every byte forwarded under that session, not every byte forwarded under one lease. Asking for
-a new lease returns 409 `relay_unavailable`; peers that still need to relay request a new
-session. Closed relay state is dropped when the session expires, so memory stays bounded by
+a new lease or a transport upgrade returns 409 `relay_unavailable`, which is terminal for
+that session id: create a new session and never retry on the old one.
+
+A transport that ends because of revocation or expiry sends a WebSocket close frame with a
+stable code (`device_revoked`, `session_revoked`, `session_expired`, `idle_timeout`,
+`backpressure`, and so on). Peers learn revocation from that stream error, not from the
+status the lease reported when it was issued. Closed relay state is dropped when the session expires, so memory stays bounded by
 sessions from the last five minutes.
 
 ## Configuration
@@ -77,7 +112,7 @@ sessions from the last five minutes.
 | `PHONECONNECT_ADMIN_TOKEN` | required | Bootstrap admin bearer token. Compose refuses to start without it. |
 | `PHONECONNECT_LISTEN_ADDR` | `0.0.0.0:8080` | Listen address. |
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
-| `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/relay` | Relay URL advertised to peers. |
+| `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/sessions` | Relay route base advertised to peers; one session appends `/{session_id}/relay`. |
 
 Terminate TLS at a reverse proxy; all public endpoints require TLS in production.
 

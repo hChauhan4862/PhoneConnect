@@ -8,7 +8,7 @@ services:
       # Required: compose refuses to start without it, so no deployment inherits a
       # publicly known bootstrap token. Generate one with `openssl rand -base64 32`.
       PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:?set PHONECONNECT_ADMIN_TOKEN to a random admin bearer token}
-      PHONECONNECT_RELAY_ENDPOINT: http://localhost:8080/api/relay
+      PHONECONNECT_RELAY_ENDPOINT: http://localhost:8080/api/sessions
     ports:
       # Loopback only: a deployment reaches the server through its TLS-terminating
       # reverse proxy, never directly on all interfaces.
