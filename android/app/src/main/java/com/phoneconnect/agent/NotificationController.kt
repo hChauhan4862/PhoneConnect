@@ -101,6 +101,10 @@ class NotificationController(
         ConnectionFailure.SessionEnded ->
             "Stopped: the session ended. A new session is needed."
 
+        is ConnectionFailure.CredentialRejected ->
+            "Stopped: the server rejected this device's credential (${failure.code}). " +
+                "Check the server configuration, then enroll this device again if the credential was rotated."
+
         is ConnectionFailure.Retryable -> "Stopped: ${describe(failure.reason)}."
     }
 

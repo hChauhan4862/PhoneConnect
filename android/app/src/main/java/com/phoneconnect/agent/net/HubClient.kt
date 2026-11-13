@@ -46,7 +46,12 @@ data class RendezvousTicket(
 )
 
 /** A session the hub authorized for this device, with no ticket of its own. */
-data class AssignedSession(val sessionId: String, val expiresAtMs: Long)
+data class AssignedSession(
+    val sessionId: String,
+    val expiresAtMs: Long,
+    /** Whether a control lease authorized this session; a read-only session is events only. */
+    val control: Boolean,
+)
 
 /** One session's rendezvous data, as the candidates route returns it. */
 data class SessionCandidates(
@@ -119,6 +124,7 @@ class HubClient(
             AssignedSession(
                 sessionId = json.getString("session_id"),
                 expiresAtMs = json.getLong("expires_at"),
+                control = json.optBoolean("control", false),
             )
         }
     }.mapFailure()

@@ -41,6 +41,14 @@ sealed interface ConnectionFailure {
      */
     data object SessionEnded : ConnectionFailure
 
+    /**
+     * The server keeps answering an authentication failure with a code this build cannot
+     * classify. Continuing would retry forever with no operator-visible outcome, so after a
+     * bounded number of consecutive refusals the agent stops — and keeps the enrollment, so
+     * a server fix or a re-enrollment recovers the device.
+     */
+    data class CredentialRejected(val code: String) : ConnectionFailure
+
     data class Retryable(val reason: ReconnectReason) : ConnectionFailure
 }
 
@@ -51,9 +59,13 @@ sealed interface ConnectionFailure {
  */
 val ConnectionFailure.retryReason: ReconnectReason?
     get() = when (this) {
-        ConnectionFailure.DeviceRevoked, ConnectionFailure.NotEnrolled -> null
+        ConnectionFailure.DeviceRevoked, ConnectionFailure.NotEnrolled,
+        is ConnectionFailure.CredentialRejected,
+        -> null
+
         ConnectionFailure.RelayUnavailable, ConnectionFailure.SessionEnded ->
             ReconnectReason.SESSION_ENDED
+
         is ConnectionFailure.Retryable -> reason
     }
 
@@ -71,6 +83,7 @@ val ConnectionFailure.invalidation: Invalidation
     get() = when (this) {
         ConnectionFailure.DeviceRevoked, ConnectionFailure.NotEnrolled -> Invalidation.ENROLLMENT
         // The session id is not persisted, so there is nothing local to invalidate: the
-        // supervisor simply awaits a new session.
+        // supervisor simply awaits a new session. A rejected credential is kept on purpose:
+        // the operator sees the terminal reason and can fix the server or re-enroll.
         else -> Invalidation.NONE
     }

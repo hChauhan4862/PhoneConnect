@@ -170,6 +170,74 @@ class HubSessionTest {
     }
 
     @Test
+    fun `a read-only session refuses a control frame from the peer`() = runBlocking {
+        enqueueDiscovery(control = false)
+        val peer = clientCipher()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        // The client tries to command a device that holds no lease.
+                        webSocket.send(routingFrame(peer.seal(controlEnvelope()).getOrThrow()).toByteString())
+                    }
+                },
+            ),
+        )
+
+        val runner = TransportSessionRunner(hub, pollIntervalMs = 0)
+        val end = withTimeout(20_000) { runner.run(store) { } }
+
+        assertEquals(
+            "a read-only session must not dispatch a control frame",
+            SessionEnd.Failed(ConnectionFailure.SessionEnded),
+            end,
+        )
+
+        // The device declared this session over, so the next attempt waits for a different
+        // one instead of polling the same id into the same refusal.
+        drainRequests()
+        server.enqueue(MockResponse().setResponseCode(204))
+        val second = withTimeoutOrNull(2_000) { runner.run(store) { } }
+        assertNull("the runner must wait for a new session", second)
+        val paths = drainRequests()
+        assertEquals(
+            "the refused session is never ticketed again: $paths",
+            0,
+            paths.count { it.endsWith("/ticket") },
+        )
+    }
+
+    @Test
+    fun `an unrecognised auth refusal stops after a bounded number of attempts`() = runBlocking {
+        // A code this build cannot classify on 401 is a credential the server rejects; it is
+        // retried a few times in case the server is mid-configuration, then stopped with the
+        // enrollment intact so the operator sees a terminal reason instead of a silent loop.
+        val runner = TransportSessionRunner(hub, pollIntervalMs = 0)
+        val attempts = TransportSessionRunner.MAX_UNKNOWN_AUTH_REFUSALS
+        val ends = mutableListOf<SessionEnd>()
+        for (attempt in 1..attempts) {
+            server.enqueue(
+                MockResponse().setResponseCode(401).setBody("""{"error":"unknown_auth_code_$attempt"}"""),
+            )
+            ends += withTimeout(20_000) { runner.run(store) { } }
+        }
+
+        for (attempt in 1 until attempts) {
+            assertEquals(
+                "attempt $attempt is still retried",
+                SessionEnd.Failed(ConnectionFailure.SessionEnded),
+                ends[attempt - 1],
+            )
+        }
+        assertEquals(
+            "the last attempt stops with a clear reason",
+            SessionEnd.Failed(ConnectionFailure.CredentialRejected("unknown_auth_code_$attempts")),
+            ends.last(),
+        )
+        assertEquals("stopping never deletes the credential", null, store.cleared)
+    }
+
+    @Test
     fun `an abandoned session id is skipped until a different one is offered`() = runBlocking {
         enqueueDiscovery()
         server.enqueue(MockResponse().setResponseCode(409).setBody("""{"error":"relay_unavailable"}"""))
@@ -442,8 +510,8 @@ class HubSessionTest {
         return paths
     }
 
-    private fun enqueueDiscovery() {
-        server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
+    private fun enqueueDiscovery(control: Boolean = true) {
+        server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000,"control":$control}"""))
         server.enqueue(MockResponse().setBody("""{"ticket":${ticketJson()},"verification_key":"vk"}"""))
         server.enqueue(MockResponse().setBody(candidatesJson(PEER_NONCE)))
     }
@@ -520,6 +588,9 @@ class HubSessionTest {
 
     @OptIn(IdentityBoundary::class)
     private class FakeStore(private val deviceSecret: ByteArray) : EnrollmentStore {
+        var cleared: ClearReason? = null
+            private set
+
         override suspend fun info(): EnrollmentInfo =
             EnrollmentInfo("dev_1", EnrollmentState.ENROLLED, 1_000)
 
@@ -534,7 +605,10 @@ class HubSessionTest {
             identityPublicKey = IdentityKey.fromBytes(deviceSecret).getOrThrow().publicKey(),
         )
 
-        override suspend fun clear(reason: ClearReason): Boolean = true
+        override suspend fun clear(reason: ClearReason): Boolean {
+            cleared = reason
+            return true
+        }
     }
 
     /**

@@ -91,5 +91,12 @@ class ReconnectPolicyTest {
         )
         assertEquals(null, ConnectionFailure.DeviceRevoked.retryReason)
         assertEquals(null, ConnectionFailure.NotEnrolled.retryReason)
+
+        // A credential the server keeps rejecting is terminal, but it is not cleared: the
+        // operator must see why the agent stopped and can fix the server or re-enroll.
+        val rejected = ConnectionFailure.CredentialRejected("some_new_code")
+        assertTrue(rejected.isTerminal)
+        assertEquals(null, rejected.retryReason)
+        assertEquals(Invalidation.NONE, rejected.invalidation)
     }
 }

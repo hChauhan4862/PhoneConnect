@@ -3,6 +3,7 @@ package com.phoneconnect.agent.crypto
 import com.phoneconnect.agent.EnvelopeCodec
 import com.phoneconnect.agent.WireError
 import com.phoneconnect.agent.wire.Envelope
+import com.phoneconnect.agent.wire.StreamKind
 import java.security.GeneralSecurityException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -28,6 +29,8 @@ sealed class SealedError(message: String) : Exception(message) {
 
     data object CounterExhausted : SealedError("frame counter space is exhausted; the session must be re-established")
     data class InvalidEnvelope(val reason: String) : SealedError("sealed frame does not contain a valid envelope: $reason")
+    data class StreamKindMismatch(val header: StreamKind, val envelope: StreamKind) :
+        SealedError("sealed header declares $header but the envelope it delivers is $envelope")
 }
 
 /**
@@ -66,8 +69,16 @@ class SessionCipher private constructor(
      * Seals one envelope. The caller sends the returned bytes; nothing else on the wire
      * describes the frame's contents.
      */
-    fun seal(envelope: Envelope): Result<ByteArray> = runCatching {
-        val streamKind = EnvelopeCodec.streamKindNumber(EnvelopeCodec.validate(envelope))
+    fun seal(envelope: Envelope): Result<ByteArray> =
+        sealWithHeaderKind(envelope, EnvelopeCodec.validate(envelope))
+
+    /**
+     * Seals [envelope] with a header label the caller chooses. Production always passes the
+     * envelope's own kind; the receiver and the relay pin that equality, so a frame sealed
+     * with any other label is refused on arrival.
+     */
+    internal fun sealWithHeaderKind(envelope: Envelope, headerKind: StreamKind): Result<ByteArray> = runCatching {
+        val streamKind = EnvelopeCodec.streamKindNumber(headerKind)
         val counter = synchronized(sendLock) {
             val current = sendCounter
             if (current == Long.MAX_VALUE) throw SealedError.CounterExhausted
@@ -124,6 +135,14 @@ class SessionCipher private constructor(
         }
         val envelope = EnvelopeCodec.decodeBody(plaintext).getOrElse { error ->
             throw SealedError.InvalidEnvelope(error.message ?: "invalid envelope")
+        }
+        // Authentication ties the header to this frame, but not to the kind of the envelope
+        // it delivers: a key holder controls both. Pin them so a control envelope cannot
+        // arrive inside a frame labelled as events, or the reverse.
+        val headerKind = EnvelopeCodec.streamKindOf(SealedFrame.streamKind(frame) ?: -1)
+            ?: throw SealedError.Malformed("sealed frame has no readable stream kind")
+        if (headerKind != envelope.streamKind) {
+            throw SealedError.StreamKindMismatch(header = headerKind, envelope = envelope.streamKind)
         }
         envelope
     }

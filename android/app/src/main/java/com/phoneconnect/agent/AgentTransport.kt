@@ -61,6 +61,9 @@ class AgentTransport(
     private val deviceId: String,
     private val sessionId: String,
     private val cipher: SessionCipher,
+    /// Whether the session's lease authorized control. A read-only session refuses a
+    /// control frame instead of dispatching it, even if the relay let it through.
+    private val controlAllowed: Boolean = true,
 ) : AutoCloseable {
     private val sequences = mutableMapOf<StreamKind, Long>()
     private var ended: ConnectionFailure? = null
@@ -93,6 +96,11 @@ class AgentTransport(
                 // is confused; never surface another session's or device's traffic.
                 if (envelope.sessionId != sessionId || envelope.deviceId != deviceId) {
                     return end(ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR))
+                }
+                if (!controlAllowed && envelope.streamKind == StreamKind.STREAM_KIND_CONTROL) {
+                    // The peer holds the key and sealed this frame, so a control command on a
+                    // read-only session is a contract violation, not a misfiled event.
+                    return end(ConnectionFailure.SessionEnded)
                 }
                 Inbound.Frame(envelope)
             }

@@ -45,10 +45,17 @@ class TransportSessionRunner(
     /** A session id whose relay was refused; polling skips it until a new session appears. */
     private var abandonedSessionId: String? = null
 
+    /** Consecutive authentication refusals this build cannot classify. Reset by a healthy session. */
+    private var unknownAuthRefusals = 0
+
     override suspend fun run(store: EnrollmentStore, onConnected: (ConnectionPath) -> Unit): SessionEnd {
         val identity = store.openIdentity() ?: return SessionEnd.Failed(ConnectionFailure.NotEnrolled)
         try {
-            return runSession(identity, onConnected)
+            return runSession(identity) { path ->
+                // A session that became healthy proves the credential is accepted.
+                unknownAuthRefusals = 0
+                onConnected(path)
+            }
         } finally {
             identity.close()
         }
@@ -131,13 +138,27 @@ class TransportSessionRunner(
                     }
                     return SessionEnd.Failed(failure)
                 }
-            val transport = AgentTransport(channel, deviceId, session.sessionId, cipher)
+            val transport = AgentTransport(
+                channel,
+                deviceId,
+                session.sessionId,
+                cipher,
+                controlAllowed = session.control,
+            )
             try {
                 onConnected(ConnectionPath.RELAY)
                 while (true) {
                     currentCoroutineContext().ensureActive()
                     when (val inbound = transport.receive()) {
-                        is Inbound.End -> return SessionEnd.Failed(inbound.failure)
+                        is Inbound.End -> {
+                            // The device itself declared this session over (expired, closed,
+                            // revoked, or a peer violating a read-only session); polling must
+                            // not offer the same id again.
+                            if (inbound.failure == ConnectionFailure.SessionEnded) {
+                                abandonedSessionId = session.sessionId
+                            }
+                            return SessionEnd.Failed(inbound.failure)
+                        }
                         // Command and telemetry adapters are a follow-up task; the connection
                         // service's job is to keep this stream authenticated and alive.
                         is Inbound.Frame -> Unit
@@ -210,8 +231,16 @@ class TransportSessionRunner(
             else -> when {
                 status == 404 || status == 410 -> ConnectionFailure.SessionEnded
                 status >= 500 -> ConnectionFailure.Retryable(ReconnectReason.SERVER_UNREACHABLE)
-                // An auth failure with an unknown code must never wipe the credential.
-                status == 401 || status == 403 -> ConnectionFailure.SessionEnded
+                // An auth failure with an unknown code must never wipe the credential, but it
+                // must not retry forever with no operator-visible outcome either.
+                status == 401 || status == 403 -> {
+                    unknownAuthRefusals += 1
+                    if (unknownAuthRefusals >= MAX_UNKNOWN_AUTH_REFUSALS) {
+                        ConnectionFailure.CredentialRejected(code)
+                    } else {
+                        ConnectionFailure.SessionEnded
+                    }
+                }
                 else -> ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR)
             }
         }
@@ -239,5 +268,8 @@ class TransportSessionRunner(
     companion object {
         const val DEFAULT_POLL_INTERVAL_MS: Long = 2_000
         const val DEFAULT_MAX_POLL_INTERVAL_MS: Long = 10_000
+
+        /** Unknown authentication refusals tolerated before the agent stops with a reason. */
+        const val MAX_UNKNOWN_AUTH_REFUSALS: Int = 5
     }
 }

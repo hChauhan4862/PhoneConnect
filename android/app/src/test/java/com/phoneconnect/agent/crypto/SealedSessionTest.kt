@@ -59,6 +59,25 @@ class SealedSessionTest {
     }
 
     @Test
+    fun `a sealed header kind must match the envelope it delivers`() {
+        val (client, device) = ciphers()
+        // A peer that holds the key can seal a control envelope under an events label. The
+        // relay checks the label it can read; the receiver must check the envelope it opens.
+        val sealed = client.sealWithHeaderKind(
+            vectorEnvelope(1, "command".toByteArray()),
+            StreamKind.STREAM_KIND_EVENTS,
+        ).getOrThrow()
+
+        assertEquals(
+            SealedError.StreamKindMismatch(
+                header = StreamKind.STREAM_KIND_EVENTS,
+                envelope = StreamKind.STREAM_KIND_CONTROL,
+            ),
+            device.open(sealed).exceptionOrNull(),
+        )
+    }
+
+    @Test
     fun `the key id matches the Rust implementation for both roles`() {
         val (client, device) = ciphers()
 

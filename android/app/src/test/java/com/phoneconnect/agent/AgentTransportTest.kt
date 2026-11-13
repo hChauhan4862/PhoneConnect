@@ -278,6 +278,44 @@ class AgentTransportTest {
     }
 
     @Test
+    fun `a read-only session refuses a control frame locally`() = runTest {
+        val peer = clientCipher()
+        val channel = FakeFrameChannel(
+            events = listOf(ChannelEvent.Frame(wrap(peer.seal(controlEnvelope(sequence = 1)).getOrThrow()))),
+        )
+        val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher(), controlAllowed = false)
+
+        val inbound = transport.receive()
+
+        assertEquals(
+            "a control frame on a read-only session is a peer violation",
+            Inbound.End(ConnectionFailure.SessionEnded),
+            inbound,
+        )
+        assertTrue(channel.closed)
+    }
+
+    @Test
+    fun `a read-only session still surfaces an events frame`() = runTest {
+        val peer = clientCipher()
+        val events = EnvelopeCodec.newEnvelope(
+            streamKind = StreamKind.STREAM_KIND_EVENTS,
+            deviceId = DEVICE_ID,
+            sessionId = SESSION_ID,
+            requestId = "",
+        ).toBuilder().setSequence(1).build()
+        val channel = FakeFrameChannel(
+            events = listOf(ChannelEvent.Frame(wrap(peer.seal(events).getOrThrow()))),
+        )
+        val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher(), controlAllowed = false)
+
+        val inbound = transport.receive()
+
+        assertTrue("expected a frame, got $inbound", inbound is Inbound.Frame)
+        assertEquals(events, (inbound as Inbound.Frame).envelope)
+    }
+
+    @Test
     fun `keepalive pings the relay while the session is open and stops afterwards`() = runTest {
         val channel = FakeFrameChannel(events = listOf(ChannelEvent.Closed("peer_closed")))
         val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher())
