@@ -45,6 +45,7 @@ function statusFixture(overrides: Partial<DeviceStatus> = {}): DeviceStatus {
       revoked_at_ms: null,
       state: "active",
       path: { state: "relay", relay_attached: true, direct_candidates: false },
+      control_refusals: 0,
     },
     lease: {
       lease: activeLease,
@@ -179,6 +180,17 @@ describe("the status screen", () => {
     expect(screen.queryByText("Relay attached")).not.toBeInTheDocument();
   });
 
+  it("reports refused control attempts on a read-only session", async () => {
+    installHost("browser");
+    const fixture = statusFixture();
+    fixture.session = { ...fixture.session, control_refusals: 2 };
+    renderApp(createFakeApi(fixture));
+
+    expect(
+      await screen.findByText(/2 control attempts were refused/i),
+    ).toBeInTheDocument();
+  });
+
   it("reports a revoked session and missing telemetry explicitly", async () => {
     installHost("browser");
     const fixture = statusFixture();
@@ -193,6 +205,7 @@ describe("the status screen", () => {
         relay_attached: false,
         direct_candidates: false,
       },
+      control_refusals: 0,
     };
     fixture.telemetry = {
       freshness: "missing",
@@ -413,6 +426,7 @@ describe("the lease surface", () => {
       revoked_at_ms: null,
       state: "none",
       path: { state: "none", relay_attached: false, direct_candidates: false },
+      control_refusals: 0,
     };
     fixture.lease = {
       lease: null,

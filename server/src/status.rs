@@ -61,6 +61,9 @@ pub struct SessionView {
     pub revoked_at_ms: Option<UnixMs>,
     pub state: SessionState,
     pub path: PathView,
+    /// Control frames this session's client tried to send while read-only. Zero unless
+    /// the server refused an attempt.
+    pub control_refusals: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -113,6 +116,7 @@ impl SessionView {
             revoked_at_ms: None,
             state: SessionState::None,
             path: PathView::absent(),
+            control_refusals: 0,
         }
     }
 }
@@ -305,6 +309,11 @@ async fn session_view(
     } else {
         PathView::absent()
     };
+    let control_refusals = if session_state == SessionState::Active {
+        state.relay.control_refusals(&record.session_id)
+    } else {
+        0
+    };
     Ok(SessionView {
         session_id: Some(record.session_id),
         created_at_ms: Some(record.created_at_ms),
@@ -312,5 +321,6 @@ async fn session_view(
         revoked_at_ms: record.revoked_at_ms,
         state: session_state,
         path,
+        control_refusals,
     })
 }

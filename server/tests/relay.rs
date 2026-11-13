@@ -1240,6 +1240,59 @@ mod transport {
     }
 
     #[tokio::test]
+    async fn relay_transport_refuses_a_read_only_control_frame_without_closing_the_stream() {
+        let app = TestApp::new();
+        let (device_id, credential) = app.enroll_new("owner-1").await;
+        // No lease: this is a read-only session.
+        let session = app.create_session(&device_id).await;
+        let session_id = session["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_owned();
+        let capability = session["capability"]
+            .as_str()
+            .expect("capability")
+            .to_owned();
+        let (status, lease) = app.relay_upgrade(&session_id, Some(&capability)).await;
+        assert_eq!(status, StatusCode::OK, "{lease}");
+        let endpoint = lease["endpoint"].as_str().expect("endpoint");
+
+        let (base, server) = serve(&app).await;
+        let url = loopback_route(&base, endpoint);
+        let mut client = attach(&url, &capability).await;
+        let mut device = attach(&url, &credential).await;
+
+        client
+            .send(Message::Binary(frame(&session_id, b"command").into()))
+            .await
+            .expect("frame sent");
+
+        // The device sees no command, and the refused frame did not close the viewer.
+        let telemetry = frame(&session_id, b"battery=64");
+        device
+            .send(Message::Binary(telemetry.clone().into()))
+            .await
+            .expect("device frame sent");
+        assert_eq!(
+            next_binary(&mut client).await,
+            telemetry,
+            "the read-only stream still receives after a refused control frame"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), device.next())
+                .await
+                .is_err(),
+            "the refused control frame never reached the device"
+        );
+        assert_eq!(
+            app.state.relay.control_refusals(&session_id),
+            1,
+            "the server records the refusal explicitly"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn relay_transport_requires_session_credentials() {
         let app = TestApp::new();
         let (device_id, _) = app.enroll_new("user-a").await;

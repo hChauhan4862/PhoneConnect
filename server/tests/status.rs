@@ -37,6 +37,42 @@ async fn the_status_prefers_a_live_session_over_a_newer_ended_one() {
 }
 
 #[tokio::test]
+async fn the_status_reports_how_many_control_frames_a_read_only_session_refused() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    app.relay_upgrade(&session_id, Some(capability)).await;
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, phoneconnect_server::relay::PeerRole::Client)
+        .await
+        .expect("client attaches");
+    let frame = phoneconnect_control_frame(&session_id);
+    assert!(
+        client.send_frame(&frame).await.is_err(),
+        "a read-only session cannot command"
+    );
+
+    let (status, body) = app.device_status(&device_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session"]["control_refusals"], Value::from(1));
+}
+
+fn phoneconnect_control_frame(session_id: &str) -> phoneconnect::v1::Envelope {
+    use phoneconnect::v1::{DeviceId, Envelope, RequestId, SessionId, StreamKind};
+    let device = DeviceId::new("dev_status").expect("device id");
+    let session = SessionId::new(session_id).expect("session id");
+    let request = RequestId::new("req_status").expect("request id");
+    Envelope::new(StreamKind::Control, &device, &session, &request)
+}
+
+#[tokio::test]
 async fn a_revoked_device_reports_no_control_and_no_lease() {
     let app = TestApp::new();
     let (device_id, _credential) = app.enroll_new("owner-1").await;

@@ -38,7 +38,9 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface) and
   `TelemetryPanel` (bounded aggregates and explicit freshness). `LeasePanel` offers revoke and
   handoff to the owner *or* the holder, because the server lets the owner revoke a lease they
-  do not hold; "Read-only access" is reserved for a user who is neither.
+  do not hold; "Read-only access" is reserved for a user who is neither. `SessionPanel` also
+  shows the server's `control_refusals` count, so a refused control attempt on a read-only
+  session is visible rather than silently dropped.
 - `src/data/useResource.ts` — one load/retry primitive; `src/session.ts` — the browser
   session (admin token + acting user id) used until local password login and MFA land.
 

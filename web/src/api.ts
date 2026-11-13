@@ -29,6 +29,8 @@ export interface SessionView {
   revoked_at_ms: number | null;
   state: SessionState;
   path: PathView;
+  /// Control frames this session's client tried to send while read-only.
+  control_refusals: number;
 }
 
 export interface LeaseView {

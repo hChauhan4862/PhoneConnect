@@ -42,6 +42,12 @@ export function SessionPanel({ session }: { session: SessionView }) {
           stays attached as the fallback.
         </p>
       ) : null}
+      {session.control_refusals > 0 ? (
+        <p className="muted">
+          {session.control_refusals} control {session.control_refusals === 1 ? "attempt was" : "attempts were"}{" "}
+          refused for this read-only session.
+        </p>
+      ) : null}
     </section>
   );
 }

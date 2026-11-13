@@ -199,8 +199,11 @@ session.
 Read-only is enforced per frame, not only at admission. The session record persists whether a
 lease authorized control; the relay refuses a `STREAM_KIND_CONTROL` frame from the client end
 of a read-only session with `control_not_authorized`, without ending the stream, so a viewer
-that keeps receiving telemetry stays connected. A control session's frames are accepted, and
-revocation ends the stream before the next frame can be sent.
+that keeps receiving telemetry stays connected. Over the WebSocket the refused frame is
+dropped and the socket stays open (the transport has no per-frame error), and the server
+counts the refusal in the status surface's `control_refusals`, which the UI shows. A control
+session's frames are accepted, and revocation ends the stream before the next frame can be
+sent.
 
 Leases are **not yet an authorization boundary in the security sense**: with no local password
 login or MFA, the admin-token holder asserts `actor_id`/`user_id` in the request. The lease

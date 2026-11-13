@@ -303,6 +303,15 @@ impl Relay {
         }
     }
 
+    /// How many control frames a read-only session's client tried to send. The refusal is
+    /// per frame, so this counter is how an operator sees that a viewer attempted control.
+    pub fn control_refusals(&self, session_id: &str) -> u64 {
+        self.sessions()
+            .get(session_id)
+            .map(|session| session.control_refusals.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// Whether any peer has attached to `session_id`, i.e. the session is carrying (or
     /// waiting to carry) relay traffic rather than only direct-path candidates.
     pub fn has_attached_session(&self, session_id: &str) -> bool {
@@ -375,6 +384,7 @@ impl RelayPeer {
             && !self.session.allows_control()
             && envelope.stream_kind == i32::from(StreamKind::Control)
         {
+            self.session.control_refusals.fetch_add(1, Ordering::SeqCst);
             return Err(RelayClose::ControlNotAuthorized {
                 session_id: self.session.session_id.clone(),
             });
@@ -472,6 +482,8 @@ struct RelaySession {
     /// Whether a control lease authorized this session. A read-only session may relay
     /// events but never a control frame; the check is per frame and does not end the stream.
     control: bool,
+    /// Control frames this session's client tried to send while read-only.
+    control_refusals: AtomicU64,
     expires_at_ms: AtomicI64,
     limits: RelayLimits,
     frame_limits: FrameLimits,
@@ -503,6 +515,7 @@ impl RelaySession {
             session_id: record.session_id.clone(),
             device_id: record.device_id.clone(),
             control: record.control,
+            control_refusals: AtomicU64::new(0),
             expires_at_ms: AtomicI64::new(record.expires_at_ms),
             limits,
             frame_limits: limits.frame_limits(),
@@ -859,9 +872,17 @@ async fn relay_connection(socket: WebSocket, peer: RelayPeer) {
             },
             inbound = stream.next() => match inbound {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if let Err(reason) = peer.send_bytes(&bytes).await {
-                        let _ = sink.send(Message::Close(Some(close_frame(&reason)))).await;
-                        break;
+                    match peer.send_bytes(&bytes).await {
+                        Ok(()) => {}
+                        // A read-only control frame is refused, not fatal: the frame is
+                        // dropped and the viewer keeps receiving. The peer cannot be told
+                        // per frame because the transport has no per-frame error, so the
+                        // refusal is counted and surfaced in the status surface instead.
+                        Err(RelayClose::ControlNotAuthorized { .. }) => {}
+                        Err(reason) => {
+                            let _ = sink.send(Message::Close(Some(close_frame(&reason)))).await;
+                            break;
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
