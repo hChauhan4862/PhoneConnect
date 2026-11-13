@@ -93,16 +93,6 @@ pub struct CandidateSet {
 }
 
 impl CandidateSet {
-    /// An empty set. Used by a relay-only path, which has no direct candidates.
-    pub(crate) fn empty() -> Self {
-        Self {
-            session_id: String::new(),
-            expires_at: i64::MAX,
-            verification_key: String::new(),
-            candidates: Vec::new(),
-        }
-    }
-
     /// Merges the server's view with endpoints discovered locally for the same peer.
     ///
     /// Direct candidates are ordered by priority (local first, then server-observed) and

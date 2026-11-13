@@ -22,11 +22,15 @@
 
 #![deny(unsafe_code)]
 
+pub mod aead;
 pub mod candidates;
 pub mod hole_punch;
 pub mod path;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
@@ -35,12 +39,17 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+pub use aead::{
+    AeadError, IdentityKey, IdentityPublicKey, KEY_ID_LEN, SealedHeader, SessionCipher,
+};
 pub use candidates::{
     CandidateError, CandidateKind, CandidateSet, EndpointCandidate, RendezvousCandidates,
 };
 pub use hole_punch::{
-    HolePunchError, ProbeAuthenticator, ProbeConfig, ProbeCredentials, ProbePacket, TicketRole,
+    DirectEvent, DirectSocket, HolePunchError, ProbeAuthenticator, ProbeConfig, ProbeCredentials,
+    ProbePacket, SwitchConfig, TicketRole,
 };
 pub use path::{
     ConnectedPath, PathConfig, PathController, PathError, PathKind, PathSetup, RelayChannel,
@@ -70,6 +79,11 @@ pub struct WebSocketRelay {
     sink: Mutex<SplitSink<WebSocket, Message>>,
     stream: Mutex<SplitStream<WebSocket>>,
     max_frame_bytes: usize,
+    /// Measured round trip from the attach handshake, in microseconds. Zero means the
+    /// measurement failed and selection must fall back to the configured estimate.
+    latency_micros: AtomicU64,
+    /// A data frame that arrived while the handshake was measuring latency.
+    pending: Mutex<VecDeque<Vec<u8>>>,
 }
 
 impl WebSocketRelay {
@@ -92,14 +106,31 @@ impl WebSocketRelay {
                     reason: "bearer token is not a valid header value".to_owned(),
                 })?,
         );
-        let (socket, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(connect_error)?;
-        let (sink, stream) = socket.split();
+        // Cap what the peer can push at us before we ever parse a frame, so a hostile or
+        // broken relay cannot make the client buffer an unbounded message.
+        let config = WebSocketConfig::default()
+            .max_frame_size(Some(max_frame_bytes))
+            .max_message_size(Some(max_frame_bytes));
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+                .await
+                .map_err(connect_error)?;
+        let (mut sink, mut stream) = socket.split();
+        let (latency, pending) = measure_latency(&mut sink, &mut stream).await;
+        let mut pending_frames = VecDeque::new();
+        if let Some(frame) = pending {
+            pending_frames.push_back(frame);
+        }
         Ok(Arc::new(Self {
             sink: Mutex::new(sink),
             stream: Mutex::new(stream),
             max_frame_bytes,
+            latency_micros: AtomicU64::new(
+                latency
+                    .map(|measured| measured.as_micros() as u64)
+                    .unwrap_or(0),
+            ),
+            pending: Mutex::new(pending_frames),
         }))
     }
 }
@@ -125,6 +156,9 @@ impl RelayChannel for WebSocketRelay {
     }
 
     async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        if let Some(frame) = self.pending.lock().await.pop_front() {
+            return Ok(frame);
+        }
         loop {
             let message = self.stream.lock().await.next().await;
             match message {
@@ -167,6 +201,49 @@ impl RelayChannel for WebSocketRelay {
 
     async fn close(&self) -> Result<(), RelayError> {
         self.sink.lock().await.close().await.map_err(socket_error)
+    }
+
+    /// The measured relay round trip, so path selection compares a real number instead of
+    /// a fixed estimate. `None` means the attach measurement failed.
+    fn latency(&self) -> Option<Duration> {
+        match self
+            .latency_micros
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            0 => None,
+            micros => Some(Duration::from_micros(micros)),
+        }
+    }
+}
+
+/// One ping/pong round trip on the freshly attached transport. A measurement is what lets
+/// path selection prefer a low-latency relay over a slow direct path; without it the
+/// configured estimate is only an upper bound.
+async fn measure_latency(
+    sink: &mut SplitSink<WebSocket, Message>,
+    stream: &mut SplitStream<WebSocket>,
+) -> (Option<Duration>, Option<Vec<u8>>) {
+    let probe = b"pc-rtt".to_vec();
+    let started = Instant::now();
+    if sink
+        .send(Message::Ping(probe.clone().into()))
+        .await
+        .is_err()
+    {
+        return (None, None);
+    }
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
+            Ok(Some(Ok(Message::Pong(payload)))) if payload.as_ref() == probe.as_slice() => {
+                return (Some(started.elapsed()), None);
+            }
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                // A frame raced the handshake; keep it for `recv_frame`.
+                return (None, Some(bytes.to_vec()));
+            }
+            _ => return (None, None),
+        }
     }
 }
 

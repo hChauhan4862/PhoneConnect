@@ -75,6 +75,9 @@ pub struct DeviceRecord {
     pub device_id: String,
     pub owner_id: String,
     pub credential_hash: String,
+    /// Base64url X25519 identity public key registered at enrollment. Its private half
+    /// never leaves the device.
+    pub identity_public_key: String,
     pub enrolled_at_ms: UnixMs,
     pub revoked_at_ms: Option<UnixMs>,
 }
@@ -98,6 +101,7 @@ pub struct RelayAuthorization {
 pub struct NewDevice {
     pub device_id: String,
     pub credential_hash: String,
+    pub identity_public_key: String,
     pub enrolled_at_ms: UnixMs,
 }
 
@@ -108,6 +112,12 @@ pub struct SessionRecord {
     pub device_id: String,
     pub owner_id: String,
     pub capability_hash: String,
+    /// Base64url X25519 identity public key the client registered for this session. It is
+    /// the login-equivalent pin in this milestone; its private half never leaves the client.
+    pub client_identity_key: String,
+    /// Base64url X25519 identity public key of the session's device, read from the device
+    /// record so every authorization path sees the same pinned key.
+    pub device_identity_key: String,
     pub created_at_ms: UnixMs,
     pub expires_at_ms: UnixMs,
     pub revoked_at_ms: Option<UnixMs>,
@@ -198,9 +208,6 @@ pub trait DeviceStore: Send + Sync {
         capability_hash: &str,
     ) -> Result<Option<SessionRecord>, StoreError>;
 
-    /// Revokes one session and returns the time revocation took effect. Idempotent:
-    /// revoking twice succeeds and keeps the first revocation time. `UnknownSession`
-    /// means no such session exists.
     async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
 }
 
@@ -217,6 +224,7 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
     credential_hash TEXT NOT NULL UNIQUE,
+    identity_public_key TEXT NOT NULL DEFAULT '',
     enrolled_at_ms INTEGER NOT NULL,
     revoked_at_ms INTEGER
 );
@@ -225,6 +233,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     device_id TEXT NOT NULL REFERENCES devices(device_id),
     owner_id TEXT NOT NULL,
     capability_hash TEXT NOT NULL UNIQUE,
+    client_identity_key TEXT NOT NULL DEFAULT '',
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
     revoked_at_ms INTEGER
@@ -250,6 +259,7 @@ impl SqliteStore {
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(backend_error)?;
         connection.execute_batch(SCHEMA).map_err(backend_error)?;
+        migrate(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -354,12 +364,14 @@ impl DeviceStore for SqliteStore {
                 .map_err(backend_error)?;
             transaction
                 .execute(
-                    "INSERT INTO devices (device_id, owner_id, credential_hash, enrolled_at_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO devices
+                     (device_id, owner_id, credential_hash, identity_public_key, enrolled_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         device.device_id,
                         owner_id,
                         device.credential_hash,
+                        device.identity_public_key,
                         device.enrolled_at_ms
                     ],
                 )
@@ -370,6 +382,7 @@ impl DeviceStore for SqliteStore {
                 device_id: device.device_id,
                 owner_id,
                 credential_hash: device.credential_hash,
+                identity_public_key: device.identity_public_key,
                 enrolled_at_ms: device.enrolled_at_ms,
                 revoked_at_ms: None,
             })
@@ -410,7 +423,8 @@ impl DeviceStore for SqliteStore {
         let found = self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT device_id, owner_id, credential_hash, enrolled_at_ms, revoked_at_ms
+                    "SELECT device_id, owner_id, credential_hash, identity_public_key,
+                            enrolled_at_ms, revoked_at_ms
                      FROM devices WHERE device_id = ?1",
                     params![device_id],
                     device_from_row,
@@ -430,7 +444,8 @@ impl DeviceStore for SqliteStore {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT device_id, owner_id, credential_hash, enrolled_at_ms, revoked_at_ms
+                    "SELECT device_id, owner_id, credential_hash, identity_public_key,
+                            enrolled_at_ms, revoked_at_ms
                      FROM devices WHERE credential_hash = ?1",
                     params![credential_hash],
                     device_from_row,
@@ -483,13 +498,15 @@ impl DeviceStore for SqliteStore {
             connection
                 .execute(
                     "INSERT INTO sessions
-                     (session_id, device_id, owner_id, capability_hash, created_at_ms, expires_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (session_id, device_id, owner_id, capability_hash, client_identity_key,
+                      created_at_ms, expires_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         session.session_id,
                         session.device_id,
                         session.owner_id,
                         session.capability_hash,
+                        session.client_identity_key,
                         session.created_at_ms,
                         session.expires_at_ms
                     ],
@@ -506,24 +523,12 @@ impl DeviceStore for SqliteStore {
         let found = self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT s.session_id, s.device_id, s.owner_id, s.capability_hash,
-                            s.created_at_ms, s.expires_at_ms, s.revoked_at_ms,
-                            d.revoked_at_ms
-                     FROM sessions s JOIN devices d ON d.device_id = s.device_id
-                     WHERE s.session_id = ?1",
+                    &format!("{SESSION_SELECT} WHERE s.session_id = ?1"),
                     params![session_id],
                     |row| {
                         Ok(RelayAuthorization {
-                            session: SessionRecord {
-                                session_id: row.get(0)?,
-                                device_id: row.get(1)?,
-                                owner_id: row.get(2)?,
-                                capability_hash: row.get(3)?,
-                                created_at_ms: row.get(4)?,
-                                expires_at_ms: row.get(5)?,
-                                revoked_at_ms: row.get(6)?,
-                            },
-                            device_revoked: row.get::<_, Option<UnixMs>>(7)?.is_some(),
+                            session: session_from_row(row)?,
+                            device_revoked: row.get::<_, Option<UnixMs>>(9)?.is_some(),
                         })
                     },
                 )
@@ -539,9 +544,7 @@ impl DeviceStore for SqliteStore {
         let found = self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT session_id, device_id, owner_id, capability_hash,
-                            created_at_ms, expires_at_ms, revoked_at_ms
-                     FROM sessions WHERE session_id = ?1",
+                    &format!("{SESSION_SELECT} WHERE s.session_id = ?1"),
                     params![session_id],
                     session_from_row,
                 )
@@ -560,9 +563,7 @@ impl DeviceStore for SqliteStore {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT session_id, device_id, owner_id, capability_hash,
-                            created_at_ms, expires_at_ms, revoked_at_ms
-                     FROM sessions WHERE capability_hash = ?1",
+                    &format!("{SESSION_SELECT} WHERE s.capability_hash = ?1"),
                     params![capability_hash],
                     session_from_row,
                 )
@@ -605,10 +606,16 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
         device_id: row.get(0)?,
         owner_id: row.get(1)?,
         credential_hash: row.get(2)?,
-        enrolled_at_ms: row.get(3)?,
-        revoked_at_ms: row.get(4)?,
+        identity_public_key: row.get(3)?,
+        enrolled_at_ms: row.get(4)?,
+        revoked_at_ms: row.get(5)?,
     })
 }
+
+const SESSION_SELECT: &str = "SELECT s.session_id, s.device_id, s.owner_id, s.capability_hash,
+                                     s.client_identity_key, s.created_at_ms, s.expires_at_ms,
+                                     s.revoked_at_ms, d.identity_public_key, d.revoked_at_ms
+                              FROM sessions s JOIN devices d ON d.device_id = s.device_id";
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -616,10 +623,54 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         device_id: row.get(1)?,
         owner_id: row.get(2)?,
         capability_hash: row.get(3)?,
-        created_at_ms: row.get(4)?,
-        expires_at_ms: row.get(5)?,
-        revoked_at_ms: row.get(6)?,
+        client_identity_key: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        expires_at_ms: row.get(6)?,
+        revoked_at_ms: row.get(7)?,
+        device_identity_key: row.get(8)?,
     })
+}
+
+/// Adds columns introduced after the first schema to an existing database. A database
+/// created by this build already has them; the check makes an upgrade safe rather than
+/// failing with "no such column".
+fn migrate(connection: &Connection) -> Result<(), StoreError> {
+    ensure_column(
+        connection,
+        "devices",
+        "identity_public_key",
+        "ALTER TABLE devices ADD COLUMN identity_public_key TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "client_identity_key",
+        "ALTER TABLE sessions ADD COLUMN client_identity_key TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    statement: &str,
+) -> Result<(), StoreError> {
+    let existing = {
+        let mut probe = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(backend_error)?;
+        probe
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(backend_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend_error)?
+    };
+    if existing.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    connection.execute_batch(statement).map_err(backend_error)?;
+    Ok(())
 }
 
 fn backend_error(error: rusqlite::Error) -> StoreError {

@@ -1,9 +1,12 @@
-//! Bounded, end-to-end encrypted relay.
+//! Bounded relay for end-to-end encrypted traffic.
 //!
 //! The relay forwards opaque PhoneConnect frames between the two peers of an authorized
-//! session. It never decodes a payload for its own purposes, never stores a frame, and
-//! never queues more than [`RelayLimits`] allows. Every rejection is an explicit
-//! [`RelayClose`] so peers can tell backpressure from authorization failure.
+//! session. The peers seal every frame with a key they agreed from their pinned identity
+//! keys (`crates/transport`), so what the relay carries is a routing envelope whose payload
+//! is ciphertext: this process holds only the public identity halves and cannot derive a
+//! traffic key or read a request id, sequence number, deadline, or payload. It never queues
+//! more than [`RelayLimits`] allows, and every rejection is an explicit [`RelayClose`] so
+//! peers can tell backpressure from authorization failure.
 //!
 //! [`authorize_relay`] holds the expiry and revocation rules for opening a session,
 //! `RelaySession::check_live` applies the same rules to an attached session by re-reading
@@ -32,7 +35,7 @@ use tokio::time::Instant;
 
 use crate::AppState;
 use crate::auth::{AuthError, SESSION_CAPABILITY_PREFIX, bearer_token};
-use crate::store::{Clock, DeviceStore, SessionRecord, StoreError, UnixMs};
+use crate::store::{Clock, DeviceStore, RelayAuthorization, SessionRecord, StoreError, UnixMs};
 
 /// Frames a relay direction may hold before it reports backpressure.
 pub const RELAY_MAX_QUEUED_FRAMES: usize = 32;
@@ -49,6 +52,14 @@ pub const RELAY_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// How often a peer blocked on receive re-reads the clock and store, so expiry and
 /// out-of-band revocation end an attached session without waiting for the next frame.
 pub const RELAY_LIVENESS_POLL_MS: u64 = 250;
+
+/// How long a relay session may reuse its last authorization read. The data path runs per
+/// frame, and a SQLite read per frame would serialize every attached peer on one mutex, so
+/// a frame inside this window uses the cached decision. An out-of-band revocation therefore
+/// takes effect within this bound (plus one [`RELAY_LIVENESS_POLL_MS`] for a blocked peer);
+/// revocation that goes through this process's admin surface closes the relay immediately
+/// because the close state is checked before the cache.
+pub const RELAY_AUTHORIZATION_CACHE_MS: u64 = 200;
 
 /// Per-session relay bounds. Nothing is unbounded: queue depth, queue bytes, total bytes,
 /// frame size, and idle time all have a ceiling.
@@ -432,6 +443,13 @@ struct RelaySession {
     to_client: Arc<Direction>,
     used_bytes: AtomicU64,
     closed: watch::Sender<Option<RelayClose>>,
+    authorization: Mutex<Option<CachedAuthorization>>,
+}
+
+/// The last store read for this session, with when it happened.
+struct CachedAuthorization {
+    read_at: std::time::Instant,
+    authorization: RelayAuthorization,
 }
 
 impl RelaySession {
@@ -454,6 +472,7 @@ impl RelaySession {
             to_client: Arc::new(Direction::new(limits)),
             used_bytes: AtomicU64::new(0),
             closed,
+            authorization: Mutex::new(None),
         }
     }
 
@@ -474,24 +493,35 @@ impl RelaySession {
         }
     }
 
-    /// Re-reads the clock and the store. An attached session stops forwarding as soon as
-    /// its expiry passes or its session, or owning device, is revoked. Any refusal closes
-    /// the session so every attached peer learns why.
+    /// Re-reads the clock and, at most once per [`RELAY_AUTHORIZATION_CACHE_MS`], the
+    /// store. An attached session stops forwarding as soon as its expiry passes or its
+    /// session, or owning device, is revoked. Any refusal closes the session so every
+    /// attached peer learns why.
     async fn check_live(&self) -> Result<(), RelayClose> {
         self.check_open()?;
         let now = self.clock.now_ms();
         if now >= self.expires_at_ms.load(Ordering::SeqCst) {
             return Err(self.fail(RelayClose::SessionExpired));
         }
-        let live = match self.store.relay_authorization(&self.session_id).await {
-            Ok(live) => live,
-            Err(StoreError::UnknownSession { .. }) => {
-                return Err(self.fail(RelayClose::UnknownSession));
-            }
-            Err(error) => {
-                return Err(self.fail(RelayClose::StoreUnavailable {
-                    reason: error.to_string(),
-                }));
+        let live = match self.cached_authorization() {
+            Some(live) => live,
+            None => {
+                let live = match self.store.relay_authorization(&self.session_id).await {
+                    Ok(live) => live,
+                    Err(StoreError::UnknownSession { .. }) => {
+                        return Err(self.fail(RelayClose::UnknownSession));
+                    }
+                    Err(error) => {
+                        return Err(self.fail(RelayClose::StoreUnavailable {
+                            reason: error.to_string(),
+                        }));
+                    }
+                };
+                *self.authorization() = Some(CachedAuthorization {
+                    read_at: std::time::Instant::now(),
+                    authorization: live.clone(),
+                });
+                live
             }
         };
         self.refresh_expiry(live.session.expires_at_ms);
@@ -509,12 +539,29 @@ impl RelaySession {
         Ok(())
     }
 
+    fn cached_authorization(&self) -> Option<RelayAuthorization> {
+        self.authorization()
+            .as_ref()
+            .filter(|cached| {
+                cached.read_at.elapsed() < Duration::from_millis(RELAY_AUTHORIZATION_CACHE_MS)
+            })
+            .map(|cached| cached.authorization.clone())
+    }
+
+    fn authorization(&self) -> MutexGuard<'_, Option<CachedAuthorization>> {
+        self.authorization
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn fail(&self, reason: RelayClose) -> RelayClose {
         self.close(reason.clone());
         reason
     }
 
     fn close(&self, reason: RelayClose) {
+        // A close is authoritative from this moment; no cached read may outlive it.
+        *self.authorization() = None;
         // `send_if_modified` records the first reason even when no peer is subscribed yet
         // (`send` would silently drop it) and never overwrites it afterwards.
         self.closed.send_if_modified(|current| match current {

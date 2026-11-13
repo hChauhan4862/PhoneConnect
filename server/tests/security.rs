@@ -765,3 +765,154 @@ async fn candidate_registration_exchanges_the_endpoints_each_peer_reported() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "invalid_endpoint");
 }
+
+#[tokio::test]
+async fn enrollment_pins_an_identity_public_key() {
+    let app = TestApp::new();
+    let token = app.issue_token("user-a").await;
+    let identity = common::TestApp::identity_key();
+
+    let (status, body) = app.enroll_raw_with_identity(&token, &identity).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let device_id = body["device_id"].as_str().expect("device_id");
+    let record = app.store.device(device_id).await.expect("device record");
+    assert_eq!(
+        record.identity_public_key, identity,
+        "the device's identity public key is pinned at enrollment"
+    );
+    assert!(
+        !body.to_string().contains(&identity),
+        "enrollment returns the credential, not a copy of the pinned key"
+    );
+
+    // A missing or malformed key never enrolls: a device without a pinned identity cannot
+    // agree traffic keys later.
+    let token = app.issue_token("user-b").await;
+    let (status, body) = app
+        .request(
+            axum::http::Method::POST,
+            "/api/devices/enroll",
+            None,
+            Some(serde_json::json!({ "token": token })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "identity_key_required");
+
+    let token = app.issue_token("user-c").await;
+    let (status, body) = app.enroll_raw_with_identity(&token, "not-a-key").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_identity_key");
+}
+
+#[tokio::test]
+async fn session_creation_pins_the_client_identity_and_binds_both_keys_into_the_ticket() {
+    let app = TestApp::new();
+    let (device_id, _credential, device_identity) = app.enroll_new_with_identity("user-a").await;
+    let client_identity = common::TestApp::identity_key();
+
+    let (status, session) = app
+        .create_session_with_identity(&device_id, Some(ADMIN_TOKEN), &client_identity)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let record = app.store.session(session_id).await.expect("session record");
+    assert_eq!(record.client_identity_key, client_identity);
+    assert_eq!(record.device_identity_key, device_identity);
+
+    // The ticket binds both public keys, so neither peer can be told a different pair
+    // without the signature failing.
+    assert_eq!(session["ticket"]["own_identity_key"], client_identity);
+    assert_eq!(session["ticket"]["peer_identity_key"], device_identity);
+    let (status, device_ticket) = app.ticket(session_id, &_credential).await;
+    assert_eq!(status, StatusCode::OK, "{device_ticket}");
+    assert_eq!(device_ticket["ticket"]["own_identity_key"], device_identity);
+    assert_eq!(
+        device_ticket["ticket"]["peer_identity_key"],
+        client_identity
+    );
+
+    // Only public halves are persisted: the server never receives identity secrets.
+    let stored = format!("{record:?}");
+    for secret_marker in ["secret", "identity_private"] {
+        assert!(
+            !stored.contains(secret_marker),
+            "the session record must not carry private identity material: {stored}"
+        );
+    }
+
+    let (status, body) = app
+        .create_session_with_identity(&device_id, Some(ADMIN_TOKEN), "not-a-key")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_identity_key");
+
+    let (status, body) = app
+        .request(
+            axum::http::Method::POST,
+            "/api/sessions",
+            Some(ADMIN_TOKEN),
+            Some(serde_json::json!({ "device_id": device_id })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "identity_key_required");
+}
+
+#[tokio::test]
+async fn re_requesting_a_ticket_inside_the_window_still_registers() {
+    let app = TestApp::new();
+    let (device_id, credential, _device_identity) = app.enroll_new_with_identity("user-a").await;
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"].as_str().expect("session_id");
+
+    // First registration redeems the round's nonce for this role.
+    let (_, first) = app.ticket(session_id, &credential).await;
+    let (status, body) = app
+        .register_candidate(
+            session_id,
+            &credential,
+            &first["ticket"],
+            "203.0.113.10:51000",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A peer that lost its ticket re-requests one inside the same 30 s window and must be
+    // able to register again: the recovery path cannot answer `ticket_replayed`.
+    let (_, second) = app.ticket(session_id, &credential).await;
+    assert_ne!(
+        second["ticket"]["nonce"], first["ticket"]["nonce"],
+        "a redeemed nonce starts a new rendezvous round"
+    );
+    let (status, body) = app
+        .register_candidate(
+            session_id,
+            &credential,
+            &second["ticket"],
+            "203.0.113.11:51000",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let observed = body["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|candidate| candidate["kind"] == "server_observed");
+    assert!(
+        observed.is_none(),
+        "the device is not told to probe itself: {body}"
+    );
+
+    // Replaying the *first* ticket is still refused, because its nonce was redeemed.
+    let (status, body) = app
+        .register_candidate(
+            session_id,
+            &credential,
+            &first["ticket"],
+            "203.0.113.12:51000",
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "ticket_replayed");
+}

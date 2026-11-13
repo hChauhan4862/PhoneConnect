@@ -36,6 +36,14 @@ json() {
 echo "building the server and stub images"
 "${COMPOSE[@]}" build server client-stub >/dev/null
 
+echo "generating the pinned identity keys for both stubs"
+CLIENT_IDENTITY=$(docker run --rm phoneconnect-path-stub:dev --generate-identity)
+DEVICE_IDENTITY=$(docker run --rm phoneconnect-path-stub:dev --generate-identity)
+CLIENT_SECRET=$(printf '%s' "$CLIENT_IDENTITY" | sed -n 1p)
+CLIENT_PUBLIC=$(printf '%s' "$CLIENT_IDENTITY" | sed -n 2p)
+DEVICE_SECRET=$(printf '%s' "$DEVICE_IDENTITY" | sed -n 1p)
+DEVICE_PUBLIC=$(printf '%s' "$DEVICE_IDENTITY" | sed -n 2p)
+
 echo "starting the server"
 "${COMPOSE[@]}" up -d --wait server >/dev/null
 
@@ -53,14 +61,14 @@ TOKEN=$(curl -fsS -X POST "$BASE/api/enrollment-tokens" \
 
 ENROLL=$(curl -fsS -X POST "$BASE/api/devices/enroll" \
     -H "Content-Type: application/json" \
-    -d "{\"token\":\"$TOKEN\"}")
+    -d "{\"token\":\"$TOKEN\",\"identity_key\":\"$DEVICE_PUBLIC\"}")
 DEVICE_ID=$(printf '%s' "$ENROLL" | json 'v["device_id"]')
 CREDENTIAL=$(printf '%s' "$ENROLL" | json 'v["credential"]')
 
 SESSION=$(curl -fsS -X POST "$BASE/api/sessions" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"device_id\":\"$DEVICE_ID\"}")
+    -d "{\"device_id\":\"$DEVICE_ID\",\"client_identity_key\":\"$CLIENT_PUBLIC\"}")
 SESSION_ID=$(printf '%s' "$SESSION" | json 'v["session_id"]')
 CAPABILITY=$(printf '%s' "$SESSION" | json 'v["capability"]')
 VERIFICATION_KEY=$(printf '%s' "$SESSION" | json 'v["verification_key"]')
@@ -69,25 +77,22 @@ CLIENT_TICKET=$(printf '%s' "$SESSION" | json 'json.dumps(v["ticket"])')
 DEVICE_TICKET=$(curl -fsS "$BASE/api/sessions/$SESSION_ID/ticket" \
     -H "Authorization: Bearer $CREDENTIAL" | json 'json.dumps(v["ticket"])')
 
-# Both peers see the relay route plus one direct candidate that nothing listens on, which
-# is what a restrictive firewall or symmetric NAT looks like to the probing peer.
-CANDIDATES=$(python3 - "$BASE" "$SESSION_ID" "$VERIFICATION_KEY" "$DEAD_CANDIDATE" <<'PY'
-import json, sys
-base, session_id, verification_key, dead = sys.argv[1:5]
-print(json.dumps({
-    "session_id": session_id,
-    "expires_at": 4102444800000,
-    "verification_key": verification_key,
-    "candidates": [
-        {"kind": "server_observed", "endpoint": dead, "priority": 150},
-        {"kind": "relay", "endpoint": f"{base}/api/sessions/{session_id}/relay", "priority": 100},
-    ],
-}))
-PY
-)
+# Candidate exchange goes through the real rendezvous route: each peer registers the
+# endpoint it observed for itself, redeeming its ticket, and receives the peer's view. The
+# registered address is a dead port on purpose, so direct negotiation must fail and the
+# session must continue over the relay.
+register_candidate() {
+    curl -fsS -X POST "$BASE/api/sessions/$SESSION_ID/candidates" \
+        -H "Authorization: Bearer $1" \
+        -H "Content-Type: application/json" \
+        -d "{\"ticket\":$2,\"endpoint\":\"$DEAD_CANDIDATE\"}"
+}
+
+CLIENT_CANDIDATES=$(register_candidate "$CAPABILITY" "$CLIENT_TICKET")
+DEVICE_CANDIDATES=$(register_candidate "$CREDENTIAL" "$DEVICE_TICKET")
 
 RELAY_URL="ws://server:8080/api/sessions/$SESSION_ID/relay"
-COMMON=(-e "STUB_CANDIDATES=$CANDIDATES" -e "STUB_RELAY_URL=$RELAY_URL" -e "STUB_PAYLOAD=fallback")
+COMMON=(-e "STUB_RELAY_URL=$RELAY_URL" -e "STUB_PAYLOAD=fallback")
 
 echo "starting the Android-side (device) stub"
 "${COMPOSE[@]}" run --rm --no-deps -T \
@@ -95,6 +100,8 @@ echo "starting the Android-side (device) stub"
     -e "STUB_TARGET=android" \
     -e "STUB_TICKET=$DEVICE_TICKET" \
     -e "STUB_BEARER=$CREDENTIAL" \
+    -e "STUB_IDENTITY_KEY=$DEVICE_SECRET" \
+    -e "STUB_CANDIDATES=$DEVICE_CANDIDATES" \
     "${COMMON[@]}" device-stub >"$DEVICE_LOG" 2>&1 &
 DEVICE_PID=$!
 
@@ -105,6 +112,8 @@ set +e
     -e "STUB_TARGET=native" \
     -e "STUB_TICKET=$CLIENT_TICKET" \
     -e "STUB_BEARER=$CAPABILITY" \
+    -e "STUB_IDENTITY_KEY=$CLIENT_SECRET" \
+    -e "STUB_CANDIDATES=$CLIENT_CANDIDATES" \
     "${COMMON[@]}" native-stub >"$CLIENT_LOG" 2>&1
 CLIENT_STATUS=$?
 wait "$DEVICE_PID"

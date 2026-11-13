@@ -529,6 +529,8 @@ async fn relay_authorization_details_are_independently_checkable() {
         device_id: "dev_check".to_owned(),
         owner_id: "user-a".to_owned(),
         capability_hash: "hash".to_owned(),
+        client_identity_key: "client-identity".to_owned(),
+        device_identity_key: "device-identity".to_owned(),
         created_at_ms: 1_000,
         expires_at_ms: 2_000,
         revoked_at_ms: None,
@@ -1316,4 +1318,51 @@ mod transport {
 
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn relay_authorization_is_cached_within_the_poll_bound() {
+    // The data path must not serialize on the store mutex per frame, but revocation must
+    // still take effect within the documented bound. An out-of-band revocation (as another
+    // server instance or an operator tool would perform it) is the strictest case because
+    // nothing local closes the relay.
+    let app = TestApp::new();
+    let (session_id, _capability) = opened_session(&app).await;
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+
+    device
+        .send_frame(&envelope(&session_id, b"warms-the-cache"))
+        .await
+        .expect("first frame authorizes and caches");
+
+    app.store
+        .revoke_session(&session_id, app.now())
+        .await
+        .expect("session revocation persists");
+
+    // Inside the cache window the frame is still accepted: the hot path did not read the
+    // store again, which is the point of the cache.
+    device
+        .send_frame(&envelope(&session_id, b"inside-the-cache-window"))
+        .await
+        .expect("a cached authorization serves the hot path");
+
+    // Past the bound the next frame re-reads the store and stops the relay.
+    tokio::time::sleep(Duration::from_millis(
+        phoneconnect_server::relay::RELAY_AUTHORIZATION_CACHE_MS + 120,
+    ))
+    .await;
+    assert_eq!(
+        device
+            .send_frame(&envelope(&session_id, b"past-the-bound"))
+            .await
+            .err(),
+        Some(RelayClose::SessionRevoked),
+        "revocation takes effect within the poll bound"
+    );
 }

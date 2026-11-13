@@ -6,9 +6,17 @@
 //! opposite role never authenticates. Authentication happens before any sequence is
 //! accepted, and a 64-entry replay window rejects a captured probe, acknowledgement, or
 //! frame instead of validating a path with it.
+//!
+//! One task owns every socket read ([`DirectSocket`]). Probes, acknowledgements, frames,
+//! and switch requests are dispatched by kind, so a concurrent upgrade can never steal the
+//! peer's acknowledgement or drop a data frame: frames always reach the frame queue.
+//!
+//! A direct path pins the peer's address. Frames sent to an address that no longer reaches
+//! the peer are still reported as sent; delivery is confirmed by the peer's frames and by
+//! the switch handshake, never by `send_to` succeeding.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,6 +24,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
+use tokio::sync::{broadcast, mpsc};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -29,6 +38,15 @@ const KEY_LABEL: &[u8] = b"phoneconnect-direct-path-v1";
 /// Largest direct-path frame. A UDP datagram cannot carry more than 65 507 bytes of
 /// payload; larger frames belong on the relay.
 pub const MAX_DIRECT_FRAME_BYTES: usize = 60_000;
+
+/// Frames a direct socket buffers for the reader before it applies backpressure.
+pub const DIRECT_FRAME_QUEUE: usize = 64;
+
+/// Switch/acknowledgement events a direct socket can hold for the path state machine.
+const DIRECT_CONTROL_QUEUE: usize = 16;
+
+/// Acks an in-flight punch can observe.
+const DIRECT_ACK_FANOUT: usize = 64;
 
 /// Which end of the session a peer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,6 +113,12 @@ pub enum HolePunchError {
     Timeout { attempts: u32 },
     #[error("direct path received no authenticated frame before its deadline")]
     ReceiveTimeout,
+    #[error("direct frame of {length} bytes exceeds the {limit}-byte datagram limit")]
+    FrameTooLarge { length: usize, limit: usize },
+    #[error("the peer never confirmed the direct switch")]
+    SwitchUnconfirmed,
+    #[error("direct socket is closed")]
+    Closed,
     #[error("socket operation failed: {reason}")]
     Io { reason: String },
 }
@@ -179,13 +203,19 @@ pub enum ProbePacket {
     /// An acknowledgement. `seq` is the acknowledger's own counter and `echo` is the probe
     /// it answers, so acknowledgements never share a sequence space with probes.
     Ack { seq: u32, echo: u32 },
-    /// One framed PhoneConnect envelope.
+    /// One sealed PhoneConnect frame.
     Frame { seq: u32, payload: Vec<u8> },
+    /// "I validated this path; commit to it."
+    Switch { seq: u32 },
+    /// "I validated this path too; both sides may commit."
+    SwitchAck { seq: u32, echo: u32 },
 }
 
 const KIND_PROBE: u8 = 1;
 const KIND_ACK: u8 = 2;
 const KIND_FRAME: u8 = 3;
+const KIND_SWITCH: u8 = 4;
+const KIND_SWITCH_ACK: u8 = 5;
 
 impl ProbePacket {
     pub fn probe(seq: u32) -> Self {
@@ -198,14 +228,29 @@ impl ProbePacket {
 
     pub fn frame(seq: u32, payload: Vec<u8>) -> Result<Self, HolePunchError> {
         if payload.len() > MAX_DIRECT_FRAME_BYTES {
-            return Err(HolePunchError::Malformed);
+            return Err(HolePunchError::FrameTooLarge {
+                length: payload.len(),
+                limit: MAX_DIRECT_FRAME_BYTES,
+            });
         }
         Ok(Self::Frame { seq, payload })
     }
 
+    pub fn switch(seq: u32) -> Self {
+        Self::Switch { seq }
+    }
+
+    pub fn switch_ack(seq: u32, echo: u32) -> Self {
+        Self::SwitchAck { seq, echo }
+    }
+
     pub fn seq(&self) -> u32 {
         match self {
-            Self::Probe { seq } | Self::Ack { seq, .. } | Self::Frame { seq, .. } => *seq,
+            Self::Probe { seq }
+            | Self::Ack { seq, .. }
+            | Self::Frame { seq, .. }
+            | Self::Switch { seq }
+            | Self::SwitchAck { seq, .. } => *seq,
         }
     }
 
@@ -215,6 +260,8 @@ impl ProbePacket {
             Self::Probe { .. } => (KIND_PROBE, Vec::new()),
             Self::Ack { echo, .. } => (KIND_ACK, echo.to_be_bytes().to_vec()),
             Self::Frame { payload, .. } => (KIND_FRAME, payload.clone()),
+            Self::Switch { .. } => (KIND_SWITCH, Vec::new()),
+            Self::SwitchAck { echo, .. } => (KIND_SWITCH_ACK, echo.to_be_bytes().to_vec()),
         };
         let mut datagram = Vec::with_capacity(HEADER_LEN + body.len() + MAC_LEN);
         datagram.extend_from_slice(MAGIC);
@@ -264,12 +311,15 @@ impl ProbePacket {
         mac.verify_slice(&datagram[HEADER_LEN + body_len..])
             .map_err(|_| HolePunchError::Unauthenticated)?;
 
+        let echo = || -> Result<u32, HolePunchError> {
+            if body.len() != 4 {
+                return Err(HolePunchError::Malformed);
+            }
+            Ok(u32::from_be_bytes([body[0], body[1], body[2], body[3]]))
+        };
         match kind {
             KIND_PROBE if body.is_empty() => Ok(Self::Probe { seq }),
-            KIND_ACK if body.len() == 4 => Ok(Self::Ack {
-                seq,
-                echo: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
-            }),
+            KIND_ACK => Ok(Self::Ack { seq, echo: echo()? }),
             KIND_FRAME => {
                 if body.is_empty() {
                     return Err(HolePunchError::Malformed);
@@ -279,6 +329,8 @@ impl ProbePacket {
                     payload: body.to_vec(),
                 })
             }
+            KIND_SWITCH if body.is_empty() => Ok(Self::Switch { seq }),
+            KIND_SWITCH_ACK => Ok(Self::SwitchAck { seq, echo: echo()? }),
             _ => Err(HolePunchError::Malformed),
         }
     }
@@ -359,26 +411,6 @@ impl ProbeAuthenticator {
     }
 }
 
-/// A validated direct path: the socket, the peer, the authenticator, and the outbound
-/// sequence counter. Probing and framed traffic share one sequence space, so a probe
-/// captured from the handshake can never be replayed as a frame.
-pub struct HolePuncher {
-    socket: Arc<UdpSocket>,
-    credentials: ProbeCredentials,
-    authenticator: ProbeAuthenticator,
-    seq: AtomicU32,
-}
-
-impl std::fmt::Debug for HolePuncher {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("HolePuncher")
-            .field("session_id", &self.credentials.session_id)
-            .field("role", &self.credentials.role)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Outcome of a successful hole punch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HolePunchOutcome {
@@ -386,18 +418,297 @@ pub struct HolePunchOutcome {
     pub rtt: Duration,
 }
 
-impl HolePuncher {
-    pub fn new(socket: Arc<UdpSocket>, credentials: ProbeCredentials) -> Self {
-        Self {
+/// Control traffic the path state machine has to see for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectEvent {
+    /// The peer validated the path and asks to commit to it.
+    Switch { from: SocketAddr, echo: u32 },
+    /// The peer confirmed our switch request.
+    SwitchAck { from: SocketAddr, echo: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AckEvent {
+    from: SocketAddr,
+    echo: u32,
+}
+
+struct DirectInner {
+    socket: Arc<UdpSocket>,
+    credentials: ProbeCredentials,
+    authenticator: ProbeAuthenticator,
+    seq: AtomicU32,
+    peer: Mutex<Option<SocketAddr>>,
+    acks: broadcast::Sender<AckEvent>,
+    events: broadcast::Sender<DirectEvent>,
+    frames: mpsc::Sender<Vec<u8>>,
+    closed: AtomicBool,
+}
+
+/// One authenticated UDP socket, with exactly one task reading it.
+///
+/// The reader owns `recv_from`; `punch`, `send_frame`, and `recv_frame` only ever wait on
+/// queues the reader feeds. That is what makes a concurrent upgrade safe: an
+/// acknowledgement cannot be stolen by the data path, and a data frame that arrives while
+/// a punch is running is queued rather than discarded.
+pub struct DirectSocket {
+    inner: Arc<DirectInner>,
+    frames: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    responder: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for DirectSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectSocket")
+            .field("session_id", &self.inner.credentials.session_id)
+            .field("role", &self.inner.credentials.role)
+            .field("peer", &self.peer())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirectSocket {
+    /// Starts the single reader for `socket`. The reader lives until the socket errors or
+    /// every handle is dropped.
+    pub async fn open(
+        socket: Arc<UdpSocket>,
+        credentials: ProbeCredentials,
+    ) -> Result<Self, HolePunchError> {
+        let (acks, _) = broadcast::channel(DIRECT_ACK_FANOUT);
+        let (events, _) = broadcast::channel(DIRECT_CONTROL_QUEUE);
+        let (frames, frame_receiver) = mpsc::channel(DIRECT_FRAME_QUEUE);
+        let inner = Arc::new(DirectInner {
             socket,
             authenticator: ProbeAuthenticator::new(&credentials),
             credentials,
             seq: AtomicU32::new(0),
-        }
+            peer: Mutex::new(None),
+            acks,
+            events,
+            frames,
+            closed: AtomicBool::new(false),
+        });
+        let reader = tokio::spawn(read_loop(Arc::clone(&inner)));
+        let responder = tokio::spawn(switch_responder(Arc::clone(&inner)));
+        Ok(Self {
+            inner,
+            frames: tokio::sync::Mutex::new(frame_receiver),
+            reader: Mutex::new(Some(reader)),
+            responder,
+        })
     }
 
     pub fn credentials(&self) -> &ProbeCredentials {
-        &self.credentials
+        &self.inner.credentials
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, HolePunchError> {
+        self.inner
+            .socket
+            .local_addr()
+            .map_err(|error| HolePunchError::Io {
+                reason: error.to_string(),
+            })
+    }
+
+    /// The validated peer, once a punch succeeded.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        *self.inner.peer()
+    }
+
+    fn set_peer(&self, peer: SocketAddr) {
+        *self.inner.peer() = Some(peer);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Stops the reader and the switch responder. Idempotent.
+    pub fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        if let Some(reader) = self
+            .reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            reader.abort();
+        }
+        self.responder.abort();
+    }
+
+    pub fn next_seq(&self) -> Result<u32, HolePunchError> {
+        self.inner.next_seq()
+    }
+
+    /// Probes every direct candidate until one returns an authenticated acknowledgement.
+    ///
+    /// Each attempt sends one probe per candidate and waits at most
+    /// `config.attempt_timeout`; after `config.max_attempts` the exchange fails with
+    /// [`HolePunchError::Timeout`]. Probes from the peer are acknowledged by the reader, so
+    /// the opposite peer validates the path too.
+    pub async fn punch(
+        &self,
+        candidates: &[SocketAddr],
+        config: ProbeConfig,
+    ) -> Result<HolePunchOutcome, HolePunchError> {
+        if candidates.is_empty() {
+            return Err(HolePunchError::Timeout { attempts: 0 });
+        }
+        let mut acks = self.inner.acks.subscribe();
+        let mut attempts = 0;
+        for _ in 0..config.max_attempts {
+            attempts += 1;
+            let seq = self.inner.next_seq()?;
+            let probe = ProbePacket::probe(seq).encode(&self.inner.credentials);
+            let sent_at = Instant::now();
+            for candidate in candidates {
+                self.inner.send_datagram(&probe, *candidate).await?;
+            }
+
+            let deadline = sent_at + config.attempt_timeout;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(deadline - now, acks.recv()).await {
+                    Ok(Ok(event)) if event.echo == seq && candidates.contains(&event.from) => {
+                        self.set_peer(event.from);
+                        return Ok(HolePunchOutcome {
+                            peer: event.from,
+                            rtt: sent_at.elapsed(),
+                        });
+                    }
+                    Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    _ => break,
+                }
+            }
+        }
+        Err(HolePunchError::Timeout { attempts })
+    }
+
+    /// Commits both peers to this path.
+    ///
+    /// The caller has already validated the path locally. It asks the peer to commit and
+    /// waits for the peer's confirmation, re-sending on a bounded retry schedule. A peer
+    /// that has not validated the path never confirms, so a one-sided punch leaves both
+    /// sides on the relay instead of black-holing frames on a path only one side uses.
+    pub async fn negotiate_switch(
+        &self,
+        peer: SocketAddr,
+        config: SwitchConfig,
+    ) -> Result<(), HolePunchError> {
+        let mut events = self.inner.events.subscribe();
+        let deadline = Instant::now() + config.total_timeout();
+        let mut next_request = Instant::now();
+        let mut pending: Option<u32> = None;
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(HolePunchError::SwitchUnconfirmed);
+            }
+            // Re-ask on the retry schedule: the peer may still be validating when the first
+            // request arrives, and a request it ignored is not a refusal.
+            if now >= next_request {
+                let seq = self.inner.next_seq()?;
+                self.inner
+                    .send_datagram(
+                        &ProbePacket::switch(seq).encode(&self.inner.credentials),
+                        peer,
+                    )
+                    .await?;
+                pending = Some(seq);
+                next_request = now + config.retry_interval();
+            }
+
+            let wake_at = next_request.min(deadline);
+            let remaining = wake_at.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(DirectEvent::Switch { from, echo })) => {
+                    // Both peers may ask at once; answer while waiting for our own answer.
+                    let _ = self.accept_switch_if_validated(from, echo).await;
+                }
+                Ok(Ok(DirectEvent::SwitchAck { from, echo }))
+                    if from == peer && pending == Some(echo) =>
+                {
+                    return Ok(());
+                }
+                Ok(Ok(DirectEvent::SwitchAck { .. })) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(HolePunchError::Closed);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Answers a peer's switch request, but only from the validated peer. An unvalidated
+    /// peer stays silent, which is what makes the handshake two-sided.
+    async fn accept_switch_if_validated(
+        &self,
+        from: SocketAddr,
+        echo: u32,
+    ) -> Result<(), HolePunchError> {
+        if *self.inner.peer() != Some(from) {
+            return Ok(());
+        }
+        let seq = self.inner.next_seq()?;
+        self.inner
+            .send_datagram(
+                &ProbePacket::switch_ack(seq, echo).encode(&self.inner.credentials),
+                from,
+            )
+            .await
+    }
+
+    /// Acknowledges a peer's switch request after the local path state machine decided the
+    /// peer is validated.
+    pub async fn accept_switch(&self, from: SocketAddr, echo: u32) -> Result<(), HolePunchError> {
+        self.accept_switch_if_validated(from, echo).await
+    }
+
+    /// Sends one sealed (already encrypted) frame to the validated peer.
+    pub async fn send_frame(&self, peer: SocketAddr, sealed: &[u8]) -> Result<(), HolePunchError> {
+        let packet = ProbePacket::frame(self.inner.next_seq()?, sealed.to_vec())?;
+        self.inner
+            .send_datagram(&packet.encode(&self.inner.credentials), peer)
+            .await
+    }
+
+    /// Waits for one sealed frame from the validated peer. Probing and switch traffic never
+    /// appears here, and a replay or a failed tag never surfaces as data.
+    pub async fn recv_frame(&self, timeout: Duration) -> Result<Vec<u8>, HolePunchError> {
+        let mut frames = self.frames.lock().await;
+        match tokio::time::timeout(timeout, frames.recv()).await {
+            Ok(Some(frame)) => {
+                if self.inner.closed.load(Ordering::SeqCst) && frame.is_empty() {
+                    return Err(HolePunchError::Closed);
+                }
+                Ok(frame)
+            }
+            Ok(None) => Err(HolePunchError::Closed),
+            Err(_) => Err(HolePunchError::ReceiveTimeout),
+        }
+    }
+}
+
+impl Drop for DirectSocket {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl DirectInner {
+    fn peer(&self) -> MutexGuard<'_, Option<SocketAddr>> {
+        self.peer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn next_seq(&self) -> Result<u32, HolePunchError> {
@@ -416,114 +727,6 @@ impl HolePuncher {
         }
     }
 
-    /// Probes every direct candidate until one returns an authenticated acknowledgement.
-    ///
-    /// Each attempt sends one probe per candidate and waits at most
-    /// `config.attempt_timeout`; after `config.max_attempts` the exchange fails with
-    /// [`HolePunchError::Timeout`]. Authenticated probes from the peer are acknowledged
-    /// immediately, so the opposite peer validates the path too.
-    pub async fn punch(
-        &self,
-        candidates: &[SocketAddr],
-        config: ProbeConfig,
-    ) -> Result<HolePunchOutcome, HolePunchError> {
-        if candidates.is_empty() {
-            return Err(HolePunchError::Timeout { attempts: 0 });
-        }
-        let mut buffered = vec![0u8; 65_535];
-        let mut attempts = 0;
-        for _ in 0..config.max_attempts {
-            attempts += 1;
-            let seq = self.next_seq()?;
-            let probe = ProbePacket::probe(seq).encode(&self.credentials);
-            let sent_at = Instant::now();
-            for candidate in candidates {
-                self.send_datagram(&probe, *candidate).await?;
-            }
-
-            let deadline = sent_at + config.attempt_timeout;
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let remaining = deadline - now;
-                let received =
-                    tokio::time::timeout(remaining, self.socket.recv_from(&mut buffered)).await;
-                let Ok(Ok((length, from))) = received else {
-                    break;
-                };
-                if !candidates.contains(&from) {
-                    continue;
-                }
-                match self.authenticator.accept(&buffered[..length]) {
-                    Ok(ProbePacket::Ack { echo, .. }) if echo == seq => {
-                        return Ok(HolePunchOutcome {
-                            peer: from,
-                            rtt: sent_at.elapsed(),
-                        });
-                    }
-                    Ok(ProbePacket::Probe { seq: peer_seq }) => {
-                        let ack =
-                            ProbePacket::ack(self.next_seq()?, peer_seq).encode(&self.credentials);
-                        self.send_datagram(&ack, from).await?;
-                    }
-                    Ok(_) => {}
-                    Err(HolePunchError::Replayed | HolePunchError::Unauthenticated) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        Err(HolePunchError::Timeout { attempts })
-    }
-
-    /// Sends one framed envelope to the validated peer.
-    pub async fn send_frame(&self, peer: SocketAddr, frame: &[u8]) -> Result<(), HolePunchError> {
-        let seq = self.next_seq()?;
-        let packet = ProbePacket::Frame {
-            seq,
-            payload: frame.to_vec(),
-        }
-        .encode(&self.credentials);
-        self.send_datagram(&packet, peer).await
-    }
-
-    /// Waits for one authenticated frame from `peer`. Probes, acknowledgements, and
-    /// datagrams from any other address are ignored; a replay or a failed tag never
-    /// surfaces as data.
-    pub async fn recv_frame(
-        &self,
-        peer: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Vec<u8>, HolePunchError> {
-        let mut buffered = vec![0u8; 65_535];
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(HolePunchError::ReceiveTimeout);
-            }
-            let received =
-                tokio::time::timeout(deadline - now, self.socket.recv_from(&mut buffered)).await;
-            let Ok(Ok((length, from))) = received else {
-                return Err(HolePunchError::ReceiveTimeout);
-            };
-            if from != peer {
-                continue;
-            }
-            match self.authenticator.accept(&buffered[..length]) {
-                Ok(ProbePacket::Frame { payload, .. }) => return Ok(payload),
-                Ok(ProbePacket::Probe { seq }) => {
-                    let ack = ProbePacket::ack(self.next_seq()?, seq).encode(&self.credentials);
-                    self.send_datagram(&ack, from).await?;
-                }
-                Ok(ProbePacket::Ack { .. }) => {}
-                Err(HolePunchError::Replayed | HolePunchError::Unauthenticated) => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     async fn send_datagram(&self, datagram: &[u8], to: SocketAddr) -> Result<(), HolePunchError> {
         self.socket
             .send_to(datagram, to)
@@ -532,5 +735,111 @@ impl HolePuncher {
             .map_err(|error| HolePunchError::Io {
                 reason: error.to_string(),
             })
+    }
+}
+
+/// Bounded switch confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchConfig {
+    pub retries: u32,
+    pub timeout: Duration,
+}
+
+impl Default for SwitchConfig {
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            timeout: Duration::from_millis(150),
+        }
+    }
+}
+
+impl SwitchConfig {
+    /// Whole handshake deadline, including every retry.
+    pub fn total_timeout(&self) -> Duration {
+        self.timeout.saturating_mul(self.retries.max(1))
+    }
+
+    /// Delay between the first request and a retry.
+    pub fn retry_interval(&self) -> Duration {
+        self.timeout
+    }
+}
+
+/// Answers the peer's switch request once this side has validated the path.
+///
+/// It runs for the life of the socket, so a peer that asks to switch while the path is
+/// carrying frames still gets an answer; an unvalidated peer never answers, which is what
+/// keeps the handshake two-sided.
+async fn switch_responder(inner: Arc<DirectInner>) {
+    let mut events = inner.events.subscribe();
+    loop {
+        match events.recv().await {
+            Ok(DirectEvent::Switch { from, echo }) => {
+                if *inner.peer() != Some(from) {
+                    continue;
+                }
+                if let Ok(seq) = inner.next_seq() {
+                    let ack = ProbePacket::switch_ack(seq, echo).encode(&inner.credentials);
+                    let _ = inner.socket.send_to(&ack, from).await;
+                }
+            }
+            Ok(DirectEvent::SwitchAck { .. }) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        if inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+}
+
+/// The only reader of the direct socket.
+///
+/// Authenticate before dispatch, and never let a probe or acknowledgement consume a frame:
+/// each kind has one destination.
+async fn read_loop(inner: Arc<DirectInner>) {
+    let mut buffer = vec![0u8; 65_535];
+    loop {
+        let received = inner.socket.recv_from(&mut buffer).await;
+        let (length, from) = match received {
+            Ok(received) => received,
+            Err(_) => {
+                inner.closed.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        match inner.authenticator.accept(&buffer[..length]) {
+            Ok(ProbePacket::Probe { seq }) => {
+                let ack = inner
+                    .next_seq()
+                    .map(|own| ProbePacket::ack(own, seq).encode(&inner.credentials));
+                if let Ok(ack) = ack {
+                    let _ = inner.socket.send_to(&ack, from).await;
+                }
+            }
+            Ok(ProbePacket::Ack { echo, .. }) => {
+                let _ = inner.acks.send(AckEvent { from, echo });
+            }
+            Ok(ProbePacket::Switch { seq }) => {
+                let _ = inner.events.send(DirectEvent::Switch { from, echo: seq });
+            }
+            Ok(ProbePacket::SwitchAck { echo, .. }) => {
+                let _ = inner.events.send(DirectEvent::SwitchAck { from, echo });
+            }
+            Ok(ProbePacket::Frame { payload, .. }) => {
+                let known = *inner.peer() == Some(from);
+                if !known {
+                    continue;
+                }
+                // Backpressure, not a silent drop: a full queue stalls the reader rather
+                // than discarding a frame the session already handed to the path.
+                if inner.frames.send(payload).await.is_err() {
+                    return;
+                }
+            }
+            Err(HolePunchError::Replayed | HolePunchError::Unauthenticated) => {}
+            Err(_) => {}
+        }
     }
 }

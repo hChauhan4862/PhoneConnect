@@ -1,12 +1,20 @@
-//! Candidate probing, path selection, and migration.
+//! Candidate probing, path selection, migration, and per-frame encryption.
 //!
-//! [`PathController::connect`] verifies the rendezvous ticket, tries every direct
-//! candidate with bounded authenticated probes, and compares the validated direct
-//! round-trip against the relay. The winner becomes the [`ConnectedPath`], which keeps
-//! carrying the same session and request ids either way. When the relay wins first,
-//! [`ConnectedPath::try_upgrade`] repeats negotiation and moves the same path to a direct
-//! channel, leaving the relay attached as the fallback. A migration never closes the
-//! relay session: a close is final for the session's lifetime.
+//! [`PathController::connect`] verifies the signed rendezvous ticket, agrees a traffic key
+//! from the two pinned identity keys, probes direct candidates with bounded authenticated
+//! datagrams, and commits to a path only after the peer confirms it. The winner becomes the
+//! [`ConnectedPath`], which seals every frame with the session cipher before either the
+//! direct path or the relay sees it and keeps the same session and request ids either way.
+//!
+//! When the relay wins first, [`ConnectedPath::upgrade_with`] repeats negotiation with the
+//! caller's fresh ticket and moves the same path to a direct channel, leaving the relay
+//! attached as the fallback. A migration never closes the relay session: a close is final
+//! for the session's lifetime, and fallback must not need a new session.
+//!
+//! A direct path pins the peer's address for this milestone. `send_to` succeeding is not
+//! delivery: a peer that moved behind a new NAT mapping is only detected by the absence of
+//! its frames, so callers must treat the direct path as best-effort until the reconnect
+//! work renegotiates it.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -18,16 +26,18 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use phoneconnect::v1::{
-    Envelope, FrameLimits, ProtocolError, SessionId, decode_frame, encode_frame,
+    DeviceId, Envelope, FrameLimits, ProtocolError, RequestId, SessionId, decode_frame,
+    encode_frame,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
+use crate::aead::{AeadError, IdentityKey, IdentityPublicKey, SealedHeader, SessionCipher};
 use crate::candidates::{CandidateError, CandidateSet};
 use crate::hole_punch::{
-    HolePunchError, HolePunchOutcome, HolePuncher, MAX_DIRECT_FRAME_BYTES, ProbeConfig,
-    ProbeCredentials, TicketRole,
+    DirectSocket, HolePunchError, HolePunchOutcome, MAX_DIRECT_FRAME_BYTES, ProbeConfig,
+    ProbeCredentials, SwitchConfig, TicketRole,
 };
 
 /// Label of the canonical ticket signature payload. Changing it invalidates old tickets.
@@ -35,18 +45,34 @@ const TICKET_LABEL: &[u8] = b"phoneconnect-rendezvous-ticket-v1\n";
 
 /// Server-issued, short-lived rendezvous ticket.
 ///
-/// The signature covers the session, device, role, nonce, probe key, and expiry, so no
-/// field can be changed without failing verification. Both peers present the same nonce;
-/// it is what binds the direct-path key material to one rendezvous attempt.
+/// The signature covers the session, device, role, nonce, probe key, both pinned identity
+/// keys, and the expiry, so no field can be changed without failing verification. Both
+/// peers present the same nonce; it is what binds the direct-path key material to one
+/// rendezvous attempt. Frame encryption keys are agreed between the identity keys and are
+/// never derived from anything the server mints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ticket {
     pub session_id: String,
     pub device_id: String,
     pub role: TicketRole,
     pub nonce: String,
+    /// Server-issued key that authenticates hole-punch datagrams only.
     pub probe_key: String,
+    /// This peer's X25519 identity public key, as pinned outside the session.
+    pub own_identity_key: String,
+    /// The opposite peer's X25519 identity public key.
+    pub peer_identity_key: String,
     pub expires_at: i64,
     pub signature: String,
+}
+
+/// Everything a verified ticket grants: probe credentials for the direct path and the
+/// pinned peer identity that frame encryption is agreed with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTicket {
+    pub credentials: ProbeCredentials,
+    pub own_identity_key: IdentityPublicKey,
+    pub peer_identity_key: IdentityPublicKey,
 }
 
 /// Ticket verification failures. Nothing degrades into "assume trusted".
@@ -58,6 +84,10 @@ pub enum TicketError {
     InvalidSignature,
     #[error("ticket probe key is not a 32-byte key")]
     InvalidProbeKey,
+    #[error("ticket identity key is invalid: {reason}")]
+    InvalidIdentityKey { reason: String },
+    #[error("ticket is for identity {found}, not the local identity {expected}")]
+    IdentityMismatch { found: String, expected: String },
     #[error("ticket expired at {expires_at}")]
     Expired { expires_at: i64 },
     #[error("ticket is for session {found}, not {expected}")]
@@ -68,27 +98,22 @@ pub enum TicketError {
 
 impl Ticket {
     /// Canonical bytes the server signs. Both sides must agree byte for byte.
-    fn signing_payload(
-        session_id: &str,
-        device_id: &str,
-        role: TicketRole,
-        nonce: &str,
-        probe_key: &str,
-        expires_at: i64,
-    ) -> Vec<u8> {
-        let role = match role {
+    fn signing_payload(&self) -> Vec<u8> {
+        let role = match self.role {
             TicketRole::Client => "client",
             TicketRole::Device => "device",
         };
         let mut payload = Vec::new();
         payload.extend_from_slice(TICKET_LABEL);
         for field in [
-            session_id,
-            device_id,
+            self.session_id.as_str(),
+            self.device_id.as_str(),
             role,
-            nonce,
-            probe_key,
-            &expires_at.to_string(),
+            self.nonce.as_str(),
+            self.probe_key.as_str(),
+            self.own_identity_key.as_str(),
+            self.peer_identity_key.as_str(),
+            &self.expires_at.to_string(),
         ] {
             payload.extend_from_slice(field.as_bytes());
             payload.push(b'\n');
@@ -96,14 +121,14 @@ impl Ticket {
         payload
     }
 
-    /// Verifies the server signature and expiry, then returns the direct-path key
-    /// material. A ticket the caller has no key for, a tampered ticket, and an expired
-    /// ticket are all refused before a candidate is probed.
+    /// Verifies the server signature and expiry, then returns the direct-path credentials
+    /// and the pinned peer identity. A ticket the caller has no key for, a tampered
+    /// ticket, and an expired ticket are all refused before a candidate is probed.
     pub fn verify(
         &self,
         verification_key: &str,
         now_ms: i64,
-    ) -> Result<ProbeCredentials, TicketError> {
+    ) -> Result<VerifiedTicket, TicketError> {
         let key_bytes = decode_hex::<32>(verification_key).ok_or_else(|| {
             TicketError::InvalidVerificationKey {
                 key: verification_key.to_owned(),
@@ -118,14 +143,7 @@ impl Ticket {
             decode_hex::<64>(&self.signature).ok_or(TicketError::InvalidSignature)?;
         let signature = Signature::from_bytes(&signature_bytes);
 
-        let payload = Self::signing_payload(
-            &self.session_id,
-            &self.device_id,
-            self.role,
-            &self.nonce,
-            &self.probe_key,
-            self.expires_at,
-        );
+        let payload = self.signing_payload();
         verifying_key
             .verify_strict(&payload, &signature)
             .map_err(|_| TicketError::InvalidSignature)?;
@@ -146,15 +164,33 @@ impl Ticket {
         if probe_key.len() != 32 || self.nonce.is_empty() {
             return Err(TicketError::InvalidProbeKey);
         }
+        let own_identity_key =
+            IdentityPublicKey::parse(&self.own_identity_key).map_err(|error| {
+                TicketError::InvalidIdentityKey {
+                    reason: error.to_string(),
+                }
+            })?;
+        let peer_identity_key =
+            IdentityPublicKey::parse(&self.peer_identity_key).map_err(|error| {
+                TicketError::InvalidIdentityKey {
+                    reason: error.to_string(),
+                }
+            })?;
 
-        ProbeCredentials::new(
+        let credentials = ProbeCredentials::new(
             self.session_id.clone(),
             self.role,
             self.nonce.clone(),
             probe_key,
             self.expires_at,
         )
-        .map_err(|_| TicketError::InvalidProbeKey)
+        .map_err(|_| TicketError::InvalidProbeKey)?;
+
+        Ok(VerifiedTicket {
+            credentials,
+            own_identity_key,
+            peer_identity_key,
+        })
     }
 
     /// Refuses a ticket issued for another session before its key material is used.
@@ -232,8 +268,8 @@ pub trait RelayChannel: Send + Sync {
     async fn recv_frame(&self) -> Result<Vec<u8>, RelayError>;
     async fn close(&self) -> Result<(), RelayError>;
 
-    /// Measured or configured relay round-trip time, when the transport knows one. It is
-    /// only used to choose between a validated direct path and the relay.
+    /// Measured relay round-trip time. `None` means no measurement exists yet; selection
+    /// then uses [`PathConfig::relay_latency_estimate`] as an upper bound.
     fn latency(&self) -> Option<Duration> {
         None
     }
@@ -244,13 +280,15 @@ pub trait RelayChannel: Send + Sync {
 pub struct PathConfig {
     /// Bounded direct negotiation.
     pub probe: ProbeConfig,
+    /// Bounded switch confirmation.
+    pub switch: SwitchConfig,
     /// Frame profile. Control paths must use [`FrameLimits::control_only`].
     pub frame_limits: FrameLimits,
-    /// Largest frame the direct datagram path accepts.
+    /// Largest sealed frame the direct datagram path accepts.
     pub direct_frame_limit: usize,
     /// How long a receive waits before reporting a deadline.
     pub recv_timeout: Duration,
-    /// Relay round-trip estimate used when the relay transport reports none.
+    /// Relay round trip used only when the relay transport has no measurement.
     pub relay_latency_estimate: Duration,
 }
 
@@ -258,6 +296,7 @@ impl Default for PathConfig {
     fn default() -> Self {
         Self {
             probe: ProbeConfig::default(),
+            switch: SwitchConfig::default(),
             frame_limits: FrameLimits::control_only(),
             direct_frame_limit: MAX_DIRECT_FRAME_BYTES,
             recv_timeout: Duration::from_secs(5),
@@ -266,9 +305,41 @@ impl Default for PathConfig {
     }
 }
 
+impl PathConfig {
+    /// Refuses a configuration that cannot carry frames. A zero or oversized direct limit
+    /// would fail on the first frame instead of at configuration time.
+    pub fn validate(&self) -> Result<(), PathError> {
+        if self.direct_frame_limit == 0 || self.direct_frame_limit > MAX_DIRECT_FRAME_BYTES {
+            return Err(PathError::InvalidConfig {
+                reason: format!(
+                    "direct_frame_limit must be between 1 and {MAX_DIRECT_FRAME_BYTES}, got {}",
+                    self.direct_frame_limit
+                ),
+            });
+        }
+        if self.probe.max_attempts == 0 {
+            return Err(PathError::InvalidConfig {
+                reason: "probe.max_attempts must be at least 1".to_owned(),
+            });
+        }
+        if self.switch.retries == 0 || self.switch.timeout.is_zero() {
+            return Err(PathError::InvalidConfig {
+                reason: "switch retries and timeout must be non-zero".to_owned(),
+            });
+        }
+        if self.recv_timeout.is_zero() {
+            return Err(PathError::InvalidConfig {
+                reason: "recv_timeout must be non-zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Everything a path needs besides the ticket and candidates.
 pub struct PathSetup {
     socket: Arc<UdpSocket>,
+    identity: IdentityKey,
     relay: Option<Arc<dyn RelayChannel>>,
     config: PathConfig,
     now_ms: i64,
@@ -279,6 +350,7 @@ impl fmt::Debug for PathSetup {
         formatter
             .debug_struct("PathSetup")
             .field("relay", &self.relay.is_some())
+            .field("identity", &self.identity)
             .field("config", &self.config)
             .field("now_ms", &self.now_ms)
             .finish_non_exhaustive()
@@ -286,9 +358,11 @@ impl fmt::Debug for PathSetup {
 }
 
 impl PathSetup {
-    pub fn new(socket: Arc<UdpSocket>) -> Self {
+    /// `identity` is the peer's own X25519 identity key. It never leaves the peer.
+    pub fn new(socket: Arc<UdpSocket>, identity: IdentityKey) -> Self {
         Self {
             socket,
+            identity,
             relay: None,
             config: PathConfig::default(),
             now_ms: unix_ms(),
@@ -323,10 +397,12 @@ pub enum PathError {
     Ticket(#[from] TicketError),
     #[error(transparent)]
     Candidate(#[from] CandidateError),
+    #[error(transparent)]
+    Aead(#[from] AeadError),
     #[error("no direct candidate and no relay are available for this session")]
     NoPath,
     #[error(transparent)]
-    HolePunch(#[from] HolePunchError),
+    HolePunch(HolePunchError),
     /// Terminal for this session id: create a new session instead of retrying.
     #[error("relay is unavailable for this session; create a new session before retrying")]
     RelayUnavailable,
@@ -334,6 +410,8 @@ pub enum PathError {
     Relay(RelayError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    #[error("invalid path configuration: {reason}")]
+    InvalidConfig { reason: String },
     #[error("direct frame of {length} bytes exceeds the {limit}-byte datagram limit")]
     DirectFrameTooLarge { length: usize, limit: usize },
     #[error("path is shut down")]
@@ -349,20 +427,38 @@ impl From<RelayError> for PathError {
     }
 }
 
-impl PathError {
-    /// True when retrying on the same session id can never succeed.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::RelayUnavailable | Self::Ticket(TicketError::Expired { .. })
-        )
+impl From<HolePunchError> for PathError {
+    fn from(error: HolePunchError) -> Self {
+        match error {
+            HolePunchError::FrameTooLarge { length, limit } => {
+                Self::DirectFrameTooLarge { length, limit }
+            }
+            other => Self::HolePunch(other),
+        }
     }
 }
 
-struct DirectPath {
-    puncher: Arc<HolePuncher>,
+impl PathError {
+    /// True when retrying on the same session id can never succeed.
+    ///
+    /// An expired ticket is deliberately **not** terminal: tickets are renewable, and a
+    /// caller that held a healthy session for longer than the ticket window refreshes it and
+    /// calls `upgrade_with` again instead of tearing the session down.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::RelayUnavailable)
+    }
+}
+
+struct DirectState {
+    socket: Arc<DirectSocket>,
     peer: SocketAddr,
     rtt: Duration,
+}
+
+struct PathState {
+    direct: Option<DirectState>,
+    relay: Option<Arc<dyn RelayChannel>>,
+    closed: bool,
 }
 
 const DIRECT: u8 = 0;
@@ -375,20 +471,18 @@ fn path_kind_byte(kind: PathKind) -> u8 {
     }
 }
 
-struct PathState {
-    direct: Option<DirectPath>,
-    relay: Option<Arc<dyn RelayChannel>>,
-    closed: bool,
-}
-
 /// Connected path over the lower-latency validated transport.
 pub struct ConnectedPath {
     session_id: String,
+    device_id: String,
     ticket: Ticket,
-    candidates: CandidateSet,
+    cipher: SessionCipher,
     config: PathConfig,
-    now_ms: i64,
     socket: Option<Arc<UdpSocket>>,
+    /// The probe socket for the current ticket round. It outlives a relay selection so the
+    /// peer can still be answered while it negotiates, and so a later upgrade reuses the
+    /// same replay window and sequence space.
+    probe_socket: std::sync::Mutex<Option<Arc<DirectSocket>>>,
     kind: AtomicU8,
     state: RwLock<PathState>,
 }
@@ -399,37 +493,51 @@ impl fmt::Debug for ConnectedPath {
             .debug_struct("ConnectedPath")
             .field("session_id", &self.session_id)
             .field("path_kind", &self.path_kind())
-            .field("config", &self.config)
+            .field("key_id", &self.cipher.key_id())
             .finish_non_exhaustive()
     }
 }
 
 impl ConnectedPath {
     /// A path that only ever uses the relay. Used when a deployment disables UDP, and by
-    /// callers that already hold an authorized relay channel.
-    pub fn relay_only(relay: Arc<dyn RelayChannel>, config: PathConfig) -> Self {
-        Self {
-            session_id: String::new(),
+    /// callers that already hold an authorized relay channel. Frames still have to be
+    /// sealed, so an identity and peer key are required.
+    pub fn relay_only(
+        relay: Arc<dyn RelayChannel>,
+        identity: &IdentityKey,
+        peer_identity: IdentityPublicKey,
+        session_id: &str,
+        device_id: &str,
+        role: TicketRole,
+        config: PathConfig,
+    ) -> Result<Self, PathError> {
+        config.validate()?;
+        let cipher = SessionCipher::new(identity, peer_identity, session_id, role)?;
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            device_id: device_id.to_owned(),
             ticket: Ticket {
-                session_id: String::new(),
-                device_id: String::new(),
-                role: TicketRole::Client,
+                session_id: session_id.to_owned(),
+                device_id: device_id.to_owned(),
+                role,
                 nonce: String::new(),
                 probe_key: String::new(),
+                own_identity_key: identity.public_key().to_string(),
+                peer_identity_key: peer_identity.to_string(),
                 expires_at: i64::MAX,
                 signature: String::new(),
             },
-            candidates: CandidateSet::empty(),
+            cipher,
             config,
-            now_ms: 0,
             socket: None,
+            probe_socket: std::sync::Mutex::new(None),
             kind: AtomicU8::new(RELAY),
             state: RwLock::new(PathState {
                 direct: None,
                 relay: Some(relay),
                 closed: false,
             }),
-        }
+        })
     }
 
     pub fn session_id(&self) -> &str {
@@ -443,8 +551,14 @@ impl ConnectedPath {
         }
     }
 
-    /// Round trip measured while validating the direct path. Reported so a caller can
-    /// surface path selection and latency, and `None` until a direct path validated.
+    /// Key id of the session's traffic keys. Reported so a caller can tell two identity
+    /// pairs apart without ever seeing key material.
+    pub fn key_id(&self) -> String {
+        self.cipher.key_id()
+    }
+
+    /// Round trip measured while validating the direct path. `None` until a direct path
+    /// validated.
     pub fn direct_rtt(&self) -> Option<Duration> {
         self.state
             .try_read()
@@ -452,9 +566,14 @@ impl ConnectedPath {
             .and_then(|state| state.direct.as_ref().map(|direct| direct.rtt))
     }
 
-    /// Encodes and sends one frame over the current path.
+    /// Seals one frame and sends it over the current path.
+    ///
+    /// Neither the relay nor a direct-path observer receives the envelope: the relay gets a
+    /// routing envelope whose payload is the ciphertext, and the direct path gets the sealed
+    /// record inside its authenticated datagram.
     pub async fn send_frame(&self, envelope: &Envelope) -> Result<(), PathError> {
-        let frame = encode_frame(envelope, &self.config.frame_limits)?;
+        validate_envelope_identity(envelope, &self.session_id, &self.device_id)?;
+        let sealed = self.cipher.seal(envelope)?;
         let (kind, direct, relay) = {
             let state = self.state.read().await;
             if state.closed {
@@ -465,31 +584,32 @@ impl ConnectedPath {
                 state
                     .direct
                     .as_ref()
-                    .map(|direct| (Arc::clone(&direct.puncher), direct.peer)),
+                    .map(|direct| (Arc::clone(&direct.socket), direct.peer)),
                 state.relay.clone(),
             )
         };
         match kind {
             PathKind::Direct => {
-                let (puncher, peer) = direct.ok_or(PathError::Shutdown)?;
-                if frame.len() > self.config.direct_frame_limit {
+                let (socket, peer) = direct.ok_or(PathError::Shutdown)?;
+                if sealed.len() > self.config.direct_frame_limit {
                     return Err(PathError::DirectFrameTooLarge {
-                        length: frame.len(),
+                        length: sealed.len(),
                         limit: self.config.direct_frame_limit,
                     });
                 }
-                puncher.send_frame(peer, &frame).await?;
+                socket.send_frame(peer, &sealed).await?;
                 Ok(())
             }
             PathKind::Relay => {
                 let relay = relay.ok_or(PathError::NoPath)?;
+                let frame = self.relay_envelope(&sealed)?;
                 relay.send_frame(&frame).await?;
                 Ok(())
             }
         }
     }
 
-    /// Receives one frame from the current path, bounded by `recv_timeout`.
+    /// Receives one frame from the current path and opens it, bounded by `recv_timeout`.
     pub async fn recv_frame(&self) -> Result<Envelope, PathError> {
         let (kind, direct, relay) = {
             let state = self.state.read().await;
@@ -501,72 +621,91 @@ impl ConnectedPath {
                 state
                     .direct
                     .as_ref()
-                    .map(|direct| (Arc::clone(&direct.puncher), direct.peer)),
+                    .map(|direct| Arc::clone(&direct.socket)),
                 state.relay.clone(),
             )
         };
-        let frame = match kind {
+        let sealed = match kind {
             PathKind::Direct => {
-                let (puncher, peer) = direct.ok_or(PathError::Shutdown)?;
-                puncher.recv_frame(peer, self.config.recv_timeout).await?
+                let socket = direct.ok_or(PathError::Shutdown)?;
+                socket.recv_frame(self.config.recv_timeout).await?
             }
             PathKind::Relay => {
                 let relay = relay.ok_or(PathError::NoPath)?;
-                relay.recv_frame().await?
+                let frame = relay.recv_frame().await?;
+                let outer = decode_frame(&frame, &self.config.frame_limits)?;
+                if outer.consumed != frame.len() {
+                    return Err(PathError::Relay(RelayError::Malformed {
+                        reason: "relay frame carried trailing bytes".to_owned(),
+                    }));
+                }
+                outer.envelope.payload
             }
         };
-        let decoded = decode_frame(&frame, &self.config.frame_limits)?;
-        Ok(decoded.envelope)
+        Ok(self.cipher.open(&sealed)?)
     }
 
-    /// Repeats direct negotiation with the ticket and clock this path was created from,
-    /// and moves to the direct channel when it validates and is not slower than the relay.
+    /// Repeats direct negotiation with the caller's fresh ticket and moves to the direct
+    /// channel when it validates, the peer confirms, and it is not slower than the relay.
     ///
-    /// The relay session is left open: migration must be reversible and fallback must not
-    /// need a new session. The transport deliberately has no clock of its own, so a caller
-    /// that has been connected for a while passes a fresh ticket and the current time to
-    /// [`Self::upgrade_with`] rather than trusting the snapshot held here.
-    pub async fn try_upgrade(&self) -> Result<PathKind, PathError> {
-        self.upgrade_with(&self.ticket, self.now_ms).await
-    }
-
-    /// Repeats direct negotiation with `ticket`. Request ids, sequence numbers, and the
-    /// relay lease are untouched: the same session continues on a better path.
-    pub async fn upgrade_with(&self, ticket: &Ticket, now_ms: i64) -> Result<PathKind, PathError> {
-        let socket = self.socket.clone().ok_or(PathError::NoPath)?;
+    /// Request ids, sequence numbers, and the relay lease are untouched. The relay is left
+    /// open: migration must be reversible and fallback must not need a new session. An
+    /// expired ticket is reported as a ticket error and is explicitly not terminal.
+    pub async fn upgrade_with(
+        &self,
+        ticket: &Ticket,
+        candidates: &CandidateSet,
+        now_ms: i64,
+    ) -> Result<PathKind, PathError> {
+        let udp = self.socket.clone().ok_or(PathError::NoPath)?;
         ticket.require_session(&self.session_id)?;
-        let credentials = ticket.verify(self.candidates.verification_key(), now_ms)?;
-        if self.candidates.is_expired(now_ms) {
-            return Err(CandidateError::Expired {
-                expires_at: self.candidates.expires_at(),
+        let verified = ticket.verify(candidates.verification_key(), now_ms)?;
+        if verified.own_identity_key != self.own_identity_key() {
+            return Err(TicketError::IdentityMismatch {
+                found: verified.own_identity_key.to_string(),
+                expected: self.own_identity_key().to_string(),
             }
             .into());
         }
-        let puncher = Arc::new(HolePuncher::new(Arc::clone(&socket), credentials));
-        let direct = match puncher
-            .punch(&self.candidates.direct(), self.config.probe)
-            .await
-        {
-            Ok(outcome) => Some((puncher, outcome)),
-            Err(HolePunchError::Timeout { .. }) | Err(HolePunchError::ReceiveTimeout) => None,
-            Err(error) => return Err(error.into()),
-        };
+        if candidates.is_expired(now_ms) {
+            return Err(CandidateError::Expired {
+                expires_at: candidates.expires_at(),
+            }
+            .into());
+        }
+
+        let existing = self.probe_socket();
+        let negotiated = negotiate_direct(
+            udp,
+            existing,
+            verified.credentials,
+            &candidates.direct(),
+            self.config.probe,
+            self.config.switch,
+        )
+        .await?;
+        if let Some((socket, _)) = &negotiated {
+            let previous = self.replace_probe_socket(Arc::clone(socket));
+            if let Some(previous) = previous {
+                if !Arc::ptr_eq(&previous, socket) {
+                    previous.close();
+                }
+            }
+        }
+        let direct =
+            negotiated.and_then(|(socket, outcome)| outcome.map(|outcome| (socket, outcome)));
 
         let mut state = self.state.write().await;
         if state.closed {
             return Err(PathError::Shutdown);
         }
-        let relay_latency = state.relay.as_ref().map(|relay| {
-            relay
-                .latency()
-                .unwrap_or(self.config.relay_latency_estimate)
-        });
+        let relay_latency = self.relay_latency(&state);
         let direct_latency = direct.as_ref().map(|(_, outcome)| outcome.rtt);
         let selection =
             PathController::select(direct_latency, relay_latency).ok_or(PathError::NoPath)?;
         if selection == PathKind::Direct {
-            if let Some((puncher, HolePunchOutcome { peer, rtt })) = direct {
-                state.direct = Some(DirectPath { puncher, peer, rtt });
+            if let Some((socket, HolePunchOutcome { peer, rtt })) = direct {
+                state.direct = Some(DirectState { socket, peer, rtt });
             }
         }
         self.kind.store(path_kind_byte(selection), Ordering::SeqCst);
@@ -590,19 +729,120 @@ impl ConnectedPath {
     /// Ends the path. The relay is closed here because the caller is done with the
     /// session; path migration never calls this.
     pub async fn shutdown(&self) -> Result<(), PathError> {
-        let relay = {
+        let (relay, direct) = {
             let mut state = self.state.write().await;
             if state.closed {
                 return Ok(());
             }
             state.closed = true;
-            state.direct = None;
-            state.relay.clone()
+            (state.relay.clone(), state.direct.take())
         };
+        if let Some(direct) = direct {
+            direct.socket.close();
+        }
+        if let Some(probe) = self.take_probe_socket() {
+            probe.close();
+        }
         if let Some(relay) = relay {
             relay.close().await?;
         }
         Ok(())
+    }
+
+    fn probe_socket(&self) -> Option<Arc<DirectSocket>> {
+        self.probe_socket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace_probe_socket(&self, socket: Arc<DirectSocket>) -> Option<Arc<DirectSocket>> {
+        self.probe_socket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(socket)
+    }
+
+    fn take_probe_socket(&self) -> Option<Arc<DirectSocket>> {
+        self.probe_socket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn relay_latency(&self, state: &PathState) -> Option<Duration> {
+        state.relay.as_ref().map(|relay| {
+            relay
+                .latency()
+                .unwrap_or(self.config.relay_latency_estimate)
+        })
+    }
+
+    fn relay_envelope(&self, sealed: &[u8]) -> Result<Vec<u8>, PathError> {
+        let stream_kind =
+            SealedHeader::stream_kind(sealed).ok_or(PathError::Aead(AeadError::Malformed {
+                reason: "sealed frame has no stream kind".to_owned(),
+            }))?;
+        let device = DeviceId::new(self.device_id.clone())?;
+        let session = SessionId::new(self.session_id.clone())?;
+        let request = RequestId::new("relay").expect("a fixed request id is valid");
+        let mut outer = Envelope::new(stream_kind, &device, &session, &request);
+        outer.request_id = String::new();
+        outer.payload = sealed.to_vec();
+        Ok(encode_frame(&outer, &self.config.frame_limits)?)
+    }
+
+    fn own_identity_key(&self) -> IdentityPublicKey {
+        IdentityPublicKey::parse(&self.ticket.own_identity_key).expect(
+            "the ticket was verified before this path existed, and identity keys are immutable",
+        )
+    }
+}
+
+impl Drop for ConnectedPath {
+    fn drop(&mut self) {
+        // `shutdown` is the contract; this also stops a reader that was never explicitly
+        // shut down, so abandoning a path does not leak a socket task.
+        if let Ok(mut socket) = self.probe_socket.lock() {
+            if let Some(socket) = socket.take() {
+                socket.close();
+            }
+        }
+    }
+}
+
+/// Hole punching plus the two-sided switch handshake.
+///
+/// The returned socket is validated and the peer has confirmed it too; a `None` means the
+/// peer never confirmed, so neither side commits and the caller keeps using the relay.
+async fn negotiate_direct(
+    udp: Arc<UdpSocket>,
+    existing: Option<Arc<DirectSocket>>,
+    credentials: ProbeCredentials,
+    candidates: &[SocketAddr],
+    probe: ProbeConfig,
+    switch: SwitchConfig,
+) -> Result<Option<(Arc<DirectSocket>, Option<HolePunchOutcome>)>, PathError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let socket = match existing {
+        Some(existing) if existing.credentials().nonce() == credentials.nonce() => existing,
+        _ => Arc::new(DirectSocket::open(udp, credentials).await?),
+    };
+    let outcome = match socket.punch(candidates, probe).await {
+        Ok(outcome) => outcome,
+        Err(HolePunchError::Timeout { .. }) | Err(HolePunchError::ReceiveTimeout) => {
+            // Keep the socket: the opposite peer may still reach this side, and the
+            // responder must outlive this attempt so a later upgrade can be confirmed.
+            return Ok(Some((socket, None)));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match socket.negotiate_switch(outcome.peer, switch).await {
+        Ok(()) => Ok(Some((socket, Some(outcome)))),
+        Err(HolePunchError::SwitchUnconfirmed) => Ok(Some((socket, None))),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -610,15 +850,24 @@ impl ConnectedPath {
 pub struct PathController;
 
 impl PathController {
-    /// Verifies the ticket, races bounded direct negotiation against the already
-    /// authorized relay, and returns the lower-latency validated path.
+    /// Verifies the ticket, agrees the session keys, races bounded direct negotiation
+    /// against the already authorized relay, and returns the lower-latency validated path.
     pub async fn connect(
         ticket: Ticket,
         candidates: CandidateSet,
         setup: PathSetup,
     ) -> Result<ConnectedPath, PathError> {
+        setup.config.validate()?;
         ticket.require_session(candidates.session_id())?;
-        let credentials = ticket.verify(candidates.verification_key(), setup.now_ms)?;
+        let verified = ticket.verify(candidates.verification_key(), setup.now_ms)?;
+        let local_identity = setup.identity.public_key();
+        if verified.own_identity_key != local_identity {
+            return Err(TicketError::IdentityMismatch {
+                found: verified.own_identity_key.to_string(),
+                expected: local_identity.to_string(),
+            }
+            .into());
+        }
         if candidates.is_expired(setup.now_ms) {
             return Err(CandidateError::Expired {
                 expires_at: candidates.expires_at(),
@@ -626,27 +875,56 @@ impl PathController {
             .into());
         }
 
+        let cipher = SessionCipher::new(
+            &setup.identity,
+            verified.peer_identity_key,
+            candidates.session_id(),
+            ticket.role,
+        )?;
+
         let PathSetup {
             socket,
             relay,
             config,
-            now_ms,
+            ..
         } = setup;
-        let direct_addresses = candidates.direct();
-        let puncher = Arc::new(HolePuncher::new(Arc::clone(&socket), credentials));
-        let direct = match puncher.punch(&direct_addresses, config.probe).await {
-            Ok(outcome) => Some((puncher, outcome)),
-            Err(HolePunchError::Timeout { .. }) | Err(HolePunchError::ReceiveTimeout) => None,
-            Err(error) => return Err(error.into()),
+
+        let path = ConnectedPath {
+            session_id: candidates.session_id().to_owned(),
+            device_id: ticket.device_id.clone(),
+            ticket: ticket.clone(),
+            cipher,
+            config: config.clone(),
+            socket: Some(Arc::clone(&socket)),
+            probe_socket: std::sync::Mutex::new(None),
+            kind: AtomicU8::new(RELAY),
+            state: RwLock::new(PathState {
+                direct: None,
+                relay: relay.clone(),
+                closed: false,
+            }),
         };
 
-        let relay_latency = relay
-            .as_ref()
-            .map(|relay| relay.latency().unwrap_or(config.relay_latency_estimate));
+        let negotiated = negotiate_direct(
+            Arc::clone(&socket),
+            None,
+            verified.credentials,
+            &candidates.direct(),
+            config.probe,
+            config.switch,
+        )
+        .await?;
+        if let Some((probe_socket, _)) = &negotiated {
+            path.replace_probe_socket(Arc::clone(probe_socket));
+        }
+        let direct =
+            negotiated.and_then(|(socket, outcome)| outcome.map(|outcome| (socket, outcome)));
+
+        let relay_latency = path.relay_latency(&*path.state.read().await);
         let direct_latency = direct.as_ref().map(|(_, outcome)| outcome.rtt);
         let kind = match PathController::select(direct_latency, relay_latency) {
             Some(kind) => kind,
-            None if direct_addresses.is_empty() => return Err(PathError::NoPath),
+            None if candidates.direct().is_empty() => return Err(PathError::NoPath),
             None => {
                 return Err(HolePunchError::Timeout {
                     attempts: config.probe.max_attempts,
@@ -655,27 +933,18 @@ impl PathController {
             }
         };
 
-        let direct_path = match (kind, direct) {
-            (PathKind::Direct, Some((puncher, HolePunchOutcome { peer, rtt }))) => {
-                Some(DirectPath { puncher, peer, rtt })
+        if kind == PathKind::Direct {
+            if let Some((direct_socket, HolePunchOutcome { peer, rtt })) = direct {
+                path.state.write().await.direct = Some(DirectState {
+                    socket: direct_socket,
+                    peer,
+                    rtt,
+                });
+                path.kind.store(DIRECT, Ordering::SeqCst);
             }
-            _ => None,
-        };
+        }
 
-        Ok(ConnectedPath {
-            session_id: candidates.session_id().to_owned(),
-            ticket,
-            candidates,
-            config,
-            now_ms,
-            socket: Some(socket),
-            kind: AtomicU8::new(path_kind_byte(kind)),
-            state: RwLock::new(PathState {
-                direct: direct_path,
-                relay,
-                closed: false,
-            }),
-        })
+        Ok(path)
     }
 
     /// Selects the lower of two validated round trips. A tie goes to the direct path, and
@@ -696,6 +965,31 @@ impl PathController {
     }
 }
 
+fn validate_envelope_identity(
+    envelope: &Envelope,
+    session_id: &str,
+    device_id: &str,
+) -> Result<(), PathError> {
+    if envelope.session_id != session_id {
+        return Err(PathError::Aead(AeadError::InvalidEnvelope {
+            reason: format!(
+                "envelope is for session {}, not {session_id}",
+                envelope.session_id
+            ),
+        }));
+    }
+    if envelope.device_id != device_id {
+        return Err(PathError::Aead(AeadError::InvalidEnvelope {
+            reason: format!(
+                "envelope is for device {}, not {device_id}",
+                envelope.device_id
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// Entry point for establishing a path.
 fn unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -119,23 +119,46 @@ impl TestApp {
         body["token"].as_str().expect("token").to_owned()
     }
 
+    /// A fresh 32-byte X25519 identity public key in the wire form the server accepts.
+    pub fn identity_key() -> String {
+        phoneconnect_server::auth::generate_secret("").expect("identity key material")
+    }
+
     pub async fn enroll_raw(&self, token: &str) -> (StatusCode, Value) {
+        self.enroll_raw_with_identity(token, &Self::identity_key())
+            .await
+    }
+
+    pub async fn enroll_raw_with_identity(
+        &self,
+        token: &str,
+        identity_key: &str,
+    ) -> (StatusCode, Value) {
         self.request(
             Method::POST,
             "/api/devices/enroll",
             None,
-            Some(json!({ "token": token })),
+            Some(json!({ "token": token, "identity_key": identity_key })),
         )
         .await
     }
 
     pub async fn enroll_new(&self, owner_id: &str) -> (String, String) {
+        let (device_id, credential, _identity) = self.enroll_new_with_identity(owner_id).await;
+        (device_id, credential)
+    }
+
+    /// Enrolls and returns the identity public key the device pinned, so a test can build
+    /// the peer end of the AEAD tunnel.
+    pub async fn enroll_new_with_identity(&self, owner_id: &str) -> (String, String, String) {
         let token = self.issue_token(owner_id).await;
-        let (status, body) = self.enroll_raw(&token).await;
+        let identity_key = Self::identity_key();
+        let (status, body) = self.enroll_raw_with_identity(&token, &identity_key).await;
         assert_eq!(status, StatusCode::CREATED, "enroll failed: {body}");
         (
             body["device_id"].as_str().expect("device_id").to_owned(),
             body["credential"].as_str().expect("credential").to_owned(),
+            identity_key,
         )
     }
 
@@ -144,11 +167,24 @@ impl TestApp {
         device_id: &str,
         bearer: Option<&str>,
     ) -> (StatusCode, Value) {
+        self.create_session_with_identity(device_id, bearer, &Self::identity_key())
+            .await
+    }
+
+    pub async fn create_session_with_identity(
+        &self,
+        device_id: &str,
+        bearer: Option<&str>,
+        client_identity_key: &str,
+    ) -> (StatusCode, Value) {
         self.request(
             Method::POST,
             "/api/sessions",
             bearer,
-            Some(json!({ "device_id": device_id })),
+            Some(json!({
+                "device_id": device_id,
+                "client_identity_key": client_identity_key
+            })),
         )
         .await
     }

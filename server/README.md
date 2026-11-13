@@ -1,8 +1,9 @@
 # PhoneConnect server
 
 The control plane for PhoneConnect: it authorizes sessions, serves rendezvous data, and
-operates the bounded end-to-end encrypted relay fallback. It never exposes ADB and never
-interprets relayed payloads.
+operates the bounded relay fallback. Frames are sealed end to end by the peers, so the relay
+carries ciphertext it cannot read: this process holds only public identity keys and can
+derive no traffic key. It never exposes ADB and never interprets a payload.
 
 ## Binary and crate layout
 
@@ -24,8 +25,8 @@ interprets relayed payloads.
 |---|---|---|---|
 | `GET` | `/health` | none | Liveness only; never touches sessions. |
 | `POST` | `/api/enrollment-tokens` | admin | `{token, expires_at}` for one owner. |
-| `POST` | `/api/devices/enroll` | enrollment token | Consumes the token once, returns `{device_id, credential}`. |
-| `POST` | `/api/sessions` | admin | Authorizes a device session; returns `{session_id, capability, expires_at, ticket, verification_key}`. |
+| `POST` | `/api/devices/enroll` | enrollment token | Consumes the token once; body is `{token, identity_key}` and the response is `{device_id, credential}`. The device's X25519 identity public key is pinned here. |
+| `POST` | `/api/sessions` | admin | Authorizes a device session; body is `{device_id, client_identity_key}`, response `{session_id, capability, expires_at, ticket, verification_key}`. |
 | `GET` | `/api/sessions/{id}/ticket` | session capability or owning device credential | Fresh short-lived ticket for the calling role. |
 | `GET` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Relay route plus the endpoint observed for the opposite peer. |
 | `POST` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Redeems a ticket, records this peer's observed endpoint, returns the peer's view. |
@@ -54,11 +55,26 @@ access logging to drop that path, or revoke through a control plane that does no
 Secrets are stored only as SHA-256 hashes and compared in constant time. Enrollment tokens
 are single-use and consumed in the same transaction that creates the device.
 
+## Frame encryption and identity keys
+
+Frame confidentiality is end to end: each peer holds a static X25519 identity key — the
+device's is registered at enrollment, the client's when its session is authorized, which is
+the login-equivalent registration until local password login lands. The two peers agree a
+secret with X25519 and split it with HKDF-SHA256 salted by the session id into one key per
+direction. Every frame is sealed with ChaCha20-Poly1305, a per-direction nonce built from
+the direction byte and a monotonic counter, and associated data that binds the session id,
+stream kind, sequence, counter, and key id.
+
+The server only ever receives the public halves. It cannot derive a traffic key, so it
+cannot read a frame even though it carries it. The server-issued probe key authenticates
+hole-punch datagrams only; it never keys encryption. A tampered frame, an unknown key id, a
+reflected frame, a replayed counter, and a counter regression are all refused explicitly.
+
 ## Rendezvous tickets and direct-path candidate exchange
 
 Each peer receives a signed, short-lived ticket: an Ed25519 signature over the session id,
-device id, role, rendezvous nonce, 256-bit probe key, and a 30-second expiry that never
-outlives the session. The public verification key travels with the ticket
+device id, role, rendezvous nonce, 256-bit probe key, both pinned identity public keys, and
+a 30-second expiry that never outlives the session. The public verification key travels with the ticket
 (`verification_key`) so a peer verifies the signature itself; only the server holds the
 private half, and the key is generated at startup, which invalidates outstanding tickets
 across a restart.
@@ -68,7 +84,9 @@ is what authenticates direct-path probes — while each ticket is signed for its
 Redemption is single-use per role: a replayed ticket answers `409 ticket_replayed`, a
 tampered or unsigned ticket `401 ticket_invalid`, an expired one `401 ticket_expired`, and
 a ticket presented by the wrong role or session `401 ticket_scope_mismatch`. None of these
-reaches candidate exchange, so a replayed ticket never establishes a path.
+reaches candidate exchange, so a replayed ticket never establishes a path. Re-requesting a
+ticket after a redemption starts a new rendezvous round, so a peer that lost its ticket can
+always re-register instead of being told its own nonce is a replay.
 
 `POST /api/sessions/{id}/candidates` redeems the caller's ticket and records the endpoint
 that peer reports for itself. `GET /api/sessions/{id}/candidates` (and the response to the
@@ -113,6 +131,10 @@ sessions from the last five minutes.
 | `PHONECONNECT_LISTEN_ADDR` | `0.0.0.0:8080` | Listen address. |
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
 | `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/sessions` | Relay route base advertised to peers; one session appends `/{session_id}/relay`. |
+
+The ticket signing key is generated at process start, so a restart invalidates outstanding
+tickets (30 s) and a multi-replica deployment would need shared key material. Identity keys
+are per device and per client and are stored as public values only.
 
 Terminate TLS at a reverse proxy; all public endpoints require TLS in production.
 

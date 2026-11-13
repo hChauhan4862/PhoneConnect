@@ -33,6 +33,29 @@ pub const SESSION_CAPABILITY_PREFIX: &str = "pcsess_";
 
 const SECRET_BYTES: usize = 32;
 
+/// Bytes in an X25519 identity public key.
+pub const IDENTITY_KEY_BYTES: usize = 32;
+
+/// Identity keys are pinned outside a session, so a malformed one is refused at the
+/// surface that registers it rather than discovered when a path fails.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdentityKeyError {
+    #[error("identity_key must be 32 bytes of unpadded base64url")]
+    Malformed,
+}
+
+/// Validates and canonicalizes an identity public key. The server only ever sees public
+/// halves; traffic keys are agreed between the peers.
+pub fn normalize_identity_key(value: &str) -> Result<String, IdentityKeyError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value.trim().as_bytes())
+        .map_err(|_| IdentityKeyError::Malformed)?;
+    if bytes.len() != IDENTITY_KEY_BYTES {
+        return Err(IdentityKeyError::Malformed);
+    }
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// Reads the bootstrap admin token from the environment.
 pub fn admin_token_from_env() -> Result<String, AuthError> {
     let token = std::env::var(ADMIN_TOKEN_ENV).map_err(|_| AuthError::MissingAdminToken)?;

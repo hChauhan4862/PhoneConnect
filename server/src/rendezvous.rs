@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::{
-    AuthError, SESSION_CAPABILITY_PREFIX, bearer_token, generate_secret, hash_secret,
+    AuthError, IdentityKeyError, SESSION_CAPABILITY_PREFIX, bearer_token, generate_secret,
+    hash_secret, normalize_identity_key,
 };
 use crate::relay::PeerRole;
 use crate::store::{SessionRecord, StoreError, UnixMs};
@@ -58,7 +59,8 @@ pub enum CandidateKind {
     Local,
     /// An address the server observed for one peer.
     ServerObserved,
-    /// The server relay; always available, bounded, end-to-end encrypted.
+    /// The server relay; always available and bounded. Frames are sealed by the peers, so
+    /// the relay carries ciphertext it cannot read.
     Relay,
 }
 
@@ -89,8 +91,15 @@ pub struct RendezvousTicket {
     pub role: PeerRole,
     pub nonce: String,
     /// Base64url-encoded 256-bit key used to authenticate direct-path probes. Both peers
-    /// receive the same key inside their signed tickets.
+    /// receive the same key inside their signed tickets. It authenticates hole-punch
+    /// datagrams only and never keys frame encryption.
     pub probe_key: String,
+    /// The receiving peer's own X25519 identity public key, pinned at enrollment or when
+    /// the session was authorized. The private half is never here.
+    pub own_identity_key: String,
+    /// The opposite peer's X25519 identity public key. Frames are sealed for this key; the
+    /// server holds only the public half and cannot derive the traffic keys.
+    pub peer_identity_key: String,
     pub expires_at: UnixMs,
     /// Hex-encoded Ed25519 signature over the authority's canonical signing payload.
     pub signature: String,
@@ -115,6 +124,8 @@ pub enum TicketError {
     InvalidNonce { nonce: String },
     #[error("random source failed: {0}")]
     Random(String),
+    #[error("session has no pinned identity keys; re-enroll the device and re-authorize")]
+    IdentityUnavailable,
 }
 
 impl TicketError {
@@ -126,6 +137,7 @@ impl TicketError {
             | Self::RoleMismatch { .. }
             | Self::InvalidNonce { .. } => "ticket_scope_mismatch",
             Self::Replayed => "ticket_replayed",
+            Self::IdentityUnavailable => "ticket_identity_missing",
             Self::Random(_) => "random_source_failed",
         }
     }
@@ -133,7 +145,7 @@ impl TicketError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Replayed => StatusCode::CONFLICT,
-            Self::Random(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Random(_) | Self::IdentityUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNAUTHORIZED,
         }
     }
@@ -153,6 +165,8 @@ pub struct VerifiedTicket {
     pub role: PeerRole,
     pub nonce: String,
     pub probe_key: String,
+    pub own_identity_key: String,
+    pub peer_identity_key: String,
     pub expires_at: UnixMs,
 }
 
@@ -221,24 +235,19 @@ impl TicketAuthority {
 
     /// Canonical bytes this authority signs. The transport crate reconstructs the same
     /// layout, so any change here needs a matching change there.
-    fn signing_payload(
-        session_id: &str,
-        device_id: &str,
-        role: PeerRole,
-        nonce: &str,
-        probe_key: &str,
-        expires_at: UnixMs,
-    ) -> Vec<u8> {
+    fn signing_payload(ticket: &RendezvousTicket) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(TICKET_SIGNING_LABEL.as_bytes());
         payload.push(b'\n');
         for field in [
-            session_id,
-            device_id,
-            role.as_str(),
-            nonce,
-            probe_key,
-            &expires_at.to_string(),
+            ticket.session_id.as_str(),
+            ticket.device_id.as_str(),
+            ticket.role.as_str(),
+            ticket.nonce.as_str(),
+            ticket.probe_key.as_str(),
+            ticket.own_identity_key.as_str(),
+            ticket.peer_identity_key.as_str(),
+            &ticket.expires_at.to_string(),
         ] {
             payload.extend_from_slice(field.as_bytes());
             payload.push(b'\n');
@@ -259,25 +268,22 @@ impl TicketAuthority {
         now_ms: UnixMs,
     ) -> Result<RendezvousTicket, TicketError> {
         let expires_at = session.expires_at_ms.min(now_ms + TICKET_TTL_MS);
-        let (nonce, probe_key) = self.round(&session.session_id, expires_at, now_ms)?;
-        let payload = Self::signing_payload(
-            &session.session_id,
-            &session.device_id,
-            role,
-            &nonce,
-            &probe_key,
-            expires_at,
-        );
-        let signature = self.signing_key.sign(&payload);
-        Ok(RendezvousTicket {
+        let (own_identity_key, peer_identity_key) = identity_keys(session, role)?;
+        let (nonce, probe_key) = self.round(&session.session_id, role, expires_at, now_ms)?;
+        let mut ticket = RendezvousTicket {
             session_id: session.session_id.clone(),
             device_id: session.device_id.clone(),
             role,
             nonce,
             probe_key,
+            own_identity_key,
+            peer_identity_key,
             expires_at,
-            signature: hex(&signature.to_bytes()),
-        })
+            signature: String::new(),
+        };
+        let signature = self.signing_key.sign(&Self::signing_payload(&ticket));
+        ticket.signature = hex(&signature.to_bytes());
+        Ok(ticket)
     }
 
     /// Starts a new rendezvous round for `session_id`, so a peer that repeats candidate
@@ -291,14 +297,24 @@ impl TicketAuthority {
     fn round(
         &self,
         session_id: &str,
+        role: PeerRole,
         ticket_expires_at: UnixMs,
         now_ms: UnixMs,
     ) -> Result<(String, String), TicketError> {
         let mut rounds = self.rounds();
         rounds.retain(|_, round| round.expires_at > now_ms);
-        if let Some(round) = rounds.get_mut(session_id) {
+        if let Some(round) = rounds.get(session_id) {
             if round.expires_at >= now_ms {
-                return Ok((round.nonce.clone(), round.probe_key.clone()));
+                // Re-requesting a ticket inside one round must not hand back a nonce this
+                // role already redeemed: that would make the documented recovery path fail
+                // with `ticket_replayed`. A redeemed nonce starts a new round instead.
+                let already_redeemed = self
+                    .redeemed()
+                    .entries
+                    .contains_key(&(round.nonce.clone(), role));
+                if !already_redeemed {
+                    return Ok((round.nonce.clone(), round.probe_key.clone()));
+                }
             }
         }
         let nonce = generate_secret("").map_err(|error| TicketError::Random(error.to_string()))?;
@@ -337,14 +353,7 @@ impl TicketAuthority {
             });
         }
         let signature = decode_hex_64(&ticket.signature).ok_or(TicketError::InvalidSignature)?;
-        let payload = Self::signing_payload(
-            &ticket.session_id,
-            &ticket.device_id,
-            ticket.role,
-            &ticket.nonce,
-            &ticket.probe_key,
-            ticket.expires_at,
-        );
+        let payload = Self::signing_payload(ticket);
         self.verifying_key
             .verify_strict(&payload, &Signature::from_bytes(&signature))
             .map_err(|_| TicketError::InvalidSignature)?;
@@ -353,7 +362,11 @@ impl TicketAuthority {
                 expires_at: ticket.expires_at,
             });
         }
-        if ticket.nonce.is_empty() || ticket.probe_key.is_empty() {
+        if ticket.nonce.is_empty()
+            || ticket.probe_key.is_empty()
+            || ticket.own_identity_key.is_empty()
+            || ticket.peer_identity_key.is_empty()
+        {
             return Err(TicketError::InvalidSignature);
         }
         Ok(VerifiedTicket {
@@ -362,6 +375,8 @@ impl TicketAuthority {
             role: ticket.role,
             nonce: ticket.nonce.clone(),
             probe_key: ticket.probe_key.clone(),
+            own_identity_key: ticket.own_identity_key.clone(),
+            peer_identity_key: ticket.peer_identity_key.clone(),
             expires_at: ticket.expires_at,
         })
     }
@@ -577,6 +592,11 @@ fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
     pub device_id: String,
+    /// X25519 identity public key of the client. There is no local password login yet, so
+    /// session authorization is the client's registration point; it is the login-equivalent
+    /// pin for this milestone. The private half never leaves the client.
+    #[serde(default)]
+    pub client_identity_key: String,
 }
 
 /// Capability and rendezvous ticket handed to the peer that created the session.
@@ -615,6 +635,12 @@ pub enum SessionError {
     DeviceRevoked { device_id: String },
     #[error("{endpoint} is not a socket address")]
     InvalidEndpoint { endpoint: String },
+    #[error("client_identity_key is missing")]
+    IdentityKeyMissing,
+    #[error("client_identity_key is invalid")]
+    IdentityKeyInvalid,
+    #[error("device {device_id} has no identity key; it must be re-enrolled")]
+    DeviceIdentityMissing { device_id: String },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -629,6 +655,9 @@ impl IntoResponse for SessionError {
             Self::DeviceUnknown { .. } => (StatusCode::NOT_FOUND, "device_unknown"),
             Self::DeviceRevoked { .. } => (StatusCode::CONFLICT, "device_revoked"),
             Self::InvalidEndpoint { .. } => (StatusCode::BAD_REQUEST, "invalid_endpoint"),
+            Self::IdentityKeyMissing => (StatusCode::BAD_REQUEST, "identity_key_required"),
+            Self::IdentityKeyInvalid => (StatusCode::BAD_REQUEST, "invalid_identity_key"),
+            Self::DeviceIdentityMissing { .. } => (StatusCode::CONFLICT, "device_identity_missing"),
             Self::Store(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store_failure"),
             Self::Rendezvous(_) => (StatusCode::INTERNAL_SERVER_ERROR, "random_source_failed"),
         };
@@ -658,6 +687,20 @@ pub async fn create_session(
             device_id: device.device_id,
         });
     }
+    if device.identity_public_key.is_empty() {
+        return Err(SessionError::DeviceIdentityMissing {
+            device_id: device.device_id,
+        });
+    }
+    if request.client_identity_key.trim().is_empty() {
+        return Err(SessionError::IdentityKeyMissing);
+    }
+    let client_identity_key = normalize_identity_key(&request.client_identity_key).map_err(
+        |error: IdentityKeyError| {
+            let _ = error;
+            SessionError::IdentityKeyInvalid
+        },
+    )?;
 
     let now = state.now_ms();
     let session_id = format!("{SESSION_ID_PREFIX}{}", random_component()?);
@@ -668,6 +711,8 @@ pub async fn create_session(
         device_id: device.device_id.clone(),
         owner_id: device.owner_id.clone(),
         capability_hash: hash_secret(&capability),
+        client_identity_key,
+        device_identity_key: device.identity_public_key.clone(),
         created_at_ms: now,
         expires_at_ms: now + SESSION_TTL_MS,
         revoked_at_ms: None,
@@ -761,6 +806,23 @@ async fn authorize_peer(
         PeerRole::Device
     };
     Ok((session, role))
+}
+
+/// The two identity public keys a ticket binds, in `(own, peer)` order for `role`.
+fn identity_keys(session: &SessionRecord, role: PeerRole) -> Result<(String, String), TicketError> {
+    if session.client_identity_key.is_empty() || session.device_identity_key.is_empty() {
+        return Err(TicketError::IdentityUnavailable);
+    }
+    Ok(match role {
+        PeerRole::Client => (
+            session.client_identity_key.clone(),
+            session.device_identity_key.clone(),
+        ),
+        PeerRole::Device => (
+            session.device_identity_key.clone(),
+            session.client_identity_key.clone(),
+        ),
+    })
 }
 
 fn random_component() -> Result<String, RendezvousError> {

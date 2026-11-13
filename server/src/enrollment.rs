@@ -13,7 +13,10 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::auth::{AuthError, DEVICE_CREDENTIAL_PREFIX, generate_secret, hash_secret};
+use crate::auth::{
+    AuthError, DEVICE_CREDENTIAL_PREFIX, IdentityKeyError, generate_secret, hash_secret,
+    normalize_identity_key,
+};
 use crate::store::{EnrollmentTokenRecord, NewDevice, StoreError, UnixMs};
 use crate::{ApiJson, AppState};
 
@@ -43,6 +46,10 @@ pub struct IssuedEnrollmentToken {
 #[derive(Debug, Deserialize)]
 pub struct EnrollDeviceRequest {
     pub token: String,
+    /// X25519 identity public key of the device, pinned at enrollment. The private half
+    /// stays in the platform keystore and is never sent here.
+    #[serde(default)]
+    pub identity_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +62,10 @@ pub struct EnrolledDevice {
 pub enum EnrollmentError {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: &'static str },
+    #[error("identity_key is missing")]
+    IdentityKeyMissing,
+    #[error("identity_key is invalid")]
+    IdentityKeyInvalid,
     #[error("enrollment token is unknown")]
     TokenUnknown,
     #[error("enrollment token expired at {expires_at_ms}")]
@@ -73,6 +84,8 @@ impl IntoResponse for EnrollmentError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
             Self::InvalidRequest { .. } => (StatusCode::BAD_REQUEST, "invalid_request"),
+            Self::IdentityKeyMissing => (StatusCode::BAD_REQUEST, "identity_key_required"),
+            Self::IdentityKeyInvalid => (StatusCode::BAD_REQUEST, "invalid_identity_key"),
             Self::TokenUnknown => (StatusCode::UNAUTHORIZED, "enrollment_token_unknown"),
             Self::TokenExpired { .. } => (StatusCode::GONE, "enrollment_token_expired"),
             Self::TokenUsed => (StatusCode::CONFLICT, "enrollment_token_used"),
@@ -152,6 +165,14 @@ pub async fn enroll_device(
     if !token.starts_with(ENROLLMENT_TOKEN_PREFIX) {
         return Err(EnrollmentError::TokenUnknown);
     }
+    if request.identity_key.trim().is_empty() {
+        return Err(EnrollmentError::IdentityKeyMissing);
+    }
+    let identity_public_key =
+        normalize_identity_key(&request.identity_key).map_err(|error: IdentityKeyError| {
+            let _ = error;
+            EnrollmentError::IdentityKeyInvalid
+        })?;
 
     let now = state.now_ms();
     let credential = generate_secret(DEVICE_CREDENTIAL_PREFIX)?;
@@ -164,6 +185,7 @@ pub async fn enroll_device(
             NewDevice {
                 device_id,
                 credential_hash: hash_secret(&credential),
+                identity_public_key,
                 enrolled_at_ms: now,
             },
         )

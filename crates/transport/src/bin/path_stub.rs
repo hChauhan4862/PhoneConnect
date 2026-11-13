@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use phoneconnect::v1::{DeviceId, Envelope, FrameLimits, RequestId, SessionId, StreamKind};
 use phoneconnect_transport::{
-    CandidateSet, PathConfig, PathController, PathKind, PathSetup, ProbeConfig,
-    RendezvousCandidates, Ticket, WebSocketRelay,
+    CandidateSet, IdentityKey, PathConfig, PathController, PathKind, PathSetup, ProbeConfig,
+    RendezvousCandidates, SwitchConfig, Ticket, WebSocketRelay,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -27,7 +27,17 @@ const RECEIVE_DEADLINE: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--generate-identity") {
+        // The driver asks for a fresh pinned identity per stub; the private half is handed
+        // to exactly one container and never to the server.
+        let identity = IdentityKey::generate()?;
+        println!("{}", identity.to_secret_string());
+        println!("{}", identity.public_key().as_str());
+        return Ok(());
+    }
+
     let role = required("STUB_ROLE")?;
+    let identity = IdentityKey::parse(&required("STUB_IDENTITY_KEY")?)?;
     let ticket: Ticket = serde_json::from_str(&required("STUB_TICKET")?)?;
     let rendezvous: RendezvousCandidates = serde_json::from_str(&required("STUB_CANDIDATES")?)?;
     let relay_url = required("STUB_RELAY_URL")?;
@@ -46,12 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             attempt_timeout: Duration::from_millis(50),
             max_attempts: 2,
         },
+        switch: SwitchConfig {
+            retries: 3,
+            timeout: Duration::from_millis(100),
+        },
         ..PathConfig::default()
     };
     let path = PathController::connect(
         ticket,
         candidates,
-        PathSetup::new(socket)
+        PathSetup::new(socket, identity)
             .with_relay(relay)
             .with_config(config)
             .at(unix_ms()),
