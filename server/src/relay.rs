@@ -119,6 +119,8 @@ pub enum RelayClose {
     DeviceRevoked { device_id: String },
     #[error("the control lease that authorized the session was revoked: {lease_id}")]
     LeaseRevoked { lease_id: String },
+    #[error("session {session_id} is read-only and may not send control frames")]
+    ControlNotAuthorized { session_id: String },
     #[error("peer closed its sending direction")]
     PeerClosed,
     #[error("malformed frame: {reason}")]
@@ -342,6 +344,7 @@ impl RelayPeer {
     /// Validates and enqueues an envelope for the other peer.
     pub async fn send_frame(&self, envelope: &Envelope) -> Result<(), RelayClose> {
         self.session.check_live().await?;
+        self.refuse_control_if_read_only(envelope)?;
         let frame = encode_frame(envelope, &self.session.frame_limits)
             .map_err(RelayClose::from_protocol)?;
         self.enqueue(frame)
@@ -361,7 +364,22 @@ impl RelayPeer {
                 extra: frame.len() - decoded.consumed,
             });
         }
+        self.refuse_control_if_read_only(&decoded.envelope)?;
         self.enqueue(frame.to_vec())
+    }
+
+    /// A read-only session's client peer may not send control frames. The refusal is one
+    /// frame, not the stream: a viewer that keeps receiving telemetry stays connected.
+    fn refuse_control_if_read_only(&self, envelope: &Envelope) -> Result<(), RelayClose> {
+        if self.role == PeerRole::Client
+            && !self.session.allows_control()
+            && envelope.stream_kind == i32::from(StreamKind::Control)
+        {
+            return Err(RelayClose::ControlNotAuthorized {
+                session_id: self.session.session_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn enqueue(&self, frame: Vec<u8>) -> Result<(), RelayClose> {
@@ -451,6 +469,9 @@ impl RelayClose {
 struct RelaySession {
     session_id: String,
     device_id: String,
+    /// Whether a control lease authorized this session. A read-only session may relay
+    /// events but never a control frame; the check is per frame and does not end the stream.
+    control: bool,
     expires_at_ms: AtomicI64,
     limits: RelayLimits,
     frame_limits: FrameLimits,
@@ -481,6 +502,7 @@ impl RelaySession {
         Self {
             session_id: record.session_id.clone(),
             device_id: record.device_id.clone(),
+            control: record.control,
             expires_at_ms: AtomicI64::new(record.expires_at_ms),
             limits,
             frame_limits: limits.frame_limits(),
@@ -493,6 +515,10 @@ impl RelaySession {
             closed,
             authorization: Mutex::new(None),
         }
+    }
+
+    fn allows_control(&self) -> bool {
+        self.control
     }
 
     fn attach_peer(&self) {
@@ -761,6 +787,7 @@ fn close_code(reason: &RelayClose) -> &'static str {
         RelayClose::SessionRevoked => "session_revoked",
         RelayClose::DeviceRevoked { .. } => "device_revoked",
         RelayClose::LeaseRevoked { .. } => "lease_revoked",
+        RelayClose::ControlNotAuthorized { .. } => "control_not_authorized",
         RelayClose::PeerClosed => "peer_closed",
         RelayClose::MalformedFrame { .. } => "malformed_frame",
         RelayClose::TrailingBytes { .. } => "trailing_bytes",

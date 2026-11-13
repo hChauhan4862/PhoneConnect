@@ -50,6 +50,7 @@ async fn harness() -> (
         created_at_ms: NOW_MS,
         expires_at_ms: NOW_MS + 300_000,
         revoked_at_ms: None,
+        control: true,
     };
     store
         .insert_enrollment_token(EnrollmentTokenRecord {

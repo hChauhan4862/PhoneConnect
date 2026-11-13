@@ -186,6 +186,11 @@ async fn an_unknown_api_path_is_a_404_not_the_spa_document() {
         (Method::GET, "/api/does-not-exist"),
         (Method::POST, "/api/devices/dev_abc/unknown"),
         (Method::GET, "/api/"),
+        // The contract is about the decoded path: an encoded slash must not turn an API
+        // path into the app shell.
+        (Method::GET, "/api%2Fnope"),
+        (Method::GET, "/api%2fdevices"),
+        (Method::GET, "/ap%69/nope"),
     ] {
         let (status, headers, body) = web.request(method.clone(), uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");

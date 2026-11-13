@@ -34,7 +34,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `GET` | `/health` | none | Liveness only; never touches sessions. |
 | `POST` | `/api/enrollment-tokens` | admin | `{token, expires_at}` for one owner. |
 | `POST` | `/api/devices/enroll` | enrollment token | Consumes the token once; body is `{token, identity_key}` and the response is `{device_id, credential}`. The device's X25519 identity public key is pinned here. |
-| `POST` | `/api/sessions` | admin | Authorizes a device session; body is `{device_id, client_identity_key}`, response `{session_id, capability, expires_at, ticket, verification_key}`. |
+| `POST` | `/api/sessions` | admin | Authorizes a device session; body is `{device_id, client_identity_key, control?, user_id?}`, response `{session_id, capability, expires_at, ticket, verification_key}`. `control: true` requires a live lease held by `user_id`; the default session is read-only. |
 | `GET` | `/api/sessions/{id}/ticket` | session capability or owning device credential | Fresh short-lived ticket for the calling role. |
 | `GET` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Relay route plus the endpoint observed for the opposite peer. |
 | `POST` | `/api/sessions/{id}/candidates` | session capability or owning device credential | Redeems a ticket, records this peer's observed endpoint, returns the peer's view. |
@@ -44,7 +44,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/revoke` | admin | Revokes a device and its live sessions; closes their relays. |
 | `POST` | `/api/sessions/{id}/revoke` | admin | Revokes one session; closes its relay. |
 | `GET` | `/api/devices` | admin | Enrolled devices, oldest first. No credential is ever returned. |
-| `GET` | `/api/devices/{id}/status?user_id=` | admin | The status surface: enrollment, newest session and path evidence, lease, telemetry freshness. |
+| `GET` | `/api/devices/{id}/status?user_id=` | admin | The status surface: enrollment, the live session (or the newest ended one when none is live) with path evidence, lease, telemetry freshness. |
 | `GET` | `/api/devices/{id}/lease?user_id=` | admin | The active lease and one user's access (`is_owner`, `role`, `can_control`). |
 | `POST` | `/api/devices/{id}/lease` | admin | The owner grants control while the device is free; body is `{actor_id, expires_in_seconds?}`. |
 | `POST` | `/api/devices/{id}/lease/handoff` | admin | Explicit transfer of control; body is `{actor_id, to_user_id, expires_in_seconds?}`. Returns the new lease and the replaced one's revocation event. |
@@ -53,13 +53,18 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
 An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA
-document. A path that names a file but does not resolve is a 404 too, so a missing asset is
+document, including when the slash is percent-encoded (`/api%2Fnope`), because the path is
+classified after decoding. A path that names a file but does not resolve is a 404 too, so a missing asset is
 never served as HTML labelled as JavaScript. Every web response carries
 `Content-Security-Policy: default-src 'self'; ... object-src 'none'; base-uri 'none';
 frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy:
 no-referrer`. Assets are immutable-cached; the app shell is `no-cache`. The built app is
 served from `PHONECONNECT_WEB_ROOT` (default `web/dist`), read once at startup; a missing
 build is reported on stderr and the API is served without it.
+
+The UI is **not live**. There is no server-to-client push channel, so a screen shows the
+snapshot it last read: another user's handoff, a revocation, or a new session appears only
+after a refresh. The status and telemetry screens say so next to their refresh controls.
 
 Errors are always `{"error": "<code>"}` with a non-2xx status; there are no
 success-shaped fallbacks. Revocation returns `{"revoked": true, "revoked_at": <unix ms>}`
@@ -191,14 +196,27 @@ revokes those sessions in the store *and* closes their relay transports with the
 rather than at the next liveness poll. Revocation returns the event naming every invalidated
 session.
 
+Read-only is enforced per frame, not only at admission. The session record persists whether a
+lease authorized control; the relay refuses a `STREAM_KIND_CONTROL` frame from the client end
+of a read-only session with `control_not_authorized`, without ending the stream, so a viewer
+that keeps receiving telemetry stays connected. A control session's frames are accepted, and
+revocation ends the stream before the next frame can be sent.
+
+Leases are **not yet an authorization boundary in the security sense**: with no local password
+login or MFA, the admin-token holder asserts `actor_id`/`user_id` in the request. The lease
+rules constrain what a client may do once its identity is accepted; they do not authenticate
+that identity. Local accounts and MFA (production-ops plan) turn them into a real boundary.
+
 ## Telemetry
 
 `POST /api/devices/{id}/telemetry` accepts one report and keeps a bounded window per device:
 at most 16 retained samples and one small aggregate (min/max/mean plus the latest value), for
 at most 200 devices. A 201st device is refused `429 telemetry_capacity` rather than evicting a
 tracked device. A non-finite CPU reading, a battery outside 0-100, or memory usage above the
-reported total is refused `400 invalid_sample`. Aggregates live in memory; no raw sample log,
-file, or media byte is persisted, and unknown JSON fields are dropped rather than retained.
+reported total is refused `400 invalid_sample`. Aggregates live in memory only: no raw sample
+log, file, or media byte is persisted, and unknown JSON fields are dropped rather than
+retained. **Telemetry history does not survive a server restart** — the aggregate is rebuilt
+from the reports that arrive after it starts.
 
 Freshness is explicit: `fresh` inside 90 seconds (three missed 30-second reports), `stale`
 after that, `missing` when no report has ever arrived. The status surface reports the state
@@ -206,10 +224,16 @@ it knows; a stale reading keeps its value and is labelled stale.
 
 ## Retention
 
-`RetentionJob::run(now_ms)` is deterministic and deletes session records, control leases,
-lease links, and telemetry aggregates that ended more than 30 days earlier. `main` runs it
-once at startup and then every six hours through `spawn_interval`; there is no separate
-scheduler daemon. A failed run is logged and retried on the next tick.
+`RetentionJob::run(now_ms)` is deterministic and deletes session records, control leases, and
+lease links that ended more than 30 days earlier. `main` runs it once at startup and then
+every six hours through `spawn_interval`; there is no separate scheduler daemon. A failed run
+is logged and retried on the next tick.
+
+The 30-day window applies to leases and session records (and to audit events once they exist).
+Telemetry aggregates are in-memory and not part of that history: the job's aggregate purge
+only bounds memory, and a restart clears them regardless of age. Device records and
+enrollment tokens are not aged out, because deleting an enrolled device would orphan a live
+device.
 
 ## Configuration
 

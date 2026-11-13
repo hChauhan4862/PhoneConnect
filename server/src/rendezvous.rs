@@ -823,6 +823,8 @@ pub async fn create_session(
         created_at_ms: now,
         expires_at_ms,
         revoked_at_ms: None,
+        // Persisted so the relay can refuse control frames from a read-only session.
+        control: control_lease.is_some(),
     };
     state.store.insert_session(session.clone()).await?;
     if let Some(lease) = control_lease {

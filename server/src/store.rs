@@ -122,6 +122,9 @@ pub struct SessionRecord {
     pub created_at_ms: UnixMs,
     pub expires_at_ms: UnixMs,
     pub revoked_at_ms: Option<UnixMs>,
+    /// Whether a control lease authorized this session. A read-only session may receive
+    /// events but may not send control frames; the relay enforces this per frame.
+    pub control: bool,
 }
 
 impl SessionRecord {
@@ -399,7 +402,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     client_identity_key TEXT NOT NULL DEFAULT '',
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
-    revoked_at_ms INTEGER
+    revoked_at_ms INTEGER,
+    control INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS control_leases (
     lease_id TEXT PRIMARY KEY,
@@ -681,8 +685,8 @@ impl DeviceStore for SqliteStore {
                 .execute(
                     "INSERT INTO sessions
                      (session_id, device_id, owner_id, capability_hash, client_identity_key,
-                      created_at_ms, expires_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                      created_at_ms, expires_at_ms, control)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         session.session_id,
                         session.device_id,
@@ -690,7 +694,8 @@ impl DeviceStore for SqliteStore {
                         session.capability_hash,
                         session.client_identity_key,
                         session.created_at_ms,
-                        session.expires_at_ms
+                        session.expires_at_ms,
+                        session.control
                     ],
                 )
                 .map_err(backend_error)?;
@@ -1129,7 +1134,8 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
 
 const SESSION_SELECT: &str = "SELECT s.session_id, s.device_id, s.owner_id, s.capability_hash,
                                      s.client_identity_key, s.created_at_ms, s.expires_at_ms,
-                                     s.revoked_at_ms, d.identity_public_key, d.revoked_at_ms
+                                     s.revoked_at_ms, d.identity_public_key, d.revoked_at_ms,
+                                     s.control
                               FROM sessions s JOIN devices d ON d.device_id = s.device_id";
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -1143,6 +1149,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         expires_at_ms: row.get(6)?,
         revoked_at_ms: row.get(7)?,
         device_identity_key: row.get(8)?,
+        control: row.get(10)?,
     })
 }
 
@@ -1161,6 +1168,12 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
         "sessions",
         "client_identity_key",
         "ALTER TABLE sessions ADD COLUMN client_identity_key TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "sessions",
+        "control",
+        "ALTER TABLE sessions ADD COLUMN control INTEGER NOT NULL DEFAULT 0",
     )?;
     Ok(())
 }

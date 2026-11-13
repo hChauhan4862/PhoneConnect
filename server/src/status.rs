@@ -259,13 +259,26 @@ async fn session_view(
     device: &DeviceRecord,
     now: UnixMs,
 ) -> Result<SessionView, StatusError> {
-    let Some(record) = state
+    // Report the session a client would actually join. Only when none is live does the
+    // newest ended session explain why there is nothing to join.
+    let live = state
         .store
-        .newest_session_for_device(&device.device_id)
+        .latest_session_for_device(&device.device_id, now)
         .await
-        .map_err(StatusError::from)?
-    else {
-        return Ok(SessionView::absent());
+        .map_err(StatusError::from)?;
+    let record = match live {
+        Some(record) => record,
+        None => {
+            let Some(ended) = state
+                .store
+                .newest_session_for_device(&device.device_id)
+                .await
+                .map_err(StatusError::from)?
+            else {
+                return Ok(SessionView::absent());
+            };
+            ended
+        }
     };
     let session_state = if record.is_revoked() {
         SessionState::Revoked

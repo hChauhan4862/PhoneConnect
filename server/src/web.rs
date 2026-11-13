@@ -78,8 +78,17 @@ impl WebUi {
     /// app's own routes, its assets, and unknown paths.
     pub async fn serve(&self, request: Request) -> Response {
         let path = request.uri().path().to_owned();
-        if is_api_path(&path) {
+
+        // Classify on the decoded path: `/api%2Fnope` is an API path, not an app route.
+        let decoded = match percent_decode(&path) {
+            Ok(decoded) => decoded,
+            Err(()) => return not_found(),
+        };
+        if is_api_path(&decoded) {
             return api_not_found();
+        }
+        if is_unsafe_path(&decoded) {
+            return not_found();
         }
         if request.method() != Method::GET && request.method() != Method::HEAD {
             let mut response = (
@@ -91,14 +100,6 @@ impl WebUi {
                 .headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
             return secure(response);
-        }
-
-        let decoded = match percent_decode(&path) {
-            Ok(decoded) => decoded,
-            Err(()) => return not_found(),
-        };
-        if is_unsafe_path(&decoded) {
-            return not_found();
         }
         let relative = decoded.trim_start_matches('/');
         if !relative.is_empty() {

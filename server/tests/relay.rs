@@ -15,17 +15,28 @@ use phoneconnect_server::store::{DeviceStore, SessionRecord, StoreError};
 const PAYLOAD_MARKER: &[u8] = b"PC-RELAY-PAYLOAD-MUST-NOT-PERSIST";
 
 fn envelope(session_id: &str, payload: &[u8]) -> Envelope {
+    envelope_of_kind(StreamKind::Control, session_id, payload)
+}
+
+fn envelope_of_kind(stream_kind: StreamKind, session_id: &str, payload: &[u8]) -> Envelope {
     let device_id = DeviceId::new("dev_relay_test").expect("device id");
     let session = SessionId::new(session_id).expect("session id");
     let request = RequestId::new("req_1").expect("request id");
-    let mut envelope = Envelope::new(StreamKind::Control, &device_id, &session, &request);
+    let mut envelope = Envelope::new(stream_kind, &device_id, &session, &request);
     envelope.payload = payload.to_vec();
     envelope
 }
 
 async fn opened_session(app: &TestApp) -> (String, String) {
     let (device_id, credential) = app.enroll_new("user-a").await;
-    let session = app.create_session(&device_id).await;
+    // Control frames travel over a session a control lease authorized; a read-only session
+    // refuses them (see the read-only tests below).
+    let (status, body) = app.acquire_lease(&device_id, "user-a", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "lease failed: {body}");
+    let (status, session) = app
+        .create_control_session(&device_id, "user-a", &TestApp::identity_key())
+        .await;
+    assert_eq!(status, StatusCode::OK, "control session failed: {session}");
     let session_id = session["session_id"]
         .as_str()
         .expect("session_id")
@@ -536,6 +547,7 @@ async fn relay_authorization_details_are_independently_checkable() {
         created_at_ms: 1_000,
         expires_at_ms: 2_000,
         revoked_at_ms: None,
+        control: true,
     };
     assert_eq!(authorize_relay(&record, 1_999), Ok(()));
     assert_eq!(
@@ -1180,7 +1192,13 @@ mod transport {
     async fn relay_transport_forwards_frames_over_the_advertised_lease_endpoint() {
         let app = TestApp::new();
         let (device_id, credential) = app.enroll_new("user-a").await;
-        let session = app.create_session(&device_id).await;
+        // The client sends a control frame, so this is a leased control session.
+        let (status, body) = app.acquire_lease(&device_id, "user-a", 600).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, session) = app
+            .create_control_session(&device_id, "user-a", &TestApp::identity_key())
+            .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
         let session_id = session["session_id"]
             .as_str()
             .expect("session_id")
@@ -1428,5 +1446,132 @@ async fn relay_authorization_is_cached_within_the_poll_bound() {
             .err(),
         Some(RelayClose::SessionRevoked),
         "revocation takes effect within the poll bound"
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_session_cannot_send_control_frames() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    // A session created without a control lease is read-only by construction.
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    let (status, body) = app.relay_upgrade(&session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let device = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    // A control command from a read-only session is refused explicitly.
+    assert_eq!(
+        client
+            .send_frame(&envelope(&session_id, b"command"))
+            .await
+            .err(),
+        Some(RelayClose::ControlNotAuthorized {
+            session_id: session_id.clone()
+        })
+    );
+
+    // The refusal is per frame: the read-only peer still receives device telemetry.
+    let telemetry = envelope_of_kind(StreamKind::Events, &session_id, b"battery=64");
+    device
+        .send_frame(&telemetry)
+        .await
+        .expect("device telemetry accepted");
+    assert_eq!(
+        client.recv_frame().await.expect("read-only peer receives"),
+        telemetry,
+        "a refused control frame must not tear down the read-only stream"
+    );
+}
+
+#[tokio::test]
+async fn a_control_session_may_send_control_frames() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, body) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, session) = app
+        .create_control_session(&device_id, "owner-1", &TestApp::identity_key())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session_id = session["session_id"].as_str().expect("session_id");
+    let capability = session["capability"].as_str().expect("capability");
+    let (status, body) = app.relay_upgrade(session_id, Some(capability)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let device = app
+        .state
+        .relay
+        .attach(session_id, PeerRole::Device)
+        .await
+        .expect("device attaches");
+    let client = app
+        .state
+        .relay
+        .attach(session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let command = envelope(session_id, b"command");
+    client
+        .send_frame(&command)
+        .await
+        .expect("a control session may command");
+    assert_eq!(device.recv_frame().await.expect("device receives"), command);
+}
+
+#[tokio::test]
+async fn lease_revocation_refuses_control_frames_immediately() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+    let lease_id = granted["lease_id"].as_str().expect("lease id");
+    let (status, session) = app
+        .create_control_session(&device_id, "owner-1", &TestApp::identity_key())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let capability = session["capability"].as_str().expect("capability");
+    app.relay_upgrade(&session_id, Some(capability)).await;
+    let client = app
+        .state
+        .relay
+        .attach(&session_id, PeerRole::Client)
+        .await
+        .expect("client attaches");
+
+    let (status, body) = app.revoke_lease(lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The revocation closed the stream in the same request, so the very next control frame
+    // is refused with the explicit lease reason.
+    assert_eq!(
+        client
+            .send_frame(&envelope(&session_id, b"after-revoke"))
+            .await
+            .err(),
+        Some(RelayClose::LeaseRevoked {
+            lease_id: lease_id.to_owned()
+        })
     );
 }

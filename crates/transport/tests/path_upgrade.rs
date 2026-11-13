@@ -65,6 +65,7 @@ impl Harness {
             created_at_ms: NOW_MS,
             expires_at_ms: NOW_MS + 300_000,
             revoked_at_ms: None,
+            control: true,
         };
         store
             .insert_enrollment_token(EnrollmentTokenRecord {
@@ -1629,6 +1630,7 @@ async fn the_websocket_relay_measures_its_own_round_trip() {
         created_at_ms: NOW_MS,
         expires_at_ms: NOW_MS + 300_000,
         revoked_at_ms: None,
+        control: true,
     };
     store.insert_session(record.clone()).await.expect("session");
 
