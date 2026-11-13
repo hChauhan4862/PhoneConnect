@@ -83,8 +83,8 @@ class HubSessionTest {
                 object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         relayOpened = true
-                        // A frame the device must open, then a terminal revocation close.
-                        webSocket.send(peer.seal(controlEnvelope()).getOrThrow().toByteString())
+                        // A routing frame the device must unwrap and open, then a terminal close.
+                        webSocket.send(routingFrame(peer.seal(controlEnvelope()).getOrThrow()).toByteString())
                         webSocket.close(1008, "device_revoked")
                     }
                 },
@@ -105,10 +105,16 @@ class HubSessionTest {
         assertEquals("/api/sessions/sess_1/ticket", server.takeRequest().path)
         val rendezvous = server.takeRequest()
         assertEquals("/api/sessions/sess_1/candidates", rendezvous.path)
+        assertEquals("the nonce is published exactly once per attempt", "POST", rendezvous.method)
+        val publishBody = JSONObject(rendezvous.body.readUtf8())
         assertEquals(
-            "a relay-only device must not publish a direct candidate endpoint",
-            "GET",
-            rendezvous.method,
+            "redeeming the attempt's ticket publishes its nonce",
+            DEVICE_NONCE,
+            publishBody.getJSONObject("ticket").getString("nonce"),
+        )
+        assertTrue(
+            "a relay-only device must not advertise an endpoint",
+            !publishBody.has("endpoint"),
         )
         val relayRequest = server.takeRequest()
         assertEquals("/api/sessions/sess_1/relay", relayRequest.path)
@@ -231,8 +237,12 @@ class HubSessionTest {
         )
         assertEquals("/api/devices/dev_1/sessions/next", server.takeRequest().path)
         assertEquals("/api/sessions/sess_1/ticket", server.takeRequest().path)
-        assertEquals("the peer nonce is polled until it exists", "/api/sessions/sess_1/candidates", server.takeRequest().path)
-        assertEquals("/api/sessions/sess_1/candidates", server.takeRequest().path)
+        val publish = server.takeRequest()
+        assertEquals("/api/sessions/sess_1/candidates", publish.path)
+        assertEquals("one ticket redemption per attempt", "POST", publish.method)
+        val poll = server.takeRequest()
+        assertEquals("/api/sessions/sess_1/candidates", poll.path)
+        assertEquals("polling is read-only", "GET", poll.method)
     }
 
     @Test
@@ -313,7 +323,11 @@ class HubSessionTest {
             SessionEnd.Failed(ConnectionFailure.Retryable(com.phoneconnect.agent.ReconnectReason.TRANSPORT_CLOSED)),
             end,
         )
-        assertEquals("a relay-only device must never POST a candidate", 0, dispatcher.candidatePosts.get())
+        assertEquals(
+            "the attempt's ticket is redeemed exactly once",
+            1,
+            dispatcher.candidatePosts.get(),
+        )
         assertTrue("the device must poll until the peer registers", dispatcher.candidatePolls.get() >= 3)
     }
 
@@ -443,6 +457,18 @@ class HubSessionTest {
         Epoch.of(PEER_NONCE, DEVICE_NONCE).getOrThrow(),
     ).getOrThrow()
 
+    /** A length-prefixed routing envelope whose payload is the sealed frame. */
+    private fun routingFrame(sealed: ByteArray): ByteArray {
+        val outer = EnvelopeCodec.newEnvelope(
+            streamKind = StreamKind.STREAM_KIND_CONTROL,
+            deviceId = "dev_1",
+            sessionId = "sess_1",
+        ).toBuilder()
+            .setPayload(com.google.protobuf.ByteString.copyFrom(sealed))
+            .build()
+        return EnvelopeCodec.encode(outer).getOrThrow()
+    }
+
     private fun controlEnvelope() = EnvelopeCodec.newEnvelope(
         streamKind = StreamKind.STREAM_KIND_CONTROL,
         deviceId = "dev_1",
@@ -495,7 +521,9 @@ class HubSessionTest {
 
             request.path?.endsWith("/candidates") == true && request.method == "POST" -> {
                 candidatePosts.incrementAndGet()
-                val nonce = JSONObject(request.body.readUtf8()).getJSONObject("ticket").getString("nonce")
+                val body = JSONObject(request.body.readUtf8())
+                assertTrue("the device must not advertise an endpoint", !body.has("endpoint"))
+                val nonce = body.getJSONObject("ticket").getString("nonce")
                 if (!redeemed.add(nonce)) {
                     MockResponse().setResponseCode(409).setBody("""{"error":"ticket_replayed"}""")
                 } else {

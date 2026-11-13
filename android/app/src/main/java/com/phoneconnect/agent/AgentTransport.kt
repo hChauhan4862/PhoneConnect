@@ -1,11 +1,18 @@
 package com.phoneconnect.agent
 
 import com.google.protobuf.ByteString
+import com.phoneconnect.agent.crypto.SealedFrame
 import com.phoneconnect.agent.crypto.SessionCipher
 import com.phoneconnect.agent.wire.Envelope
 import com.phoneconnect.agent.wire.StreamKind
 
-/** One message delivered by a [FrameChannel]: a whole sealed frame, or the end of the stream. */
+/**
+ * One message delivered by a [FrameChannel]: a whole routing frame, or the end of the stream.
+ *
+ * A routing frame is a length-prefixed PhoneConnect envelope whose payload is the sealed
+ * frame, exactly what `ConnectedPath::relay_envelope` puts on the relay. The relay validates
+ * and bounds that envelope without reading its payload.
+ */
 sealed interface ChannelEvent {
     data class Frame(val bytes: ByteArray) : ChannelEvent
 
@@ -14,12 +21,11 @@ sealed interface ChannelEvent {
 }
 
 /**
- * The authenticated byte channel one session runs on: exactly one sealed PhoneConnect frame
- * per message.
+ * The authenticated byte channel one session runs on: exactly one routing frame per message.
  *
- * A channel moves ciphertext and reports the server's close code; it never sees plaintext.
- * The relay lease (`409 relay_unavailable`) never produces a channel, so a session that
- * cannot relay ends before this interface is reached.
+ * A channel moves bytes and reports the server's close code; it never sees plaintext and never
+ * unwraps the sealed payload. The relay lease (`409 relay_unavailable`) never produces a
+ * channel, so a session that cannot relay ends before this interface is reached.
  */
 interface FrameChannel : AutoCloseable {
     suspend fun send(frame: ByteArray)
@@ -77,7 +83,10 @@ class AgentTransport(
         ended?.let { return Inbound.End(it) }
         return when (val event = channel.receive()) {
             is ChannelEvent.Frame -> {
-                val envelope = cipher.open(event.bytes).getOrElse { error ->
+                val sealed = routingPayload(event.bytes).getOrElse { error ->
+                    return end(error.asProtocolFailure())
+                }
+                val envelope = cipher.open(sealed).getOrElse { error ->
                     return end(error.asProtocolFailure())
                 }
                 // A frame sealed by this session can still be addressed elsewhere if a peer
@@ -115,8 +124,36 @@ class AgentTransport(
         // The sequence number is consumed only once the frame is actually sealed and handed
         // to the channel: a failed send must not leave a hole in a monotonic stream.
         val sealed = cipher.seal(envelope).getOrThrow()
-        channel.send(sealed)
+        channel.send(routingFrame(sealed))
         sequences[kind] = sequence + 1
+    }
+
+    /**
+     * Wraps a sealed frame in the routing envelope the relay validates and bounds. Mirrors
+     * `ConnectedPath::relay_envelope`: the stream kind comes from the sealed header, the ids
+     * are this session's, and the request id and sequence are unset.
+     */
+    private fun routingFrame(sealed: ByteArray): ByteArray {
+        val number = SealedFrame.streamKind(sealed)
+            ?: throw WireError.MalformedBody("sealed frame has no readable stream kind")
+        val kind = EnvelopeCodec.streamKindOf(number)
+            ?: throw WireError.UnknownStreamKind(number)
+        val outer = EnvelopeCodec.newEnvelope(kind, deviceId, sessionId).toBuilder()
+            .setPayload(ByteString.copyFrom(sealed))
+            .build()
+        return EnvelopeCodec.encode(outer).getOrThrow()
+    }
+
+    /** Decodes one routing frame and returns its sealed payload. */
+    private fun routingPayload(frame: ByteArray): Result<ByteArray> = runCatching {
+        val decoded = EnvelopeCodec.decode(frame).getOrElse { throw it }
+        if (decoded.consumed != frame.size) {
+            throw WireError.MalformedBody("routing frame carries ${frame.size - decoded.consumed} trailing bytes")
+        }
+        if (decoded.envelope.deviceId != deviceId || decoded.envelope.sessionId != sessionId) {
+            throw WireError.MalformedBody("routing frame is for another session or device")
+        }
+        decoded.envelope.payload.toByteArray()
     }
 
     private fun end(failure: ConnectionFailure): Inbound.End {

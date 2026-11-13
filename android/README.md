@@ -16,12 +16,13 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    (`POST /api/sessions`); the device credential reads it from
    `GET /api/devices/{id}/sessions/next` with a device-role ticket. The device never creates
    sessions and never holds client or admin credentials.
-3. **Rendezvous.** `GET /ticket` mints a fresh device ticket. The device then *reads*
-   `GET /candidates` until the client's redemption nonce appears; the two ticket nonces are the
-   per-connection key epoch. It never redeems its own ticket and never publishes a candidate:
-   a ticket nonce is single-use, so re-posting it would answer `409 ticket_replayed`, and a
-   relay-only device has no direct endpoint to advertise (a wildcard address would be handed
-   to the peer as a direct candidate that can never answer).
+3. **Rendezvous.** `GET /ticket` mints a fresh device ticket. The device then redeems that
+   ticket **once** at `POST /candidates` with no `endpoint`: this publishes its half of the
+   connection epoch without advertising a probe target (a relay-only device has no direct
+   address, and a wildcard would be handed to the peer as a candidate that can never answer).
+   It then polls the read-only `GET /candidates` until the client's nonce appears. The two
+   ticket nonces are the per-connection key epoch. A ticket is single-use, so an attempt that
+   re-posted it would answer `409 ticket_replayed`; polling never redeems one.
 4. **Transport.** `SessionCipher` agrees X25519 → HKDF-SHA256 keys and seals every frame;
    `RelayFrameChannel` attaches to the relay WebSocket (binary frame per message, WebSocket
    ping every 10 s) and reports the server's close code.

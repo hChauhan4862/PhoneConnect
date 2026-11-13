@@ -133,12 +133,31 @@ class AgentTransportTest {
         transport.sendEvent("c".toByteArray())
         transport.sendControl("request-3", "d".toByteArray())
 
-        val opened = channel.sent.map { peer.open(it).getOrThrow() }
+        val opened = channel.sent.map { peer.open(unwrap(it)).getOrThrow() }
         assertEquals(listOf(1, 2, 3), opened.filter { it.streamKind == StreamKind.STREAM_KIND_CONTROL }.map { it.sequence })
         assertEquals(listOf(1), opened.filter { it.streamKind == StreamKind.STREAM_KIND_EVENTS }.map { it.sequence })
         assertEquals(DEVICE_ID, opened.map { it.deviceId }.toSet().single())
         assertEquals(SESSION_ID, opened.map { it.sessionId }.toSet().single())
         assertArrayEquals("d".toByteArray(), opened.last().payload.toByteArray())
+    }
+
+    @Test
+    fun `outbound frames carry the sealed payload inside a routing envelope`() = runTest {
+        val peer = clientCipher()
+        val channel = FakeFrameChannel()
+        val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher())
+
+        transport.sendControl("request-1", "a".toByteArray())
+
+        val routing = EnvelopeCodec.decode(channel.sent.single()).getOrThrow()
+        assertEquals("the routing frame is the only frame in the message", routing.consumed, channel.sent.single().size)
+        assertEquals(StreamKind.STREAM_KIND_CONTROL, routing.envelope.streamKind)
+        assertEquals(DEVICE_ID, routing.envelope.deviceId)
+        assertEquals(SESSION_ID, routing.envelope.sessionId)
+        assertEquals("a routing envelope has no application sequence", 0, routing.envelope.sequence)
+        assertEquals("a routing envelope has no request id", "", routing.envelope.requestId)
+        // The payload is the sealed frame, which the peer opens to the real envelope.
+        assertEquals("a".toByteArray().toList(), peer.open(routing.envelope.payload.toByteArray()).getOrThrow().payload.toByteArray().toList())
     }
 
     @Test
@@ -151,7 +170,7 @@ class AgentTransportTest {
         assertTrue("the channel failure must surface", failure.exceptionOrNull() is IllegalStateException)
 
         transport.sendControl("request-2", "b".toByteArray())
-        assertEquals(1, peer.open(channel.sent.single()).getOrThrow().sequence)
+        assertEquals(1, peer.open(unwrap(channel.sent.single())).getOrThrow().sequence)
     }
 
     @Test
@@ -206,7 +225,9 @@ class AgentTransportTest {
             .setSessionId("sess_someone_else")
             .setDeviceId(DEVICE_ID)
             .build()
-        val channel = FakeFrameChannel(events = listOf(ChannelEvent.Frame(peer.seal(foreign).getOrThrow())))
+        val channel = FakeFrameChannel(
+            events = listOf(ChannelEvent.Frame(wrap(peer.seal(foreign).getOrThrow()))),
+        )
         val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher())
 
         val inbound = transport.receive()
@@ -222,7 +243,9 @@ class AgentTransportTest {
             .setSessionId(SESSION_ID)
             .setDeviceId("dev_someone_else")
             .build()
-        val channel = FakeFrameChannel(events = listOf(ChannelEvent.Frame(peer.seal(foreign).getOrThrow())))
+        val channel = FakeFrameChannel(
+            events = listOf(ChannelEvent.Frame(wrap(peer.seal(foreign).getOrThrow()))),
+        )
         val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher())
 
         val inbound = transport.receive()
@@ -235,7 +258,9 @@ class AgentTransportTest {
     fun `an inbound frame is opened and surfaced to the agent`() = runTest {
         val peer = clientCipher()
         val expected = controlEnvelope(sequence = 7)
-        val channel = FakeFrameChannel(events = listOf(ChannelEvent.Frame(peer.seal(expected).getOrThrow())))
+        val channel = FakeFrameChannel(
+            events = listOf(ChannelEvent.Frame(wrap(peer.seal(expected).getOrThrow()))),
+        )
         val transport = AgentTransport(channel, DEVICE_ID, SESSION_ID, deviceCipher())
 
         val inbound = transport.receive()
@@ -265,6 +290,20 @@ class AgentTransportTest {
 
         assertTrue("expected an InvalidIdentifier, got $error", error is WireError.InvalidIdentifier)
         assertTrue(channel.sent.isEmpty())
+    }
+
+    /** The routing envelope the relay carries: a length-prefixed envelope around the sealed frame. */
+    private fun wrap(sealed: ByteArray): ByteArray {
+        val outer = EnvelopeCodec.newEnvelope(StreamKind.STREAM_KIND_CONTROL, DEVICE_ID, SESSION_ID).toBuilder()
+            .setPayload(com.google.protobuf.ByteString.copyFrom(sealed))
+            .build()
+        return EnvelopeCodec.encode(outer).getOrThrow()
+    }
+
+    private fun unwrap(routing: ByteArray): ByteArray {
+        val decoded = EnvelopeCodec.decode(routing).getOrThrow()
+        assertEquals("routing frame must be exactly one frame", routing.size, decoded.consumed)
+        return decoded.envelope.payload.toByteArray()
     }
 
     private fun transportFor(closeReason: String) = AgentTransport(

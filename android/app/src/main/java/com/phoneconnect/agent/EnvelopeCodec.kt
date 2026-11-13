@@ -150,6 +150,16 @@ object EnvelopeCodec {
         else -> 0
     }
 
+    /** The stream kind for a wire number, or `null` when the number is not one this build knows. */
+    fun streamKindOf(number: Int): StreamKind? = when (number) {
+        1 -> StreamKind.STREAM_KIND_CONTROL
+        2 -> StreamKind.STREAM_KIND_EVENTS
+        3 -> StreamKind.STREAM_KIND_FILE
+        4 -> StreamKind.STREAM_KIND_MEDIA
+        5 -> StreamKind.STREAM_KIND_PROXY
+        else -> null
+    }
+
     /** Checks what a relay or peer must not be trusted about; returns the decoded kind. */
     fun validate(envelope: Envelope): StreamKind {
         if (envelope.protocolVersion != PROTOCOL_VERSION) {

@@ -70,12 +70,18 @@ class TransportSessionRunner(
             return SessionEnd.Failed(ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR))
         }
         // The two ticket nonces are the per-connection epoch. This device has no direct path,
-        // so it publishes no candidate endpoint (a wildcard address would be advertised to the
-        // peer as a direct candidate that can never answer); it only reads the opposite
-        // peer's nonce once that peer has registered.
-        val candidates = when (val rendezvous = awaitPeerNonce(credential, session.sessionId)) {
-            is RendezvousWait.Rendezvous -> rendezvous.candidates
-            is RendezvousWait.Ended -> return rendezvous.end
+        // so it publishes its nonce exactly once without an endpoint, then reads the opposite
+        // peer's nonce. Polling never redeems a ticket: a nonce is single-use, and a device
+        // that is up before the client must not burn it and stop for good.
+        val registered = hub.registerNonce(credential, session.sessionId, ticket)
+            .getOrElse { error -> return SessionEnd.Failed(error.toFailure()) }
+        val candidates = if (registered.peerNonce != null) {
+            registered
+        } else {
+            when (val rendezvous = awaitPeerNonce(credential, session.sessionId)) {
+                is RendezvousWait.Rendezvous -> rendezvous.candidates
+                is RendezvousWait.Ended -> return rendezvous.end
+            }
         }
         return connectOverRelay(identity, credential, deviceId, session, ticket, candidates, onConnected)
     }
