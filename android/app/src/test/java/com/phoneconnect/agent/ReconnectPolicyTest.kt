@@ -66,17 +66,30 @@ class ReconnectPolicyTest {
     }
 
     @Test
-    fun `terminal failures are explicit and name what they invalidate`() {
+    fun `only a dead credential stops the agent while a dead session retries`() {
+        // Terminal means the agent stops. Only the two credential failures qualify: every
+        // other failure leaves the enrollment usable and must resume on a new session, or a
+        // routine lease revocation would take the phone offline until reboot.
         assertTrue(ConnectionFailure.DeviceRevoked.isTerminal)
         assertTrue(ConnectionFailure.NotEnrolled.isTerminal)
-        assertTrue(ConnectionFailure.RelayUnavailable.isTerminal)
+        assertFalse(ConnectionFailure.RelayUnavailable.isTerminal)
+        assertFalse(ConnectionFailure.SessionEnded.isTerminal)
         assertFalse(ConnectionFailure.Retryable(ReconnectReason.TRANSPORT_CLOSED).isTerminal)
 
         assertEquals(Invalidation.ENROLLMENT, ConnectionFailure.DeviceRevoked.invalidation)
         assertEquals(Invalidation.ENROLLMENT, ConnectionFailure.NotEnrolled.invalidation)
-        // A relay 409 is terminal for the session id, not for the enrollment: the server
-        // documents "create a new session", and the credential stays valid.
-        assertEquals(Invalidation.SESSION, ConnectionFailure.RelayUnavailable.invalidation)
-        assertEquals(Invalidation.NONE, ConnectionFailure.Retryable(ReconnectReason.PROTOCOL_ERROR).invalidation)
+        // The session id is not persisted, so ending the loop is the whole invalidation.
+        assertEquals(Invalidation.NONE, ConnectionFailure.RelayUnavailable.invalidation)
+        assertEquals(Invalidation.NONE, ConnectionFailure.SessionEnded.invalidation)
+
+        // A session-end retries with its own reason so the status surface can say why.
+        assertEquals(ReconnectReason.SESSION_ENDED, ConnectionFailure.SessionEnded.retryReason)
+        assertEquals(ReconnectReason.SESSION_ENDED, ConnectionFailure.RelayUnavailable.retryReason)
+        assertEquals(
+            ReconnectReason.TICKET_EXPIRED,
+            ConnectionFailure.Retryable(ReconnectReason.TICKET_EXPIRED).retryReason,
+        )
+        assertEquals(null, ConnectionFailure.DeviceRevoked.retryReason)
+        assertEquals(null, ConnectionFailure.NotEnrolled.retryReason)
     }
 }

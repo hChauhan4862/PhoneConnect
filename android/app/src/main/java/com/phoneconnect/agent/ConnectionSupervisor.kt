@@ -38,7 +38,9 @@ sealed interface SupervisorOutcome {
 /**
  * Owns the reconnect loop: one session at a time, bounded exponential backoff with jitter,
  * a reset after a healthy connection, and an explicit terminal class that stops retrying
- * and applies the failure's [Invalidation].
+ * and applies the failure's [Invalidation]. A session that ended (expiry, close, revoked
+ * lease, relay 409) is not terminal: the loop waits out its backoff and awaits a new
+ * session, so a routine revocation never stops the agent.
  *
  * A network-available callback wakes the backoff wait, so recovery does not have to sit
  * out a delay that was chosen before the network returned.
@@ -89,7 +91,8 @@ class ConnectionSupervisor(
                 SessionEnd.Cancelled -> return SupervisorOutcome.Cancelled
                 is SessionEnd.Failed -> {
                     val failure = end.failure
-                    if (failure.isTerminal) {
+                    val reason = failure.retryReason
+                    if (reason == null) {
                         stop(failure)
                         return SupervisorOutcome.Terminal(failure)
                     }
@@ -98,10 +101,6 @@ class ConnectionSupervisor(
                         attempt = 0
                     }
                     attempt += 1
-                    val reason = when (failure) {
-                        is ConnectionFailure.Retryable -> failure.reason
-                        else -> ReconnectReason.PROTOCOL_ERROR
-                    }
                     val delayMs = policy.nextDelay(attempt, reason)
                     status(ConnectionStatus.Reconnecting(attempt, delayMs, reason))
                     withTimeoutOrNull(delayMs) { networkRestored.receive() }

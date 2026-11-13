@@ -54,17 +54,52 @@ class ConnectionSupervisorTest {
     }
 
     @Test
-    fun `a terminal relay 409 ends the session but keeps the enrollment`() = runTest {
+    fun `a revoked lease ends the stream but the agent resumes on a new session`() = runTest {
         val store = FakeEnrollmentStore()
-        val runner = ScriptedRunner(listOf(Step(end = SessionEnd.Failed(ConnectionFailure.RelayUnavailable))))
+        val runner = ScriptedRunner(
+            listOf(
+                Step(healthy = ConnectionPath.RELAY, end = SessionEnd.Failed(ConnectionFailure.SessionEnded)),
+                // The next session is healthy too; a later device revocation is what stops it.
+                Step(healthy = ConnectionPath.RELAY, end = SessionEnd.Failed(ConnectionFailure.DeviceRevoked)),
+            ),
+        )
         val statuses = mutableListOf<ConnectionStatus>()
 
         val outcome = supervisor(store, runner, statuses).run()
 
-        assertEquals(SupervisorOutcome.Terminal(ConnectionFailure.RelayUnavailable), outcome)
-        assertEquals("a relay 409 must not destroy the device credential", emptyList<ClearReason>(), store.clears)
-        assertEquals(1, runner.starts)
-        assertEquals("dev_1", store.info()?.deviceId)
+        assertEquals(
+            "a session that ended resumes; only the revocation stops the agent",
+            SupervisorOutcome.Terminal(ConnectionFailure.DeviceRevoked),
+            outcome,
+        )
+        assertEquals("a session end must never clear the credential", 2, runner.starts)
+        assertEquals(
+            listOf(ConnectionStatus.Reconnecting(1, 1_000L, ReconnectReason.SESSION_ENDED)),
+            statuses.filterIsInstance<ConnectionStatus.Reconnecting>(),
+        )
+    }
+
+    @Test
+    fun `a relay 409 resets the session instead of stopping the agent`() = runTest {
+        val store = FakeEnrollmentStore()
+        val runner = ScriptedRunner(
+            listOf(
+                Step(end = SessionEnd.Failed(ConnectionFailure.RelayUnavailable)),
+                Step(end = SessionEnd.Failed(ConnectionFailure.DeviceRevoked)),
+            ),
+        )
+        val statuses = mutableListOf<ConnectionStatus>()
+
+        val outcome = supervisor(store, runner, statuses).run()
+
+        assertEquals(SupervisorOutcome.Terminal(ConnectionFailure.DeviceRevoked), outcome)
+        assertEquals("a relay 409 must be retried on a new session", 2, runner.starts)
+        // Only the later revocation clears anything; the relay 409 itself does not.
+        assertEquals(listOf(ClearReason.REVOKED), store.clears)
+        assertEquals(
+            listOf(ConnectionStatus.Reconnecting(1, 1_000L, ReconnectReason.SESSION_ENDED)),
+            statuses.filterIsInstance<ConnectionStatus.Reconnecting>(),
+        )
     }
 
     @Test

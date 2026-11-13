@@ -21,6 +21,7 @@ import com.phoneconnect.agent.EnvelopeCodec
 import com.phoneconnect.agent.wire.StreamKind
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -165,6 +166,34 @@ class HubSessionTest {
             "exactly one relay attempt, on one session id",
             1,
             relayAttempts.count { it.endsWith("/relay") },
+        )
+    }
+
+    @Test
+    fun `an abandoned session id is skipped until a different one is offered`() = runBlocking {
+        enqueueDiscovery()
+        server.enqueue(MockResponse().setResponseCode(409).setBody("""{"error":"relay_unavailable"}"""))
+        val runner = TransportSessionRunner(hub, pollIntervalMs = 0)
+
+        val first = withTimeout(20_000) { runner.run(store) { } }
+        assertEquals(SessionEnd.Failed(ConnectionFailure.RelayUnavailable), first)
+        drainRequests()
+
+        // The refused session is still the newest; the server then reports none at all.
+        server.enqueue(MockResponse().setBody("""{"session_id":"sess_1","expires_at":1760000000000}"""))
+        server.enqueue(MockResponse().setResponseCode(204))
+        val second = withTimeoutOrNull(2_000) { runner.run(store) { } }
+
+        assertNull("the runner must wait for a new session instead of retiring", second)
+        val paths = drainRequests()
+        assertEquals(
+            "the abandoned id is polled past, never ticketed again: $paths",
+            0,
+            paths.count { it.endsWith("/ticket") },
+        )
+        assertTrue(
+            "the runner keeps asking for a session: $paths",
+            paths.count { it.endsWith("/sessions/next") } >= 2,
         )
     }
 
@@ -374,7 +403,7 @@ class HubSessionTest {
             assertEquals("$code must end the session", SessionEnd.Failed(ConnectionFailure.SessionEnded), end)
             assertEquals(
                 "$code must not delete the credential",
-                Invalidation.SESSION,
+                Invalidation.NONE,
                 (end as SessionEnd.Failed).failure.invalidation,
             )
         }
@@ -401,6 +430,16 @@ class HubSessionTest {
                 expected.invalidation,
             )
         }
+    }
+
+    /** Paths of every request the server has received since the last drain. */
+    private fun drainRequests(): List<String> {
+        val paths = mutableListOf<String>()
+        while (true) {
+            val request = server.takeRequest(50, TimeUnit.MILLISECONDS) ?: break
+            paths += request.path.orEmpty()
+        }
+        return paths
     }
 
     private fun enqueueDiscovery() {

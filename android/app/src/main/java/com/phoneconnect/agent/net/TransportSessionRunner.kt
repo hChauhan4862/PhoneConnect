@@ -30,8 +30,9 @@ import java.io.IOException
  * available and every session reports [ConnectionPath.RELAY]. That is a documented gap, not a
  * silent fallback.
  *
- * A relay `409 relay_unavailable` is terminal for that session id: this runner never retries
- * the same id, which the supervisor turns into [ConnectionFailure.RelayUnavailable].
+ * A relay `409 relay_unavailable` is terminal for that session id: this runner abandons the
+ * id and waits for a different one, while the supervisor retries with
+ * [ConnectionFailure.RelayUnavailable] so the agent stays online.
  */
 @OptIn(IdentityBoundary::class)
 class TransportSessionRunner(
@@ -41,6 +42,9 @@ class TransportSessionRunner(
     private val openChannel: suspend (url: String, credential: String) -> Result<FrameChannel> =
         { url, credential -> RelayFrameChannel.connect(url, credential) },
 ) : SessionRunner {
+    /** A session id whose relay was refused; polling skips it until a new session appears. */
+    private var abandonedSessionId: String? = null
+
     override suspend fun run(store: EnrollmentStore, onConnected: (ConnectionPath) -> Unit): SessionEnd {
         val identity = store.openIdentity() ?: return SessionEnd.Failed(ConnectionFailure.NotEnrolled)
         try {
@@ -120,7 +124,13 @@ class TransportSessionRunner(
                 return SessionEnd.Failed(error.toFailure())
             }
             val channel = openChannel(url, credential)
-                .getOrElse { error -> return SessionEnd.Failed(error.toFailure()) }
+                .getOrElse { error ->
+                    val failure = error.toFailure()
+                    if (failure == ConnectionFailure.RelayUnavailable) {
+                        abandonedSessionId = session.sessionId
+                    }
+                    return SessionEnd.Failed(failure)
+                }
             val transport = AgentTransport(channel, deviceId, session.sessionId, cipher)
             try {
                 onConnected(ConnectionPath.RELAY)
@@ -147,7 +157,9 @@ class TransportSessionRunner(
             currentCoroutineContext().ensureActive()
             val result = hub.assignedSession(credential, deviceId)
             val session = result.getOrElse { error -> return SessionWait.Ended(SessionEnd.Failed(error.toFailure())) }
-            if (session != null) {
+            // A session whose relay was refused stays "active" until it expires. Waiting for
+            // a different id honors "never retry the same session" without stopping the agent.
+            if (session != null && session.sessionId != abandonedSessionId) {
                 return SessionWait.Assigned(session)
             }
             if (pause > 0) delay(pause)

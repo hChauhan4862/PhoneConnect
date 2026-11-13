@@ -110,6 +110,7 @@ class NotificationController(
         ReconnectReason.TRANSPORT_CLOSED -> "connection closed"
         ReconnectReason.TICKET_EXPIRED -> "rendezvous ticket expired"
         ReconnectReason.PROTOCOL_ERROR -> "protocol error"
+        ReconnectReason.SESSION_ENDED -> "session ended; waiting for a new one"
     }
 
     private fun seconds(milliseconds: Long): String =
