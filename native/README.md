@@ -45,6 +45,19 @@ run the same negotiation:
   candidates, now)` for migrating a relay session to direct while keeping the relay as the
   fallback, and `fallback_to_relay` for path degradation. A migration never closes the relay
   session.
+- A freshly committed or re-promoted direct path duplicates every frame onto the relay until
+  a direct frame proves the peer reads direct. The duplication is bounded in time
+  (`PathConfig::transition_timeout`) and frames (`PathConfig::transition_max_frames`), and a
+  relay that answers backpressure ends it early: an unbounded transition would fill the
+  relay's peer queue until the server closed the sender's socket, destroying the fallback.
+- A committed direct path is demoted only when the peer stops answering keepalives, never
+  because the application happened to be blocked in `recv_frame`. A receive longer than
+  `direct_health_timeout` keeps a live path direct, and a direct frame that arrives while
+  the relay is being read re-promotes the path and is surfaced to the caller. Every receive
+  is bounded by `PathConfig::recv_timeout`, including the relay wait.
+- Loss is reported, not hidden: `ConnectedPath::dropped_frames` counts frames the bounded
+  inbound ring dropped for a stalled reader, and `relay_backpressure_events` counts
+  duplicated frames the relay refused.
 - `WebSocketRelay` attaches to the server's framed relay route. A `409 relay_unavailable`
   is terminal for that session id: create a new session, never retry on the old one, and
   read revocation from the stream close reason rather than from the lease status.

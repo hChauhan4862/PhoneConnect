@@ -1521,6 +1521,31 @@ async fn a_path_configuration_without_a_usable_direct_limit_is_refused() {
         .expect_err("an unusable direct limit is refused");
         assert!(matches!(error, PathError::InvalidConfig { .. }), "{error}");
     }
+
+    // A transition that cannot end would duplicate onto the relay without limit.
+    for config in [
+        PathConfig {
+            transition_timeout: Duration::ZERO,
+            ..PathConfig::default()
+        },
+        PathConfig {
+            transition_max_frames: 0,
+            ..PathConfig::default()
+        },
+    ] {
+        let error = ConnectedPath::relay_only(RelayOnlyPath {
+            relay: Arc::clone(&relay),
+            identity: &identity,
+            peer_identity: harness.device_identity.public_key(),
+            session_id: SESSION,
+            device_id: DEVICE_ID,
+            role: TicketRole::Client,
+            epoch: &epoch,
+            config,
+        })
+        .expect_err("an unbounded transition is refused");
+        assert!(matches!(error, PathError::InvalidConfig { .. }), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -2748,5 +2773,617 @@ async fn a_ticket_cannot_open_two_paths() {
     assert!(
         matches!(error, PathError::Ticket(TicketError::AlreadyUsed { .. })),
         "{error}"
+    );
+}
+
+// --------------------------------------------------------------------------------------
+// Fix round 4: receive liveness, a bounded transition, relay-less timeouts, ring loss.
+// --------------------------------------------------------------------------------------
+
+/// Two peers connected over real loopback addresses, so a direct path really validates.
+struct DirectPair {
+    client: ConnectedPath,
+    device: ConnectedPath,
+    client_addr: SocketAddr,
+    device_addr: SocketAddr,
+    client_relay: Option<Arc<RelayProbe>>,
+}
+
+/// Connects both roles with the given config. `relays` says whether each role is given a
+/// relay channel, which is what makes the relay-less cases reachable.
+async fn connect_direct_pair(
+    harness: &Harness,
+    config: PathConfig,
+    relay_latency: Duration,
+    relays: [bool; 2],
+) -> DirectPair {
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+
+    let mut client_builder = client_setup(client_socket, harness)
+        .with_config(config.clone())
+        .at(NOW_MS);
+    let mut device_builder = device_setup(device_socket, harness)
+        .with_config(config)
+        .at(NOW_MS);
+    let mut client_probe = None;
+    if relays[0] {
+        let (relay, probe) = harness
+            .relay_channel(PeerRole::Client, Some(relay_latency))
+            .await;
+        client_builder = client_builder.with_relay(relay);
+        client_probe = Some(probe);
+    }
+    if relays[1] {
+        let (relay, _probe) = harness
+            .relay_channel(PeerRole::Device, Some(relay_latency))
+            .await;
+        device_builder = device_builder.with_relay(relay);
+    }
+
+    let (client, device) = tokio::join!(
+        PathController::connect(client_ticket, client_candidates, client_builder),
+        PathController::connect(device_ticket, device_candidates, device_builder),
+    );
+    DirectPair {
+        client: client.expect("client connects"),
+        device: device.expect("device connects"),
+        client_addr,
+        device_addr,
+        client_relay: client_probe,
+    }
+}
+
+/// A relay that refuses every frame with backpressure, like a server whose peer queue is
+/// full.
+struct SaturatedRelay {
+    sends: AtomicUsize,
+}
+
+#[async_trait]
+impl RelayChannel for SaturatedRelay {
+    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        Err(RelayError::Backpressure)
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
+        std::future::pending().await
+    }
+
+    async fn close(&self) -> Result<(), RelayError> {
+        Ok(())
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+}
+
+/// A `recv_frame` that blocks longer than the health bound must not demote a path whose
+/// keepalives are still answered, and the direct frame that arrives afterwards must be
+/// surfaced instead of being stranded in the direct queue behind a relay read.
+#[tokio::test]
+async fn a_receive_that_outlives_the_health_bound_keeps_a_live_path_direct() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(100),
+            keepalive_interval: Duration::from_millis(30),
+            recv_timeout: Duration::from_secs(2),
+            ..PathConfig::default()
+        },
+        Duration::from_millis(60),
+        // The device gets no relay, so its frame can only arrive on the direct path.
+        [true, false],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    // Commit the client to the direct path with a real direct frame first: a transition path
+    // reads both, so this is what makes the blocked receive exercise the committed state.
+    let warmup = envelope("req-health-warmup", b"commit the path");
+    pair.device.send_frame(&warmup).await.expect("warmup send");
+    assert_eq!(recv(&pair.client).await, warmup);
+    assert!(
+        !pair.client.transition_active(),
+        "the direct frame committed the path"
+    );
+
+    let client = Arc::new(pair.client);
+    let waiting = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.recv_frame().await }
+    });
+
+    // Four health bounds of silence with the peer still answering keepalives.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        client.path_kind(),
+        PathKind::Direct,
+        "a receive blocked past direct_health_timeout must not demote a live path"
+    );
+
+    let frame = envelope("req-slow-recv", b"arrives after the health bound");
+    pair.device.send_frame(&frame).await.expect("direct send");
+    let received = timeout(Duration::from_secs(3), waiting)
+        .await
+        .expect("the blocked receive returns")
+        .expect("receive task")
+        .expect("the direct frame is surfaced to the blocked receive");
+    assert_eq!(received, frame);
+    assert_eq!(client.path_kind(), PathKind::Direct);
+}
+
+/// A genuinely dead path still demotes on the receive side, and the receive is bounded
+/// instead of waiting on the relay forever.
+#[tokio::test]
+async fn a_silent_direct_path_still_demotes_on_receive() {
+    let harness = Harness::new(SESSION).await;
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let proxy = UdpSocket::bind("127.0.0.1:0").await.expect("proxy socket");
+    let proxy_addr = proxy.local_addr().expect("proxy addr");
+    let paused = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let proxy_task = tokio::spawn(
+        AckLossProxy {
+            socket: proxy,
+            client: client_addr,
+            device: device_addr,
+            client_credentials: harness.credentials(PeerRole::Client),
+            device_credentials: harness.credentials(PeerRole::Device),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            drop_switch_acks: false,
+            drop_confirm_from_client: ConfirmLoss::None,
+            paused: Arc::clone(&paused),
+            confirms_dropped: Arc::new(AtomicUsize::new(0)),
+        }
+        .run(Arc::clone(&stop)),
+    );
+
+    let (client_path, device_path) = connect_through_proxy(
+        &harness,
+        proxy_addr,
+        client_socket,
+        device_socket,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(100),
+            keepalive_interval: Duration::from_millis(30),
+            recv_timeout: Duration::from_millis(400),
+            ..PathConfig::default()
+        },
+    )
+    .await;
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    paused.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let started = Instant::now();
+    let error = timeout(Duration::from_secs(2), client_path.recv_frame())
+        .await
+        .expect("a receive on a dead path is bounded by recv_timeout")
+        .expect_err("nothing was sent");
+    assert!(
+        matches!(error, PathError::HolePunch(HolePunchError::ReceiveTimeout)),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the relay wait is bounded by the caller's deadline"
+    );
+    assert_eq!(
+        client_path.path_kind(),
+        PathKind::Relay,
+        "the peer stopped answering, so the path demoted to the relay"
+    );
+
+    drop(device_path);
+    stop.store(true, Ordering::SeqCst);
+    proxy_task.await.expect("proxy stops");
+}
+
+/// A path with no relay has a direct candidate, so a normal receive timeout must be a
+/// timeout and not "no candidate and no relay".
+#[tokio::test]
+async fn a_direct_only_path_reports_a_receive_timeout_not_no_path() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(100),
+            keepalive_interval: Duration::from_millis(30),
+            recv_timeout: Duration::from_millis(150),
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [false, false],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    let error = timeout(Duration::from_secs(2), pair.client.recv_frame())
+        .await
+        .expect("the receive is bounded")
+        .expect_err("no frame was sent");
+    assert!(
+        matches!(error, PathError::HolePunch(HolePunchError::ReceiveTimeout)),
+        "a direct-only path times out; it does not claim there is no path: {error}"
+    );
+}
+
+/// A re-promoted path must enter the bounded transition, not jump straight to direct-only
+/// sends: the peers only just agreed, and a frame sent before the peer is committed would be
+/// lost.
+#[tokio::test]
+async fn a_re_promoted_path_starts_in_the_bounded_transition() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(200),
+            keepalive_interval: Duration::from_millis(40),
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    let key = harness.verification_key();
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            pair.device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![pair.client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            pair.client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![pair.device_addr],
+    )
+    .expect("device candidates");
+
+    let (client_upgrade, device_upgrade) = tokio::join!(
+        pair.client
+            .upgrade_with(&client_ticket, &client_candidates, NOW_MS),
+        pair.device
+            .upgrade_with(&device_ticket, &device_candidates, NOW_MS),
+    );
+    assert_eq!(
+        client_upgrade.expect("client re-promotes"),
+        PathKind::Direct
+    );
+    assert_eq!(
+        device_upgrade.expect("device re-promotes"),
+        PathKind::Direct
+    );
+    assert!(
+        pair.client.transition_active() && pair.device.transition_active(),
+        "a re-promoted path keeps duplicating until a direct frame proves the peer reads it"
+    );
+
+    let frame = envelope("req-repromote-transition", b"over the transition");
+    pair.client.send_frame(&frame).await.expect("send");
+    assert_eq!(recv(&pair.device).await, frame);
+
+    // The direct frame committed the device; the reply commits the client.
+    let reply = envelope("req-repromote-reply", b"proves direct reads");
+    pair.device.send_frame(&reply).await.expect("reply");
+    assert_eq!(recv(&pair.client).await, reply);
+    assert!(
+        !pair.client.transition_active() && !pair.device.transition_active(),
+        "the first direct frame in each direction ends the transition"
+    );
+}
+
+/// Only one peer re-promotes. The confirmation handshake never completes, so the side that
+/// tried reports the relay it actually uses: it must not claim a direct path and send there
+/// while the peer reads the relay.
+#[tokio::test]
+async fn a_one_sided_re_promotion_never_commits_the_upgraded_side() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(200),
+            keepalive_interval: Duration::from_millis(40),
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    // The device moves back to the relay and never re-negotiates, so it reads the relay.
+    pair.device
+        .fallback_to_relay()
+        .await
+        .expect("device falls back");
+    assert_eq!(pair.device.path_kind(), PathKind::Relay);
+
+    let key = harness.verification_key();
+    let (upgrade_ticket, peer_ticket) = harness.peer_tickets();
+    let candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            pair.device_addr,
+            RELAY_ENDPOINT,
+            &peer_ticket.nonce,
+        ),
+        vec![pair.client_addr],
+    )
+    .expect("client candidates");
+
+    let kind = timeout(
+        Duration::from_secs(3),
+        pair.client
+            .upgrade_with(&upgrade_ticket, &candidates, NOW_MS),
+    )
+    .await
+    .expect("the client re-negotiates within the test deadline")
+    .expect("the client reports the path it has");
+    assert_eq!(
+        kind,
+        PathKind::Relay,
+        "the peer never confirmed, so the client did not commit a direct path"
+    );
+    assert_eq!(pair.client.path_kind(), PathKind::Relay);
+    assert!(!pair.client.transition_active());
+
+    // Delivery still works on the relay the peer is reading.
+    let frame = envelope("req-one-sided", b"the peer never re-promoted");
+    pair.client.send_frame(&frame).await.expect("send");
+    assert_eq!(recv(&pair.device).await, frame);
+}
+
+/// A strictly one-way session must stop duplicating within the bound: the relay's peer queue
+/// stays bounded, so the server never closes the sender's relay socket and the byte budget
+/// is not spent on copies nobody reads.
+#[tokio::test]
+async fn a_one_way_burst_stops_duplicating_within_the_bound() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(500),
+            keepalive_interval: Duration::from_millis(40),
+            transition_timeout: Duration::from_secs(30),
+            transition_max_frames: 8,
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    // The receiver never reads while the sender sends: the exact case the old transition
+    // duplicated forever.
+    for index in 0..60 {
+        let frame = envelope(&format!("req-oneway-{index}"), b"nobody is reading");
+        pair.client.send_frame(&frame).await.expect("send");
+    }
+
+    let client_probe = pair.client_relay.as_ref().expect("client relay");
+    assert!(
+        client_probe.sends() <= 8,
+        "duplication stopped at the frame bound, not after every frame: {}",
+        client_probe.sends()
+    );
+    assert_eq!(
+        pair.client.relay_backpressure_events(),
+        0,
+        "the bound stops the duplication before the relay's queue can fill"
+    );
+    assert!(
+        !client_probe.closed(),
+        "the relay fallback survives a one-way burst"
+    );
+    assert!(
+        !pair.client.transition_active(),
+        "the transition ended when its bound was reached"
+    );
+
+    // Every frame still arrived, once each, on the direct path.
+    for index in 0..60 {
+        let expected = envelope(&format!("req-oneway-{index}"), b"nobody is reading");
+        assert_eq!(recv(&pair.device).await, expected);
+    }
+}
+
+/// Backpressure during a transition is reported and stops the duplication instead of being
+/// swallowed while every later frame charges the session budget again.
+#[tokio::test]
+async fn relay_backpressure_during_a_transition_is_surfaced_and_stops_duplication() {
+    let harness = Harness::new(SESSION).await;
+    let key = harness.verification_key();
+    let client_socket = socket().await;
+    let device_socket = socket().await;
+    let client_addr = client_socket.local_addr().expect("client addr");
+    let device_addr = device_socket.local_addr().expect("device addr");
+
+    let (client_ticket, device_ticket) = harness.peer_tickets();
+    let client_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            device_addr,
+            RELAY_ENDPOINT,
+            &device_ticket.nonce,
+        ),
+        vec![client_addr],
+    )
+    .expect("client candidates");
+    let device_candidates = CandidateSet::discover(
+        rendezvous(
+            SESSION,
+            &key,
+            client_addr,
+            RELAY_ENDPOINT,
+            &client_ticket.nonce,
+        ),
+        vec![device_addr],
+    )
+    .expect("device candidates");
+
+    let saturated = Arc::new(SaturatedRelay {
+        sends: AtomicUsize::new(0),
+    });
+    let (device_relay, _device_probe) = harness
+        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .await;
+    let config = PathConfig {
+        probe: fast_probes(),
+        switch: fast_switch(),
+        direct_health_timeout: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(40),
+        ..PathConfig::default()
+    };
+    let (client_path, device_path) = tokio::join!(
+        PathController::connect(
+            client_ticket,
+            client_candidates,
+            client_setup(client_socket, &harness)
+                .with_relay(Arc::clone(&saturated) as Arc<dyn RelayChannel>)
+                .with_config(config.clone())
+                .at(NOW_MS)
+        ),
+        PathController::connect(
+            device_ticket,
+            device_candidates,
+            device_setup(device_socket, &harness)
+                .with_relay(device_relay)
+                .with_config(config)
+                .at(NOW_MS)
+        ),
+    );
+    let client_path = client_path.expect("client connects");
+    let device_path = device_path.expect("device connects");
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+
+    let first = envelope("req-saturated-1", b"direct delivery");
+    client_path
+        .send_frame(&first)
+        .await
+        .expect("the direct copy lands even though the relay refused its copy");
+    assert_eq!(
+        client_path.relay_backpressure_events(),
+        1,
+        "the refusal is reported instead of swallowed"
+    );
+    assert_eq!(saturated.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(recv(&device_path).await, first);
+
+    let second = envelope("req-saturated-2", b"no more copies");
+    client_path
+        .send_frame(&second)
+        .await
+        .expect("direct delivery");
+    assert_eq!(
+        saturated.sends.load(Ordering::SeqCst),
+        1,
+        "backpressure ended the duplication instead of charging the relay again"
+    );
+    assert_eq!(client_path.path_kind(), PathKind::Direct);
+    assert!(!client_path.transition_active());
+}
+
+/// A stalled reader loses frames to the bounded inbound ring; the loss is reported on the
+/// path instead of surfacing only as a silent sequence hole.
+#[tokio::test]
+async fn inbound_ring_overflow_is_reported_on_the_path() {
+    let harness = Harness::new(SESSION).await;
+    let pair = connect_direct_pair(
+        &harness,
+        PathConfig {
+            probe: fast_probes(),
+            switch: fast_switch(),
+            direct_health_timeout: Duration::from_millis(1000),
+            keepalive_interval: Duration::from_millis(40),
+            transition_timeout: Duration::from_secs(30),
+            transition_max_frames: 4,
+            ..PathConfig::default()
+        },
+        Duration::from_millis(10),
+        [true, true],
+    )
+    .await;
+    assert_eq!(pair.client.path_kind(), PathKind::Direct);
+
+    // The device sends while the client never reads: the client's inbound ring holds 64.
+    for index in 0..80 {
+        let frame = envelope(&format!("req-overflow-{index}"), b"filling the ring");
+        pair.device.send_frame(&frame).await.expect("send");
+    }
+    // Give the reader a moment to accept and overflow the ring.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        pair.client.dropped_frames() > 0,
+        "a stalled reader's loss is reported on the path"
+    );
+    assert!(
+        pair.client.dropped_frames() >= 80 - 64,
+        "every frame beyond the ring's capacity is counted: {}",
+        pair.client.dropped_frames()
     );
 }
