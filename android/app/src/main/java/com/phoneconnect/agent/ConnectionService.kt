@@ -12,6 +12,8 @@ import android.os.Build
 import android.os.IBinder
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
+import com.phoneconnect.agent.control.AndroidAppPlatform
+import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.FileHandler
 import com.phoneconnect.agent.control.PathGuard
@@ -148,6 +150,7 @@ open class ConnectionService : Service() {
             dispatcher = CommandDispatcher(
                 telemetry = sampler,
                 files = FileHandler(PathGuard(filesRoot())),
+                apps = AppsHandler(AndroidAppPlatform(this)),
             ),
             telemetry = sampler,
         )

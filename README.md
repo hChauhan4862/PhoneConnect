@@ -21,9 +21,11 @@ This is the foundation milestone, not a finished product.
   command until the device answers; there is no server-to-client push channel.
 - Each enrolled device keeps a second, authenticated management connection to the server
   carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, and the
-  `files.*` commands work end to end from the one web UI (the command console and the file
-  browser); every later device feature plugs into the same channel. The sealed peer relay is
-  unchanged and the server still cannot read it.
+  `files.*` commands work end to end from the one web UI (the command console, the file
+  browser, and the app inventory); every later device feature plugs into the same channel. An
+  ordinary app cannot hold the signature-level permissions `apps.clear` and `apps.set_enabled`
+  need, so those are explicit refusals pointing at ADB. The sealed peer relay is unchanged and
+  the server still cannot read it.
 - Direct hole-punched paths are implemented and tested in the transport, but both shipped
   clients use the relay. Production connectivity is relay-only.
 - Telemetry aggregates are bounded and kept in memory.
@@ -75,9 +77,12 @@ the APK build, and the Docker end-to-end test.
 The component READMEs are the source of truth for what does and does not work:
 
 - `android/README.md` — no direct-path port, no ticket-signature verification, and a small
-  management vocabulary (`device.info`, `device.ping`, `telemetry.now`, and the `files.*`
-  commands inside one app-private directory). ADB, media, apps, input, screen mirroring, and
-  audio are not implemented, and the phone is not remotely controllable.
+  management vocabulary (`device.info`, `device.ping`, `telemetry.now`, the `files.*` commands
+  inside one app-private directory, and the `apps.*` commands). Package listing depends on
+  `QUERY_ALL_PACKAGES`; a background activity start is usually blocked (`launch_blocked`), and
+  `apps.clear`/`apps.set_enabled` are refused because an installed app cannot hold the
+  signature-level permissions. ADB, media, input, screen mirroring, and audio are not
+  implemented, and the phone is not remotely controllable.
 - `native/README.md` — there is no Android-side TCP bridge, so the loopback proxy does not
   reach a phone yet; no screen creates a session until the server's user login and MFA land.
   Only macOS has been built here; Windows and Linux are untested.

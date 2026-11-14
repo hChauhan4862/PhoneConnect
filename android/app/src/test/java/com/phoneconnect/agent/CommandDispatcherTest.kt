@@ -1,10 +1,13 @@
 package com.phoneconnect.agent
 
+import com.phoneconnect.agent.control.AppPlatform
+import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.CommandFailure
 import com.phoneconnect.agent.control.DeviceDescription
 import com.phoneconnect.agent.control.DeviceInfoHandler
 import com.phoneconnect.agent.control.FileHandler
+import com.phoneconnect.agent.control.InstalledApp
 import com.phoneconnect.agent.control.PathGuard
 import com.phoneconnect.agent.net.DeviceControlChannel
 import com.phoneconnect.agent.telemetry.BatteryReading
@@ -101,6 +104,43 @@ class CommandDispatcherTest {
 
         assertEquals(0, output.getJSONArray("entries").length())
         assertTrue("file I/O must not run on the command receive loop", recording.used.get())
+    }
+
+    @Test
+    fun `app commands run on the injected background dispatcher`() = runBlocking {
+        val recording = RecordingDispatcher(Dispatchers.IO)
+        val withApps = CommandDispatcher(
+            telemetry = telemetry,
+            apps = AppsHandler(
+                object : AppPlatform {
+                    override fun installed() = listOf(
+                        InstalledApp("com.example.zeta", "Zeta", "1.0", 1, false, true, 1),
+                    )
+
+                    override fun launchIntent(packageName: String) = null
+
+                    override fun startActivity(intent: android.content.Intent) = Unit
+
+                    override fun killBackgroundProcesses(packageName: String) = Unit
+
+                    override fun mayStartActivityFromBackground() = true
+                },
+            ),
+            ioDispatcher = recording,
+        )
+
+        val output = withApps.dispatch(CommandDispatcher.APPS_LIST, JSONObject()).getOrThrow()
+
+        assertEquals(1, output.getJSONArray("apps").length())
+        assertTrue("app listing must not run on the command receive loop", recording.used.get())
+    }
+
+    @Test
+    fun `an app command without a configured handler is still answered by name`() = runBlocking {
+        val failure = dispatcher.dispatch(CommandDispatcher.APPS_LAUNCH).exceptionOrNull()
+
+        assertTrue("expected a CommandFailure, got $failure", failure is CommandFailure)
+        assertEquals("unknown_command", (failure as CommandFailure).code)
     }
 
     @Test

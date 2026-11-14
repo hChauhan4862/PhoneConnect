@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -9,6 +10,25 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- apps.list: Android 11+ hides other installed apps from a package unless it declares
+         this. Listing installed apps is the whole point of apps.list; without the permission
+         the answer would be only the handful of packages the system chooses to reveal, which
+         is not the device's app inventory. Play policy restricts QUERY_ALL_PACKAGES to apps
+         whose core purpose needs it and requires a declaration; this is a self-hosted device
+         management agent, and android/README.md states the implication.
+
+         Lint recommends a <queries> declaration instead. That is the right tool for an app
+         that talks to a few known packages; it cannot express "every installed app", which
+         is exactly what apps.list must report. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- apps.stop: lets the agent ask Android to kill a package's background processes. An
+         ordinary app cannot hold the signature-level permissions apps.clear and
+         apps.set_enabled would need; those commands refuse explicitly instead. -->
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
 
     <!-- Backup is disabled so the Keystore-wrapped enrollment blob never leaves the device
          and a restore onto different hardware cannot present an undecryptable credential. -->

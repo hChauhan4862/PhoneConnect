@@ -30,13 +30,14 @@ class CommandFailure(val code: String, message: String? = null) : Exception(mess
  *
  * Handlers are `suspend` so a deadline can stop them cooperatively; a handler that blocks a
  * thread cannot be interrupted, which is why the channel also refuses to *start* a command
- * whose absolute server deadline has already passed. File work is I/O, so it runs on
+ * whose absolute server deadline has already passed. File and app work is I/O, so it runs on
  * [ioDispatcher] and never on the command receive loop.
  */
 open class CommandDispatcher(
     private val telemetry: TelemetrySampler,
     private val deviceInfo: DeviceInfoHandler = DeviceInfoHandler(),
     private val files: FileHandler? = null,
+    private val apps: AppsHandler? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -54,6 +55,12 @@ open class CommandDispatcher(
                     ?: return@withContext Result.failure(CommandFailure.unknown(name))
                 runCatching { handler.handle(name, args) }
             }
+        APPS_LIST, APPS_LAUNCH, APPS_STOP, APPS_CLEAR, APPS_SET_ENABLED ->
+            withContext(ioDispatcher) {
+                val handler = apps
+                    ?: return@withContext Result.failure(CommandFailure.unknown(name))
+                runCatching { handler.handle(name, args) }
+            }
         else -> Result.failure(CommandFailure.unknown(name))
     }
 
@@ -68,5 +75,11 @@ open class CommandDispatcher(
         const val FILES_MKDIR = "files.mkdir"
         const val FILES_DELETE = "files.delete"
         const val FILES_RENAME = "files.rename"
+
+        const val APPS_LIST = "apps.list"
+        const val APPS_LAUNCH = "apps.launch"
+        const val APPS_STOP = "apps.stop"
+        const val APPS_CLEAR = "apps.clear"
+        const val APPS_SET_ENABLED = "apps.set_enabled"
     }
 }

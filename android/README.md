@@ -53,6 +53,30 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    at 4 096 entries (or ~1 MB encoded) and refused as `listing_too_large` instead of being
    materialized, and an I/O fault is `io_error` with a root-relative path — never the platform
    message that names the device's absolute path.
+8. **Apps.** `apps.list` reports the packages visible to the app's UID — `package`, `label`
+   from `PackageManager` (an unresolvable label falls back to the package name, never an
+   invented one), `version_name`, `version_code`, `system`, `enabled`, and `updated_ms` from
+   `PackageInfo` — sorted by label, case-insensitive, and refused as `listing_too_large` at
+   2 000 apps or ~1 MB encoded instead of being truncated. `apps.launch` starts the app's own
+   launch intent; Android 10+ restricts background activity starts, so when the platform will
+   not allow one the answer is `error: launch_blocked` (`background_activity_start_restricted`,
+   or `platform_refused` when the start itself is refused) and never a success; a package with
+   no launchable activity is `error: no_launch_activity`. `apps.stop` calls
+   `ActivityManager.killBackgroundProcesses` and reports `kill_requested: true` — a request,
+   never a confirmed stop — and `error: not_permitted` when the platform refuses.
+   `apps.clear` and `apps.set_enabled` need signature-level permissions an ordinary installed
+   app cannot hold, so they are constant `error: not_permitted` refusals whose message names
+   the ADB path (`adb shell pm clear`, `adb shell pm disable-user`). Every acting command
+   resolves `package` against the device's own list first: an unknown name is
+   `error: unknown_package`, not a platform exception.
+
+   `QUERY_ALL_PACKAGES` is declared because Android 11+ hides other installed apps otherwise,
+   and a partial inventory would be a fabricated one. Google Play restricts that permission to
+   apps whose core purpose needs it and requires a declaration: **a Play-distributed build of
+   this agent would have to justify it (device management) or ship without a complete app
+   list.** `KILL_BACKGROUND_PROCESSES` is declared for `apps.stop`. Both are ordinary
+   permissions; neither grants the signature-level authority `apps.clear`/`apps.set_enabled`
+   would need.
 
 ## Layout
 
@@ -79,6 +103,8 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `control/DeviceInfoHandler.kt` | `device.info` and the `hello` description, from `Build` only. |
 | `control/PathGuard.kt` | The one root, and the only place a requested path becomes a concrete path. |
 | `control/FileHandler.kt` | The six `files.*` commands: chunked reads, capped writes, empty-directory delete. |
+| `control/AppsHandler.kt` | The five `apps.*` commands, the `AppPlatform` contract, and the honest refusals a non-privileged app must give. |
+| `control/AndroidAppPlatform.kt` | The only `AppPlatform`: `PackageManager` inventory and launch intent, `ActivityManager` kill and background-start check. |
 | `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
 | `RecoveryReceiver.kt` | Boot and post-update recovery with `goAsync`, refusing gracefully when the OS refuses. |
 | `AgentSettings.kt` / `AgentDiagnostics.kt` | Hub URL and the last background-start refusal. |
