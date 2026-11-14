@@ -46,9 +46,12 @@ class FileHandler(private val guard: PathGuard) {
                 for (child in children) {
                     val entry = describe(child) ?: continue
                     // One listing is one command result, and the server accepts at most 2 MiB.
-                    // Stop before materializing an oversized answer and say so; a silently
-                    // truncated listing would be a fabricated one.
-                    val encoded = entry.toString().length + 1
+                    // Measure UTF-8 bytes, not characters: org.json emits non-ASCII raw, so a
+                    // character count would let a multi-byte listing out two to three times
+                    // larger than it looks and take the channel down with it. Stop before
+                    // materializing an oversized answer and say so; a silently truncated
+                    // listing would be a fabricated one.
+                    val encoded = entry.toString().toByteArray(Charsets.UTF_8).size + 1
                     if (entries.size >= MAX_LIST_ENTRIES || encodedBytes + encoded > MAX_LIST_BYTES) {
                         throw listingTooLarge(path)
                     }
@@ -59,10 +62,9 @@ class FileHandler(private val guard: PathGuard) {
         } catch (error: DirectoryIteratorException) {
             // Iteration wraps its own I/O fault; report it like the open, never as an
             // `internal_error` carrying the platform's absolute path.
-            val cause = error.cause as? IOException ?: IOException("directory iteration failed")
-            throw ioFailure("list", path, cause)
+            throw ioFailureForList(path, error)
         } catch (error: IOException) {
-            throw ioFailure("list", path, error)
+            throw ioFailureForList(path, error)
         }
         return JSONObject().put(
             "entries",
@@ -256,6 +258,20 @@ class FileHandler(private val guard: PathGuard) {
             "(limit $MAX_LIST_ENTRIES entries or $MAX_LIST_BYTES bytes)",
     )
 
+    /**
+     * The refusal for a directory that could not be read or iterated. Kept separate so the
+     * iteration wrapper's unwrapping is testable without provoking a real mid-iteration fault.
+     */
+    internal fun ioFailureForList(path: Path, error: Throwable): CommandFailure {
+        val cause = when (error) {
+            is DirectoryIteratorException ->
+                error.cause as? IOException ?: IOException("directory iteration failed")
+            is IOException -> error
+            else -> IOException(error.message ?: error.javaClass.simpleName)
+        }
+        return ioFailure("list", path, cause)
+    }
+
     private fun ioFailure(operation: String, path: Path, error: IOException): CommandFailure {
         // The platform message can name absolute device paths; the caller gets the operation
         // and the request instead.
@@ -294,8 +310,9 @@ class FileHandler(private val guard: PathGuard) {
         const val MAX_LIST_ENTRIES: Int = 4_096
 
         /**
-         * Estimated encoded size one listing may carry. The server accepts a 2 MiB result, so
-         * staying well under it keeps `files.list` a usable answer instead of a refusal.
+         * UTF-8 bytes of the serialized entries one listing may carry. The server refuses a
+         * result above 2 MiB and closes the channel above a 2.16 MiB frame, so staying well
+         * under both keeps `files.list` a usable answer instead of a dropped channel.
          */
         private const val MAX_LIST_BYTES: Int = 1_000_000
 

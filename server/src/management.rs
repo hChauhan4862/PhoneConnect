@@ -11,9 +11,11 @@
 //! - at most [`MAX_IN_FLIGHT_PER_DEVICE`] pending commands per device;
 //! - a result may not exceed [`MAX_RESULT_BYTES`], and an oversized one refuses the command
 //!   with `result_too_large` instead of being held;
-//! - the retained answers together may not exceed [`MAX_RETAINED_OUTPUT_BYTES`]: the oldest
-//!   completed records are dropped (as past the count cap) so a device answering large file
-//!   chunks cannot grow the table without bound;
+//! - the retained answers together may not exceed [`MAX_RETAINED_ANSWER_BYTES`]: `output` plus
+//!   its message and error text, with each text field itself capped by
+//!   `MAX_RETAINED_TEXT_BYTES`; the oldest completed records are dropped (as past the count
+//!   cap) so a device answering large file chunks — or large prose — cannot grow the table
+//!   without bound;
 //! - commands live in memory only; the audit row written by the HTTP surface is the durable
 //!   trace, so there is no commands table;
 //! - one device cannot degrade ingest for the others: its inbound frames and bytes are
@@ -63,16 +65,24 @@ pub const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 /// ones are bounded by [`MAX_IN_FLIGHT_PER_DEVICE`] per connected device.
 const MAX_RETAINED_COMMANDS: usize = 4 * 1024;
 
-/// Aggregate output retained by completed commands.
+/// Aggregate answer bytes retained by completed commands: the serialized `output` plus the
+/// stored `message` and `error` text, charged as one answer.
 ///
 /// Count alone is not a memory bound: `files.read` answers ~350 KiB of base64 each, so 4 096
 /// records could hold ~1.4 GiB, and command creation is fast enough to reach that in minutes.
-/// This is one budget for the whole table — not per device, so a busy fleet cannot multiply it
-/// — on the bytes of retained answers. Once it is crossed the oldest completed records are
-/// dropped whole, exactly as past the count cap, and `GET /api/commands/{id}` answers
-/// `command_unknown` for a trimmed record. Pending commands hold no output and are never
-/// dropped.
-pub const MAX_RETAINED_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+/// This is one budget for the whole table — not per device, so a busy fleet cannot multiply it.
+/// Once it is crossed the oldest completed records are dropped whole, exactly as past the count
+/// cap, and `GET /api/commands/{id}` answers `command_unknown` for a trimmed record. Pending
+/// commands retain no answer and are never dropped.
+pub const MAX_RETAINED_ANSWER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Longest retained `message` or `error` text.
+///
+/// A frame may carry far more, but an explanation is useful at paragraph length, and without
+/// this one successful result could spend the whole retained-answer budget on prose. A longer
+/// value is stored as its beginning plus an ellipsis, so the text stays useful and still fits
+/// inside [`MAX_RETAINED_ANSWER_BYTES`].
+const MAX_RETAINED_TEXT_BYTES: usize = 4 * 1024;
 
 /// Longest accepted command name. Names belong to the device; the server only bounds them.
 const MAX_COMMAND_NAME_BYTES: usize = 128;
@@ -170,10 +180,10 @@ pub struct CommandRecord {
     /// When the command becomes `timeout`. Not part of the wire record.
     #[serde(skip)]
     pub deadline_at_ms: UnixMs,
-    /// Serialized size of `output`, charged against [`MAX_RETAINED_OUTPUT_BYTES`]. Not part
-    /// of the wire record.
+    /// Answer bytes this record retains, charged against [`MAX_RETAINED_ANSWER_BYTES`]. Not
+    /// part of the wire record.
     #[serde(skip)]
-    retained_output_bytes: usize,
+    retained_answer_bytes: usize,
 }
 
 /// A command that was handed to the device's channel.
@@ -298,8 +308,8 @@ struct RegistryInner {
     next_connection_id: u64,
     connections: HashMap<String, Connection>,
     commands: HashMap<String, CommandRecord>,
-    /// Sum of every retained record's `retained_output_bytes`.
-    retained_output_bytes: usize,
+    /// Sum of every retained record's `retained_answer_bytes`.
+    retained_answer_bytes: usize,
     completed: VecDeque<String>,
     /// Per-device inbound budgets, keyed by device so a reconnect does not reset them.
     ingest: HashMap<String, IngestBudget>,
@@ -354,7 +364,7 @@ impl RegistryInner {
     /// Pending records are never dropped; their answers do not exist yet.
     fn trim(&mut self) {
         while self.commands.len() > MAX_RETAINED_COMMANDS
-            || self.retained_output_bytes > MAX_RETAINED_OUTPUT_BYTES
+            || self.retained_answer_bytes > MAX_RETAINED_ANSWER_BYTES
         {
             let Some(command_id) = self.completed.pop_front() else {
                 break;
@@ -363,12 +373,12 @@ impl RegistryInner {
                 .commands
                 .get(&command_id)
                 .filter(|record| record.status != CommandStatus::Pending)
-                .map(|record| record.retained_output_bytes)
+                .map(|record| record.retained_answer_bytes)
             else {
                 continue;
             };
             self.commands.remove(&command_id);
-            self.retained_output_bytes = self.retained_output_bytes.saturating_sub(retained);
+            self.retained_answer_bytes = self.retained_answer_bytes.saturating_sub(retained);
         }
     }
 }
@@ -562,7 +572,7 @@ impl DeviceRegistry {
                 created_at_ms: now,
                 completed_at_ms: None,
                 deadline_at_ms: now + deadline_ms,
-                retained_output_bytes: 0,
+                retained_answer_bytes: 0,
             },
         );
         if sender.try_send(frame).is_err() {
@@ -608,7 +618,7 @@ impl DeviceRegistry {
                 request_id: request_id.to_owned(),
             });
         }
-        let mut retained_output_bytes = 0;
+        let mut answer_bytes = 0;
         match status {
             ResultStatus::Ok => {
                 let bytes = match output.as_ref() {
@@ -626,24 +636,29 @@ impl DeviceRegistry {
                 } else {
                     record.status = CommandStatus::Ok;
                     record.output = output;
-                    record.message = message;
-                    // What this answer costs the retained-output budget.
-                    retained_output_bytes = bytes;
+                    record.message = message.map(bounded_text);
+                    answer_bytes = bytes;
                 }
             }
             ResultStatus::Error => {
                 record.status = CommandStatus::Error;
-                record.error = Some(error.unwrap_or_else(|| "device_error".to_owned()));
-                record.message = message;
+                record.error = Some(match error {
+                    Some(error) => bounded_text(error),
+                    None => "device_error".to_owned(),
+                });
+                record.message = message.map(bounded_text);
             }
         }
         record.completed_at_ms = Some(now);
-        record.retained_output_bytes = retained_output_bytes;
+        // The whole retained answer is charged, not only `output`: a `message` or an `error`
+        // is just as able to grow the table as a result payload.
+        answer_bytes = answer_bytes
+            .saturating_add(record.message.as_deref().map_or(0, str::len))
+            .saturating_add(record.error.as_deref().map_or(0, str::len));
+        record.retained_answer_bytes = answer_bytes;
         let command_id = request_id.to_owned();
         // The mutable borrow of the record ends here, so the aggregate can be charged.
-        inner.retained_output_bytes = inner
-            .retained_output_bytes
-            .saturating_add(retained_output_bytes);
+        inner.retained_answer_bytes = inner.retained_answer_bytes.saturating_add(answer_bytes);
         inner.completed.push_back(command_id);
         inner.trim();
         Ok(())
@@ -662,6 +677,22 @@ impl DeviceRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// A retained `message` or `error`, bounded so one result cannot spend the whole
+/// [`MAX_RETAINED_ANSWER_BYTES`] budget on prose. The beginning is what a reader needs.
+fn bounded_text(text: String) -> String {
+    if text.len() <= MAX_RETAINED_TEXT_BYTES {
+        return text;
+    }
+    let mut end = MAX_RETAINED_TEXT_BYTES - '…'.len_utf8();
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_RETAINED_TEXT_BYTES);
+    bounded.push_str(&text[..end]);
+    bounded.push('…');
+    bounded
 }
 
 /// The `status` a device reports in a `result` frame.

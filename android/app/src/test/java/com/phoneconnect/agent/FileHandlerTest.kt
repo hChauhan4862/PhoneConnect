@@ -17,6 +17,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.IOException
+import java.nio.file.DirectoryIteratorException
 import java.util.Base64
 
 /**
@@ -117,6 +119,47 @@ class FileHandlerTest {
         assertTrue(
             "the message names the limit: ${error.message}",
             error.message.orEmpty().contains(FileHandler.MAX_LIST_ENTRIES.toString()),
+        )
+    }
+
+    @Test
+    fun `a listing past the byte cap is refused even when its names are multi-byte`() {
+        val wide = File(root, "wide").apply { mkdirs() }
+        // Each name is ~80 CJK characters: ~240 UTF-8 bytes but only 80 UTF-16 units, so a
+        // character-counted cap would let this listing out at two to three times its size.
+        val name = "文".repeat(80)
+        repeat(2_000) { index ->
+            assertTrue(File(wide, "%03d-%s".format(index, name)).createNewFile())
+        }
+
+        val error = failure { handler.list(args("path" to "wide")) }
+
+        assertEquals("listing_too_large", error.code)
+        assertTrue(
+            "the message names the limit: ${error.message}",
+            error.message.orEmpty().contains(FileHandler.MAX_LIST_ENTRIES.toString()),
+        )
+    }
+
+    @Test
+    fun `an iteration fault is io_error without the device path`() {
+        val folder = File(root, "folder").apply { mkdirs() }
+        // What `DirectoryStream` iteration throws is the checked fault, wrapped; its message
+        // names the absolute device path, which must never reach the caller.
+        val iteration = DirectoryIteratorException(
+            IOException("/data/user/0/com.phoneconnect.agent/files/folder/secret"),
+        )
+
+        val error = handler.ioFailureForList(folder.toPath().toRealPath(), iteration)
+
+        assertEquals("io_error", error.code)
+        assertTrue(
+            "the request is named, relative to the root: ${error.message}",
+            error.message.orEmpty().contains("folder"),
+        )
+        assertFalse(
+            "the message must not name the device's absolute path: ${error.message}",
+            error.message.orEmpty().contains("/data/user/0"),
         )
     }
 

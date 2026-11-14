@@ -271,10 +271,12 @@ that is not valid JSON closes the channel with `malformed_frame`; an invalid tel
 Commands live in memory only: at most 64 in flight per device, a 10 s default and 60 s
 maximum deadline, and at most 2 MiB per result (an oversized result refuses the command with
 `result_too_large`). Retained records are bounded by count **and** by the bytes of their
-answers: the whole table keeps at most 32 MiB of result output (a `files.read` chunk is
-~350 KiB, so a count-only cap would allow over a gigabyte), and the oldest completed records
-are dropped once either bound is crossed — a trimmed command reads as `command_unknown`, the
-same as one past the count cap. One budget serves every device, so a large fleet cannot
+answers: the whole table keeps at most 32 MiB of retained answer (the serialized `output` plus
+the `message` and `error` text — a `files.read` chunk is ~350 KiB, so a count-only cap would
+allow over a gigabyte), and the oldest completed records are dropped once either bound is
+crossed — a trimmed command reads as `command_unknown`, the same as one past the count cap.
+Each `message`/`error` is itself kept to 4 KiB (its beginning plus an ellipsis) so one result
+cannot spend the budget on prose, and one budget serves every device, so a large fleet cannot
 multiply the ceiling. The channel is rate-limited per device, not just bounded: 20 inbound
 frames/s and 4 MiB/s, with an over-budget channel closed as `rate_limited`; command creation
 is throttled at 10/s per device (burst 20) and answers `429 rate_limited` with `Retry-After`.

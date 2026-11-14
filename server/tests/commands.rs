@@ -10,7 +10,7 @@ use common::TestApp;
 use common::control;
 use futures_util::StreamExt;
 use phoneconnect_server::management::{
-    DEFAULT_COMMAND_TIMEOUT_MS, MAX_IN_FLIGHT_PER_DEVICE, MAX_RETAINED_OUTPUT_BYTES,
+    DEFAULT_COMMAND_TIMEOUT_MS, MAX_IN_FLIGHT_PER_DEVICE, MAX_RETAINED_ANSWER_BYTES,
 };
 use phoneconnect_server::store::DeviceStore;
 use serde_json::json;
@@ -331,7 +331,7 @@ async fn retained_results_are_bounded_by_bytes_as_well_as_count() {
     // A `files.read` chunk is ~350 KiB of base64, so a count-only cap would let a few thousand
     // records retain gigabytes. Each answer here is a full mebibyte.
     let payload = "x".repeat(1024 * 1024);
-    let turns = MAX_RETAINED_OUTPUT_BYTES / payload.len() + 8;
+    let turns = MAX_RETAINED_ANSWER_BYTES / payload.len() + 8;
     let mut ids = Vec::new();
     for _ in 0..turns {
         // Pace command creation: this test is about retained bytes, not the creation rate.
@@ -383,8 +383,105 @@ async fn retained_results_are_bounded_by_bytes_as_well_as_count() {
         ids.len()
     );
     assert!(
-        retained <= MAX_RETAINED_OUTPUT_BYTES,
-        "{retained} bytes retained, budget {MAX_RETAINED_OUTPUT_BYTES}"
+        retained <= MAX_RETAINED_ANSWER_BYTES,
+        "{retained} bytes retained, budget {MAX_RETAINED_ANSWER_BYTES}"
+    );
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_large_message_cannot_bypass_the_retained_budget() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // A frame may carry up to MAX_RESULT_BYTES + 64 KiB, so `message` and `error` are as able
+    // to grow the table as `output`. Both are stored bounded, and the retained answer as a
+    // whole is charged.
+    let prose = "m".repeat(2 * 1024 * 1024);
+    // One frame may not exceed MAX_RESULT_BYTES + 64 KiB, so the error result splits its bulk
+    // between the code and the message.
+    let code = format!("{}tail", "e".repeat(1024 * 1024));
+    let error_prose = "n".repeat(1024 * 1024);
+
+    app.clock.advance_ms(120);
+    let (status, accepted) = app
+        .dispatch_command(&device_id, "user-a", info_command())
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let ok_id = accepted["command_id"]
+        .as_str()
+        .expect("command_id")
+        .to_owned();
+    control::next_json(&mut socket).await;
+    control::send(
+        &mut socket,
+        json!({
+            "type": "result", "request_id": ok_id, "status": "ok",
+            "output": null, "error": null, "message": prose,
+        }),
+    )
+    .await;
+
+    app.clock.advance_ms(120);
+    let (status, accepted) = app
+        .dispatch_command(&device_id, "user-a", info_command())
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let error_id = accepted["command_id"]
+        .as_str()
+        .expect("command_id")
+        .to_owned();
+    control::next_json(&mut socket).await;
+    control::send(
+        &mut socket,
+        json!({
+            "type": "result", "request_id": error_id, "status": "error",
+            "output": null, "error": code, "message": error_prose,
+        }),
+    )
+    .await;
+
+    let ok = wait_for_completion(&app, &ok_id, "user-a").await;
+    assert_eq!(ok["status"], "ok", "{ok}");
+    let stored = ok["message"].as_str().expect("message");
+    assert!(
+        stored.len() <= 4_096,
+        "a 2 MiB message must not be retained whole: {} bytes",
+        stored.len()
+    );
+    assert!(
+        stored.starts_with("mmm"),
+        "the beginning of the device's text stays useful: {stored}"
+    );
+
+    let failure = wait_for_completion(&app, &error_id, "user-a").await;
+    assert_eq!(failure["status"], "error", "{failure}");
+    let stored_code = failure["error"].as_str().expect("error");
+    assert!(stored_code.len() <= 4_096, "{} bytes", stored_code.len());
+    assert!(
+        stored_code.starts_with("eee"),
+        "the code keeps its beginning: {stored_code}"
+    );
+    assert!(
+        failure["message"].as_str().expect("message").len() <= 4_096,
+        "the message is bounded too"
+    );
+
+    // What is resident is charged as a whole answer, so it cannot exceed the budget.
+    let mut retained = 0usize;
+    for command_id in [&ok_id, &error_id] {
+        let (status, record) = app.command(command_id, "user-a").await;
+        assert_eq!(status, StatusCode::OK, "{record}");
+        retained += serde_json::to_vec(&record["output"]).expect("json").len();
+        retained += record["message"].as_str().map(str::len).unwrap_or(0);
+        retained += record["error"].as_str().map(str::len).unwrap_or(0);
+    }
+    assert!(
+        retained <= MAX_RETAINED_ANSWER_BYTES,
+        "{retained} bytes retained, budget {MAX_RETAINED_ANSWER_BYTES}"
     );
 
     socket.close(None).await.expect("channel closed");
