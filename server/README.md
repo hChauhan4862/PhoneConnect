@@ -350,9 +350,12 @@ frames/s and 4 MiB/s, with an over-budget channel closed as `rate_limited`; comm
 and every attempt that can be traced, including a refused one — is throttled at 10/s per device
 (burst 20) and answers `429 rate_limited` with `Retry-After`. The throttle is checked at the
 attempt's entry, before any other decision, because it is also the bound on audit growth: an
-attempt it refuses is not traced. The per-device bucket table is capped (4 096 ids), because an
-attempt may name an id that matches no device and is still traced; past the cap a new name is
-refused rather than remembered.
+attempt it refuses is not traced. Because an attempt may name an id that matches no device and
+is still traced, two more bounds sit alongside the per-device bucket: the per-device table is
+capped at 4 096 ids and full means *evict the least recently used* bucket — a rotating id costs a
+reset budget, never a permanent refusal, and a newly enrolled device is always admitted — and a
+**global** budget of 200 attempts/s (burst 200) bounds the total across every id, since the
+per-device allowance multiplies with the number of ids a caller names.
 The bursts are sized from the caps, not guessed: at least one result frame per in-flight
 command, and enough bytes for a full-size result from each of them, so a device that fell
 behind can always deliver what it owes. The same per-device ingress budget is charged by
@@ -460,19 +463,26 @@ lease links that ended more than 30 days earlier, and audit rows written more th
 earlier. `main` runs it once at startup and then every six hours through `spawn_interval`;
 there is no separate scheduler daemon. A failed run is logged and retried on the next tick.
 
-Age is the only bound on the audit log, and the per-device creation throttle sets its worst case.
-Every traced attempt — accepted, refused for want of access, or refused for its shape — charges
-that bucket, and only an attempt the bucket admits writes rows, so the rate is a real ceiling
-rather than an estimate for accepted dispatches. At 10/s per device (burst 20) and at most two
-rows per attempt (one `command.dispatch`, one `command.outcome`), one device can append at most
-**about 1.7 million rows a day and 51.8 million rows per 30-day window**; the 200-device ceiling
-makes that roughly **10.4 billion rows** (order 1 TB at ~100 bytes a row) if every device
-attempted at full throttle, unanswered, for the whole window. Real deployments sit far below it —
-an outcome row appears only for a command no device answered, and a device that answers writes
-one row — but there is no count cap, so size the database for the window you actually retain.
-The other row writers are revocation rows (idempotent: a retried revoke appends nothing), a
-`lease.handoff` row per successful handoff, and nothing at all for an enrollment-token
-revocation; handoffs are the one action bounded only by admin request rate.
+Age is the only bound on the audit log, and two creation throttles set its worst case. Every
+traced attempt — accepted, refused for want of access, or refused for its shape — charges a
+per-device bucket (10/s, burst 20) **and** the global bucket (200/s, burst 200); an attempt either
+bucket refuses writes nothing. These are ceilings, not estimates: nothing that appends a row can
+skip the charge.
+
+Per real device, at 10 attempts/s: 10 × 86 400 s = 864 000 attempts a day, at most two rows each
+(`command.dispatch` plus `command.outcome`) = **~1.73 million rows a day, ~51.8 million rows in a
+30-day window** (~5 GB at ~100 bytes a row).
+
+Across asserted ids, the per-device bucket does not bound anything — a fresh id starts with a full
+burst — so the global budget does: 200 × 86 400 s = 17.28 million attempts a day = **~34.6 million
+rows a day, ~1.04 billion rows in a 30-day window** (~104 GB at ~100 bytes a row). That is the
+number to size the database for, and it is the same whether one id or four thousand are rotated.
+
+Real deployments sit far below both: an outcome row appears only for a command no device answered,
+command creation is operator-driven, and an attempt with a bad token or no `user_id` is not traced
+at all. Revocation rows are idempotent — a retried `device.revoke`, `session.revoke` or
+`lease.revoke` appends nothing, and an enrollment-token revocation is not a row — so the one action
+bounded only by admin request rate is `lease.handoff`, one row per successful handoff.
 
 The 30-day window applies to leases, session records, and the audit log. Telemetry aggregates
 are a separate, in-memory concern: they are not persisted at all, the job's aggregate purge

@@ -94,11 +94,12 @@ const MAX_RETAINED_TEXT_BYTES: usize = 4 * 1024;
 /// Longest accepted command name. Names belong to the device; the server only bounds them.
 const MAX_COMMAND_NAME_BYTES: usize = 128;
 
-/// Command-creation budget entries. A bucket is created for every device id an attempt names,
-/// including an id that matches no device — such an attempt is refused and traced, and the
-/// rejection happens before the store is consulted. The table is therefore capped: past it, an
-/// id it has never seen is refused `429` instead of growing the table. Four thousand is far above
-/// the 200-device ceiling, so the cost of a spoofed id is one refusal and never a row.
+/// Command-creation budget entries. A bucket is created for every asserted device id an attempt
+/// names, including an id that matches no device — such an attempt is refused and traced, and the
+/// rejection happens before the store is consulted. The table is therefore capped, and full means
+/// **evict the least recently used**, never refuse an unseen id: a rotating id costs a reset
+/// bucket, and a device that enrolls after churn is still admitted. Four thousand is far above any
+/// real fleet, so eviction only happens under deliberate churn.
 const MAX_CREATION_BUCKETS: usize = 4 * 1024;
 
 /// Inbound WebSocket message ceiling: the largest acceptable result plus frame overhead. A
@@ -149,6 +150,14 @@ pub mod limits {
     /// Command creations per device per second on the HTTP path.
     pub const COMMAND_CREATES_PER_SECOND: f64 = 10.0;
     pub const COMMAND_BURST: f64 = 20.0;
+
+    /// Command creations per second across every asserted device id.
+    ///
+    /// The per-device allowance multiplies with the number of ids a caller names, so it cannot
+    /// bound the total; this does. Every traced attempt — accepted, refused for want of access,
+    /// or refused for its shape — charges it, which makes it the real ceiling on audit growth.
+    pub const GLOBAL_CREATES_PER_SECOND: f64 = 200.0;
+    pub const GLOBAL_CREATE_BURST: f64 = 200.0;
 }
 
 /// The one shape a throttled caller sees: `429 rate_limited` with `Retry-After`. Both the
@@ -326,6 +335,77 @@ impl IngestBudget {
     }
 }
 
+/// Command-creation budgets: one bucket per asserted device id, plus one global bucket.
+///
+/// The per-device table is capped and **self-healing**: each bucket remembers when it was last
+/// charged, and an id it has never seen evicts the least recently used bucket instead of being
+/// refused. Rotating ids therefore cannot fill the table permanently, and a device that enrolls
+/// after the table has been churned is always admitted — at the cost of the evicted device
+/// starting a fresh, full budget when it returns.
+///
+/// The global bucket is the ceiling that matters: the per-device allowance multiplies with the
+/// number of asserted ids, so only a fleet-wide budget bounds the total attempt — and therefore
+/// audit — rate.
+#[derive(Default)]
+struct CreationBudgets {
+    per_device: HashMap<String, CreationBucket>,
+    /// Created on first use so it starts full at the current clock, not at zero.
+    global: Option<TokenBucket>,
+}
+
+struct CreationBucket {
+    bucket: TokenBucket,
+    last_seen_ms: UnixMs,
+}
+
+impl CreationBudgets {
+    /// Charges one creation. `Some(retry_after_ms)` means the attempt is throttled and must answer
+    /// `429` without being traced; the wait is the time until a token actually exists.
+    fn charge(&mut self, device_id: &str, now_ms: UnixMs) -> Option<i64> {
+        let global = self.global.get_or_insert_with(|| {
+            TokenBucket::new(
+                limits::GLOBAL_CREATE_BURST,
+                limits::GLOBAL_CREATES_PER_SECOND,
+                now_ms,
+            )
+        });
+        if let Err(retry_after_ms) = global.take(1.0, now_ms) {
+            return Some(retry_after_ms);
+        }
+        if !self.per_device.contains_key(device_id) && self.per_device.len() >= MAX_CREATION_BUCKETS
+        {
+            self.evict_least_recently_used();
+        }
+        let entry = self
+            .per_device
+            .entry(device_id.to_owned())
+            .or_insert_with(|| CreationBucket {
+                bucket: TokenBucket::new(
+                    limits::COMMAND_BURST,
+                    limits::COMMAND_CREATES_PER_SECOND,
+                    now_ms,
+                ),
+                last_seen_ms: now_ms,
+            });
+        entry.last_seen_ms = now_ms;
+        entry.bucket.take(1.0, now_ms).err()
+    }
+
+    /// Drops the bucket charged least recently. Called only when the table is full and an unseen
+    /// id arrives, so the table never refuses an id for lack of space.
+    fn evict_least_recently_used(&mut self) {
+        let Some(oldest) = self
+            .per_device
+            .iter()
+            .min_by_key(|(_, bucket)| bucket.last_seen_ms)
+            .map(|(device_id, _)| device_id.clone())
+        else {
+            return;
+        };
+        self.per_device.remove(&oldest);
+    }
+}
+
 #[derive(Default)]
 struct RegistryInner {
     next_connection_id: u64,
@@ -341,8 +421,8 @@ struct RegistryInner {
     completed: VecDeque<String>,
     /// Per-device inbound budgets, keyed by device so a reconnect does not reset them.
     ingest: HashMap<String, IngestBudget>,
-    /// Per-device command-creation budgets, same reasoning.
-    creates: HashMap<String, TokenBucket>,
+    /// Command-creation budgets: one bucket per asserted id plus the global budget.
+    creates: CreationBudgets,
 }
 
 /// A command that reached a terminal state without a device answer. Its fields are copied out
@@ -420,25 +500,6 @@ impl RegistryInner {
         let mut outcomes = self.expire(now_ms);
         outcomes.extend(self.fail_pending(device_id, "device_offline", now_ms));
         outcomes
-    }
-
-    /// Charges one command creation against `device_id`'s bucket. `Some(retry_after_ms)` means
-    /// the attempt is throttled and must answer `429` without being traced.
-    fn charge_create(&mut self, device_id: &str, now: UnixMs) -> Option<i64> {
-        if !self.creates.contains_key(device_id) && self.creates.len() >= MAX_CREATION_BUCKETS {
-            return Some(1_000);
-        }
-        self.creates
-            .entry(device_id.to_owned())
-            .or_insert_with(|| {
-                TokenBucket::new(
-                    limits::COMMAND_BURST,
-                    limits::COMMAND_CREATES_PER_SECOND,
-                    now,
-                )
-            })
-            .take(1.0, now)
-            .err()
     }
 
     fn in_flight(&self, device_id: &str) -> usize {
@@ -641,12 +702,15 @@ impl DeviceRegistry {
     /// throttle is what bounds the log's growth, so a flood must not write through it.
     ///
     /// Every attempt whose outcome can be traced — accepted, refused for want of access, refused
-    /// for its shape, or refused because the id matches no device — charges this bucket, which is
-    /// why it is keyed by the asserted id and capped ([`MAX_CREATION_BUCKETS`]). Attempts stopped
-    /// before any row could exist (a missing actor, a bad token) do not charge.
+    /// for its shape, or refused because the id matches no device — charges it, which is why it is
+    /// keyed by the asserted id. The global bucket is what actually bounds the total, because the
+    /// per-device allowance multiplies with the number of ids named; the per-device table is
+    /// capped ([`MAX_CREATION_BUCKETS`]) and evicts its least recently used bucket rather than
+    /// refusing an unseen id. Attempts stopped before any row could exist (a missing actor, a bad
+    /// token) do not charge.
     pub fn charge_command(&self, device_id: &str) -> Option<i64> {
         let now = self.now_ms();
-        self.inner().charge_create(device_id, now)
+        self.inner().creates.charge(device_id, now)
     }
 
     /// Records the `hello` a connection sent. A replaced connection's late hello is ignored:
@@ -1185,10 +1249,7 @@ mod tests {
         );
     }
 
-    /// An attempt may name an id that matches no device, and it is traced — so the budget table
-    /// must be capped rather than grown by every spoofed name.
-    #[tokio::test]
-    async fn creation_budgets_are_capped_for_ids_that_name_no_device() {
+    fn state_with_clock() -> (AppState, Arc<ManualClock>) {
         let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
         let clock = Arc::new(ManualClock::new(1_760_000_000_000));
         let state = AppState::new(
@@ -1196,26 +1257,95 @@ mod tests {
             "test-admin-token",
             "https://relay.test/api/sessions",
             RelayLimits::default(),
-            clock,
+            clock.clone(),
         )
         .expect("app state with a non-empty admin token");
+        (state, clock)
+    }
 
+    /// The global budget is the real ceiling: rotating the asserted id gives every attempt a full
+    /// per-device bucket, so only the fleet-wide bucket can stop it. The wait it reports is the
+    /// time until a token exists, not a permanent refusal.
+    #[tokio::test]
+    async fn the_global_budget_throttles_a_flood_across_many_ids() {
+        let (state, clock) = state_with_clock();
+
+        let mut admitted = 0;
+        let retry_after_ms = loop {
+            assert!(admitted <= 10_000, "the global budget never fired");
+            let device_id = format!("dev_rotating_{admitted}");
+            if let Some(retry_after_ms) = state.management.charge_command(&device_id) {
+                break retry_after_ms;
+            }
+            admitted += 1;
+        };
+        assert_eq!(
+            admitted as f64,
+            limits::GLOBAL_CREATE_BURST,
+            "every new id has a full per-device bucket, so only the global burst can stop it"
+        );
+        assert!(
+            (1..=10).contains(&retry_after_ms),
+            "the wait is the ~5ms until a token refills, not a permanent refusal: {retry_after_ms}"
+        );
+
+        // The reported wait is real: one refill interval later an attempt is admitted again.
+        clock.advance_ms(5);
+        assert!(
+            state
+                .management
+                .charge_command("dev_after_the_wait")
+                .is_none(),
+            "the global budget refills"
+        );
+    }
+
+    /// A full table evicts the least recently used bucket, so an unseen id — a device that enrolls
+    /// after churn included — is admitted and the evicted device starts fresh when it returns.
+    #[tokio::test]
+    async fn a_full_table_evicts_the_least_recently_used_bucket_instead_of_refusing() {
+        let (state, clock) = state_with_clock();
+
+        // Charge 4096 distinct ids, giving the global bucket its 200/s back between attempts.
         for index in 0..MAX_CREATION_BUCKETS {
             assert!(
                 state
                     .management
                     .charge_command(&format!("dev_spoofed_{index}"))
                     .is_none(),
-                "a fresh id starts with a full bucket"
+                "a fresh id is admitted"
+            );
+            clock.advance_ms(5);
+        }
+
+        // The table is full. An id it has never seen is admitted, at the cost of the oldest bucket.
+        assert!(
+            state
+                .management
+                .charge_command("dev_newly_enrolled")
+                .is_none(),
+            "a full table never refuses an unseen id"
+        );
+        clock.advance_ms(5);
+        assert!(
+            state
+                .management
+                .charge_command("dev_another_new_one")
+                .is_none(),
+            "the table keeps admitting unseen ids"
+        );
+
+        // The evicted device returns with a full bucket: its old state did not survive eviction.
+        // The clock is frozen here so the bucket cannot refill between charges.
+        for charge in 0..(limits::COMMAND_BURST as usize) {
+            assert!(
+                state.management.charge_command("dev_spoofed_0").is_none(),
+                "charge {charge} of a fresh bucket succeeds"
             );
         }
         assert!(
-            state.management.charge_command("dev_one_more").is_some(),
-            "past the cap an id it has never seen is refused instead of growing the table"
-        );
-        assert!(
-            state.management.charge_command("dev_spoofed_0").is_none(),
-            "an id that already has a bucket is still charged from it"
+            state.management.charge_command("dev_spoofed_0").is_some(),
+            "a bucket starts fresh after eviction, so the burst is exactly full again"
         );
     }
 }
