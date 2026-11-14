@@ -18,8 +18,9 @@ pub const HOST_CONTEXT_GLOBAL: &str = "__PHONECONNECT_HOST__";
 pub const HOST_BRIDGE_GLOBAL: &str = "__PHONECONNECT_BRIDGE__";
 /// Environment variable naming the server origin the shell loads.
 pub const SERVER_URL_ENV: &str = "PHONECONNECT_SERVER_URL";
-/// Development default: a server on this machine, never a remote plain-HTTP origin.
-pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
+/// Development default: a server on this machine, never a remote plain-HTTP origin. Shared
+/// with the server's default public origin so the advertised relay is always on it.
+pub const DEFAULT_SERVER_URL: &str = phoneconnect::DEFAULT_SERVER_ORIGIN;
 
 /// Explicit URL-policy failures. A rejected configuration names what is wrong; the shell
 /// never silently corrects a URL it was told to load.

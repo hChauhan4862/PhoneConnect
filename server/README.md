@@ -133,8 +133,8 @@ always re-register instead of being told its own nonce is a replay.
 `POST /api/sessions/{id}/candidates` redeems the caller's ticket and records the endpoint
 that peer reports for itself. `GET /api/sessions/{id}/candidates` (and the response to the
 `POST`) returns the relay route plus a `server_observed` candidate for the opposite peer
-once that peer has reported one. The relay route is `<PHONECONNECT_RELAY_ENDPOINT base>
-/{session_id}/relay`.
+once that peer has reported one. The relay route is `<PHONECONNECT_PUBLIC_URL>/api/sessions/
+{session_id}/relay`.
 
 ## Relay transport and live authorization
 
@@ -258,7 +258,7 @@ device.
 | `PHONECONNECT_ADMIN_TOKEN` | required | Bootstrap admin bearer token. Compose refuses to start without it. |
 | `PHONECONNECT_LISTEN_ADDR` | `0.0.0.0:8080` | Listen address. |
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
-| `PHONECONNECT_RELAY_ENDPOINT` | `http://localhost:8080/api/sessions` | Relay route base advertised to peers; one session appends `/{session_id}/relay`. |
+| `PHONECONNECT_PUBLIC_URL` | `http://127.0.0.1:8080` | The origin clients use. The relay base is derived as `<origin>/api/sessions` and one session appends `/{session_id}/relay`, so the advertised relay is always on the origin a native client loaded. Set it to the public HTTPS origin behind a TLS proxy. |
 | `PHONECONNECT_WEB_ROOT` | `web/dist` | Directory of the built web app, served at `/` (the image uses `/app/web`). |
 
 A peer that reconnects fetches a fresh ticket and re-reads its candidates: each ticket's
@@ -266,8 +266,11 @@ single-use nonce is half of that connection's key epoch, and the transport refus
 second path with a ticket it already used.
 
 The ticket signing key is generated at process start, so a restart invalidates outstanding
-tickets (30 s) and a multi-replica deployment would need shared key material. Identity keys
-are per device and per client and are stored as public values only.
+tickets (30 s), changes the advertised verification key, and a multi-replica deployment would
+need shared key material. Identity keys are per device and per client and are stored as public
+values only. The native shell pins the verification key on first use, so after a server
+restart it refuses a changed key with the remedy `native/README.md` documents (delete the pin
+file after confirming the new key); it never silently accepts a rotation.
 
 Terminate TLS at a reverse proxy; all public endpoints require TLS in production.
 

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use phoneconnect::v1::{DeviceId, STREAM_FRAME_LIMIT};
 use phoneconnect_transport::{
-    CandidateError, CandidateSet, IdentityKey, PathSetup, RelayError, RendezvousCandidates, Ticket,
-    WebSocketRelay, relay_url,
+    CandidateError, CandidateKind, CandidateSet, IdentityKey, PathSetup, RelayError,
+    RendezvousCandidates, Ticket, WebSocketRelay, relay_url,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -26,6 +26,7 @@ use url::Url;
 
 use crate::proxy::{LocalEndpoint, ProxyAllocator, ProxyCapability, ProxyError, ProxyLimits};
 use crate::session_client::{SessionClient, SessionClientError, SessionPath};
+use crate::trust::{TicketTrust, TrustError};
 
 /// Longest lifetime the shell grants one endpoint. A capability is short-lived; an endpoint
 /// that outlives it would keep a local port pointing at a dead stream.
@@ -54,9 +55,58 @@ impl EndpointPolicy {
         }
     }
 
-    pub fn with_verification_key(mut self, verification_key: impl Into<String>) -> Self {
-        self.verification_key = Some(verification_key.into());
-        self
+    pub fn with_verification_key(&self, verification_key: impl Into<String>) -> Self {
+        Self {
+            server_url: self.server_url.clone(),
+            verification_key: Some(verification_key.into()),
+        }
+    }
+
+    /// Checks the parts of a candidates view the shell controls: the relay must be on the
+    /// configured origin, and a pinned key must match. Direct candidates are not checked here
+    /// because they are filtered out before discovery — the shell never dials one.
+    pub fn validate_candidates(&self, candidates: &CandidateSet) -> Result<(), EndpointError> {
+        let relay = candidates.relay().ok_or(EndpointError::NoRelay)?;
+        let parsed = Url::parse(&relay).map_err(|_| EndpointError::RelayOriginOutsideServer {
+            endpoint: relay.clone(),
+            server: self.server_url.as_str().to_owned(),
+        })?;
+        if parsed.origin() != self.server_url.origin() {
+            return Err(EndpointError::RelayOriginOutsideServer {
+                endpoint: relay,
+                server: self.server_url.as_str().to_owned(),
+            });
+        }
+        if let Some(pinned) = &self.verification_key
+            && candidates.verification_key() != pinned
+        {
+            return Err(EndpointError::VerificationKeyMismatch {
+                expected: pinned.clone(),
+                found: candidates.verification_key().to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Keeps only the relay candidate.
+///
+/// Direct candidates are dropped before discovery, never dialed: this milestone routes every
+/// endpoint over the relay, and a page-influenced address must not make the shell send UDP
+/// probes. The server's relay is always present, so a peer that advertises an endpoint still
+/// opens.
+fn relay_only(candidates: &RendezvousCandidates) -> RendezvousCandidates {
+    RendezvousCandidates {
+        session_id: candidates.session_id.clone(),
+        expires_at: candidates.expires_at,
+        verification_key: candidates.verification_key.clone(),
+        peer_nonce: candidates.peer_nonce.clone(),
+        candidates: candidates
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.kind == CandidateKind::Relay)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -104,6 +154,7 @@ pub struct EndpointManager {
     identity: IdentityKey,
     limits: ProxyLimits,
     policy: EndpointPolicy,
+    trust: Option<Arc<TicketTrust>>,
     allocator: Arc<ProxyAllocator>,
     sessions: Mutex<HashMap<String, Arc<SessionPath>>>,
     serving: Mutex<HashMap<String, ServingEndpoint>>,
@@ -129,8 +180,8 @@ pub enum EndpointError {
     NoRelay,
     #[error("relay {endpoint} is not on the configured server origin {server}")]
     RelayOriginOutsideServer { endpoint: String, server: String },
-    #[error("page-supplied direct candidates are refused; this milestone is relay-only")]
-    DirectCandidatesRefused,
+    #[error("the shell has no source for the pinned ticket verification key")]
+    TrustUnavailable,
     #[error("ticket verification key {found} is not the pinned {expected}")]
     VerificationKeyMismatch { expected: String, found: String },
     #[error("the ticket's session has no peer nonce yet; register candidates and retry")]
@@ -143,6 +194,8 @@ pub enum EndpointError {
     Session(#[from] SessionClientError),
     #[error(transparent)]
     Proxy(#[from] ProxyError),
+    #[error(transparent)]
+    Trust(#[from] TrustError),
     #[error("{operation} failed: {source}")]
     Io {
         operation: &'static str,
@@ -152,11 +205,17 @@ pub enum EndpointError {
 }
 
 impl EndpointManager {
-    pub fn new(identity: IdentityKey, limits: ProxyLimits, policy: EndpointPolicy) -> Self {
+    pub fn new(
+        identity: IdentityKey,
+        limits: ProxyLimits,
+        policy: EndpointPolicy,
+        trust: Option<Arc<TicketTrust>>,
+    ) -> Self {
         Self {
             identity,
             limits,
             policy,
+            trust,
             allocator: Arc::new(ProxyAllocator::new()),
             sessions: Mutex::new(HashMap::new()),
             serving: Mutex::new(HashMap::new()),
@@ -357,13 +416,20 @@ impl EndpointManager {
         &self,
         capability: &str,
         ticket: &Ticket,
-        candidates: &RendezvousCandidates,
+        view: &RendezvousCandidates,
     ) -> Result<SessionPath, EndpointError> {
-        if candidates.peer_nonce.is_none() {
+        if view.peer_nonce.is_none() {
             return Err(EndpointError::PeerNonceMissing);
         }
-        let candidates = CandidateSet::discover(candidates.clone(), Vec::new())?;
-        self.validate_candidates(&candidates)?;
+        // The trust anchor comes from the configured origin, never from the page.
+        let trust = self.trust.as_ref().ok_or(EndpointError::TrustUnavailable)?;
+        let pinned = trust
+            .verify_supplied(&view.verification_key, &ticket.session_id, capability)
+            .await?;
+        let candidates = CandidateSet::discover(relay_only(view), Vec::new())?;
+        self.policy
+            .with_verification_key(pinned)
+            .validate_candidates(&candidates)?;
         let relay_base = candidates.relay().ok_or(EndpointError::NoRelay)?;
         let url = relay_url(&relay_base, &ticket.session_id);
         let relay = WebSocketRelay::connect(&url, capability, STREAM_FRAME_LIMIT as usize).await?;
@@ -379,36 +445,6 @@ impl EndpointManager {
         Ok(SessionClient::new()
             .connect(ticket.clone(), candidates, setup)
             .await?)
-    }
-
-    fn validate_candidates(&self, candidates: &CandidateSet) -> Result<(), EndpointError> {
-        if candidates
-            .candidates()
-            .iter()
-            .any(|candidate| candidate.kind.is_direct())
-        {
-            return Err(EndpointError::DirectCandidatesRefused);
-        }
-        let relay = candidates.relay().ok_or(EndpointError::NoRelay)?;
-        let parsed = Url::parse(&relay).map_err(|_| EndpointError::RelayOriginOutsideServer {
-            endpoint: relay.clone(),
-            server: self.policy.server_url.as_str().to_owned(),
-        })?;
-        if parsed.origin() != self.policy.server_url.origin() {
-            return Err(EndpointError::RelayOriginOutsideServer {
-                endpoint: relay,
-                server: self.policy.server_url.as_str().to_owned(),
-            });
-        }
-        if let Some(pinned) = &self.policy.verification_key
-            && candidates.verification_key() != pinned
-        {
-            return Err(EndpointError::VerificationKeyMismatch {
-                expected: pinned.clone(),
-                found: candidates.verification_key().to_owned(),
-            });
-        }
-        Ok(())
     }
 
     fn device_id(&self, device_id: &str) -> Result<DeviceId, EndpointError> {
@@ -485,19 +521,15 @@ mod tests {
     use phoneconnect_transport::CandidateKind;
     use phoneconnect_transport::candidates::WireCandidate;
 
-    fn manager(server: &str, pin: Option<&str>) -> EndpointManager {
-        let mut policy = EndpointPolicy::new(Url::parse(server).expect("server URL"));
-        if let Some(pin) = pin {
-            policy = policy.with_verification_key(pin);
+    fn policy(server: &str, pin: Option<&str>) -> EndpointPolicy {
+        let policy = EndpointPolicy::new(Url::parse(server).expect("server URL"));
+        match pin {
+            Some(pin) => policy.with_verification_key(pin),
+            None => policy,
         }
-        EndpointManager::new(
-            IdentityKey::generate().expect("identity"),
-            ProxyLimits::default(),
-            policy,
-        )
     }
 
-    fn candidates(relay: &str, key: &str, direct: Option<&str>) -> CandidateSet {
+    fn view(relay: &str, key: &str, direct: Option<&str>) -> RendezvousCandidates {
         let mut candidates = vec![WireCandidate {
             kind: CandidateKind::Relay,
             endpoint: relay.to_owned(),
@@ -510,23 +542,35 @@ mod tests {
                 priority: 150,
             });
         }
-        CandidateSet::discover(
-            RendezvousCandidates {
-                session_id: "sess_policy".to_owned(),
-                expires_at: i64::MAX,
-                verification_key: key.to_owned(),
-                peer_nonce: Some("peer-nonce".to_owned()),
-                candidates,
-            },
-            Vec::new(),
-        )
-        .expect("candidate set")
+        RendezvousCandidates {
+            session_id: "sess_policy".to_owned(),
+            expires_at: i64::MAX,
+            verification_key: key.to_owned(),
+            peer_nonce: Some("peer-nonce".to_owned()),
+            candidates,
+        }
+    }
+
+    fn candidates(relay: &str, key: &str, direct: Option<&str>) -> CandidateSet {
+        CandidateSet::discover(view(relay, key, direct), Vec::new()).expect("candidate set")
+    }
+
+    #[test]
+    fn the_default_server_and_client_configurations_agree() {
+        // The relay below is what the server derives from its default public origin.
+        let relay = format!("{}/api/sessions", phoneconnect::DEFAULT_SERVER_ORIGIN);
+        assert_eq!(
+            crate::web_shell::DEFAULT_SERVER_URL,
+            phoneconnect::DEFAULT_SERVER_ORIGIN
+        );
+        policy(phoneconnect::DEFAULT_SERVER_ORIGIN, None)
+            .validate_candidates(&candidates(&relay, "key", None))
+            .expect("the default client origin accepts the default relay");
     }
 
     #[test]
     fn a_relay_on_the_configured_origin_is_accepted() {
-        let manager = manager("http://127.0.0.1:8080", None);
-        manager
+        policy("http://127.0.0.1:8080", None)
             .validate_candidates(&candidates(
                 "http://127.0.0.1:8080/api/sessions",
                 "key",
@@ -537,8 +581,7 @@ mod tests {
 
     #[test]
     fn a_relay_on_another_origin_is_refused() {
-        let manager = manager("https://phoneconnect.example", None);
-        let error = manager
+        let error = policy("https://phoneconnect.example", None)
             .validate_candidates(&candidates(
                 "https://evil.example/api/sessions",
                 "key",
@@ -552,25 +595,39 @@ mod tests {
     }
 
     #[test]
-    fn page_supplied_direct_candidates_are_refused() {
-        let manager = manager("http://127.0.0.1:8080", None);
-        let error = manager
-            .validate_candidates(&candidates(
-                "http://127.0.0.1:8080/api/sessions",
-                "key",
-                Some("203.0.113.9:9"),
-            ))
-            .expect_err("this milestone is relay-only");
+    fn a_server_observed_candidate_is_filtered_and_the_relay_is_used() {
+        let view = view(
+            "http://127.0.0.1:8080/api/sessions",
+            "key",
+            Some("203.0.113.9:9"),
+        );
+        let filtered = relay_only(&view);
         assert!(
-            matches!(error, EndpointError::DirectCandidatesRefused),
-            "{error:?}"
+            filtered
+                .candidates
+                .iter()
+                .all(|candidate| candidate.kind == CandidateKind::Relay),
+            "a direct candidate never reaches the transport"
+        );
+        let set = CandidateSet::discover(filtered, Vec::new()).expect("candidate set");
+        assert!(set.direct().is_empty(), "no address is ever probed");
+        assert_eq!(
+            set.relay().as_deref(),
+            Some("http://127.0.0.1:8080/api/sessions")
+        );
+        policy("http://127.0.0.1:8080", None)
+            .validate_candidates(&set)
+            .expect("the relay is still accepted");
+        assert_eq!(
+            phoneconnect_transport::PathController::select(None, Some(Duration::from_millis(5))),
+            Some(phoneconnect_transport::PathKind::Relay),
+            "with no direct candidate the relay is the selected path"
         );
     }
 
     #[test]
     fn a_pinned_verification_key_cannot_be_replaced_by_the_page() {
-        let manager = manager("http://127.0.0.1:8080", Some("the-pinned-key"));
-        let error = manager
+        let error = policy("http://127.0.0.1:8080", Some("the-pinned-key"))
             .validate_candidates(&candidates(
                 "http://127.0.0.1:8080/api/sessions",
                 "page-chosen-key",
@@ -582,7 +639,7 @@ mod tests {
             "{error:?}"
         );
 
-        manager
+        policy("http://127.0.0.1:8080", Some("the-pinned-key"))
             .validate_candidates(&candidates(
                 "http://127.0.0.1:8080/api/sessions",
                 "the-pinned-key",

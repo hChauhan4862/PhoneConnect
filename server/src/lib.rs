@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod auth;
+pub mod config;
 pub mod enrollment;
 pub mod leases;
 pub mod relay;

@@ -17,6 +17,14 @@
 //! the peer. [`ProxySummary`] therefore counts bytes *accepted by the transport*, and any
 //! transport failure closes the local connection instead of leaving the client waiting.
 //!
+//! # Device-side contract
+//!
+//! The peer (the Android agent, once its TCP byte bridge lands) receives one `request_id` per
+//! local connection, `proxy-<stream>-<n>`. Its sequence state must be scoped **per request
+//! id**, not per session: every connection's sequence starts at 1 and ends with that
+//! connection. Request ids are unique per hub; a re-established session restarts the counter
+//! at 1, and a late frame for a closed connection must be dropped by the shell, not answered.
+//!
 //! There is no Android TCP bridge yet, so an endpoint is useful only against a peer that
 //! speaks the proxy stream (the tests use an echoing stub). The README states this.
 

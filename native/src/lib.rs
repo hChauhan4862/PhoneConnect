@@ -9,6 +9,7 @@
 //!   pump over one proxy stream.
 //! - [`endpoints`] — the endpoint lifecycle behind the shell's commands.
 //! - [`session_client`] — the authenticated transport path the proxy rides.
+//! - [`trust`] — the trust-on-first-use pin for the server's ticket verification key.
 //!
 //! `src/main.rs` is only the Tauri wiring, compiled with `--features shell`, so the logic
 //! above is tested without a webview or a display.
@@ -16,4 +17,5 @@
 pub mod endpoints;
 pub mod proxy;
 pub mod session_client;
+pub mod trust;
 pub mod web_shell;

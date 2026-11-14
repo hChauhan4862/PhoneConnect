@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use phoneconnect_server::auth::{ADMIN_TOKEN_ENV, admin_token_from_env};
+use phoneconnect_server::config::{PUBLIC_URL_ENV, relay_endpoint_for};
 use phoneconnect_server::relay::RelayLimits;
 use phoneconnect_server::retention::{DEFAULT_RETENTION_INTERVAL, RetentionJob};
 use phoneconnect_server::store::{DeviceStore, SqliteStore, SystemClock};
@@ -15,12 +16,10 @@ use phoneconnect_server::{AppState, build_router};
 
 const LISTEN_ADDR_ENV: &str = "PHONECONNECT_LISTEN_ADDR";
 const DATABASE_PATH_ENV: &str = "PHONECONNECT_DATABASE_PATH";
-const RELAY_ENDPOINT_ENV: &str = "PHONECONNECT_RELAY_ENDPOINT";
 const WEB_ROOT_ENV: &str = "PHONECONNECT_WEB_ROOT";
 
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_DATABASE_PATH: &str = "/data/phoneconnect.sqlite3";
-const DEFAULT_RELAY_ENDPOINT: &str = "http://localhost:8080/api/sessions";
 const DEFAULT_WEB_ROOT: &str = "web/dist";
 
 #[tokio::main]
@@ -29,7 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| format!("{ADMIN_TOKEN_ENV} must be set to a non-empty admin token"))?;
     let listen_addr = environment_or(LISTEN_ADDR_ENV, DEFAULT_LISTEN_ADDR);
     let database_path = environment_or(DATABASE_PATH_ENV, DEFAULT_DATABASE_PATH);
-    let relay_endpoint = environment_or(RELAY_ENDPOINT_ENV, DEFAULT_RELAY_ENDPOINT);
+    // One origin, not two settings: the relay base peers receive is derived from it, so a
+    // native shell that loaded this origin can always dial the relay it is told about.
+    let public_url = environment_or(
+        PUBLIC_URL_ENV,
+        phoneconnect_server::config::DEFAULT_PUBLIC_URL,
+    );
+    let relay_endpoint = relay_endpoint_for(&public_url);
     let web_root = environment_or(WEB_ROOT_ENV, DEFAULT_WEB_ROOT);
 
     let store: Arc<dyn DeviceStore> = Arc::new(SqliteStore::open(&database_path)?);

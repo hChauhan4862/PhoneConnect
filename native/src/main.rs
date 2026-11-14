@@ -5,9 +5,11 @@
 //! host context, a tray, detached OS windows, OS notifications, and the loopback proxy
 //! endpoints the endpoint manager owns. There is no second UI tree here.
 //!
-//! Run with `PHONECONNECT_SERVER_URL` set (default `http://127.0.0.1:8080`). The shell uses
-//! the page's normal session cookies; it never embeds a server credential, and its transport
-//! identity private half never leaves this process.
+//! Run with `PHONECONNECT_SERVER_URL` set (default `http://127.0.0.1:8080`, the same origin the
+//! server derives its relay from). The shell uses the page's normal session cookies; it never
+//! embeds a server credential, and its transport identity private half never leaves this
+//! process. The ticket verification key is pinned on first use under the shell's config
+//! directory (`native/src/trust.rs`).
 
 #[cfg(feature = "shell")]
 mod shell {
@@ -15,6 +17,7 @@ mod shell {
 
     use phoneconnect_native::endpoints::{EndpointManager, EndpointPolicy, OpenEndpointRequest};
     use phoneconnect_native::proxy::{LocalEndpoint, ProxyLimits};
+    use phoneconnect_native::trust::{TicketTrust, default_pin_path};
     use phoneconnect_native::web_shell::{
         self, NotificationInput, TrayStatus, bridge_script, capability_origins, host_context,
         host_context_script, is_same_origin, resolve_route, route_window_label, tray_tooltip,
@@ -151,10 +154,15 @@ mod shell {
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let server_url = web_shell::configured_server_url()?;
         let identity = IdentityKey::generate()?;
+        let pin_path = default_pin_path().ok_or(
+            "no config directory for the ticket verification key pin; set HOME or XDG_CONFIG_HOME",
+        )?;
+        let trust = Arc::new(TicketTrust::new(server_url.clone(), pin_path));
         let endpoints = Arc::new(EndpointManager::new(
             identity,
             ProxyLimits::default(),
             EndpointPolicy::new(server_url.clone()),
+            Some(trust),
         ));
         let setup_endpoints = Arc::clone(&endpoints);
         let setup_server = server_url.clone();

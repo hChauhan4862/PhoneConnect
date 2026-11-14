@@ -20,7 +20,13 @@ PHONECONNECT_SERVER_URL=https://phoneconnect.example \
 ## What it loads
 
 `PHONECONNECT_SERVER_URL` names the server **origin**; the default is
-`http://127.0.0.1:8080`. `web_shell::resolve_url` accepts only:
+`http://127.0.0.1:8080`, the same constant the server derives its advertised relay from
+(`phoneconnect::DEFAULT_SERVER_ORIGIN`). An endpoint is only usable when the relay is on the
+origin the shell loaded, so the two defaults cannot drift: `localhost` and `127.0.0.1` are
+different origins. A deployment sets the server's `PHONECONNECT_PUBLIC_URL` to the origin
+clients load and the shell's `PHONECONNECT_SERVER_URL` to that same origin.
+
+`web_shell::resolve_url` accepts only:
 
 - `https://` on any host, or
 - `http://127.0.0.1[:port]` / `http://localhost[:port]` for development,
@@ -82,12 +88,12 @@ duplicated.
 2. The page registers its candidates and passes the issued ticket, its candidates view, and
    the session capability to `openEndpoint({ deviceId, stream, ttlSeconds, session })` with
    `session.kind = "rendezvous"`.
-3. `EndpointManager` verifies everything through the shared transport
-   (`SessionClient::connect`: signed ticket, authenticated direct probe against the relay,
-   shortest validated path), reusing the session for the next endpoint on that device. The
-   page cannot choose where the shell dials: the relay must be on the configured server
-   origin, page-supplied direct candidates are refused (relay-only for this milestone), and a
-   pinned ticket verification key, once the shell has one, cannot be replaced by the page.
+3. `EndpointManager` pins the ticket verification key itself (see below), keeps only the
+   relay candidate, and verifies everything through the shared transport
+   (`SessionClient::connect`). The page cannot choose where the shell dials: the relay must be
+   on the configured server origin, and direct candidates are **ignored, never dialed** — the
+   server always advertises a relay, so a peer that reports an endpoint still opens over it
+   rather than failing.
 4. It binds `127.0.0.1:0`, registers the endpoint with its capability deadline, and starts a
    serving task that accepts one local connection at a time until closed, expired, or the
    session path fails. Each local connection gets its own request id
@@ -98,6 +104,25 @@ The shell's identity private half never leaves the process and no server credent
 embedded in the page: the ticket is single-use and short-lived, and the capability is the one
 the signed-in user already holds. `EndpointManager` is plain Rust, so this whole command path
 is covered by `native/tests/endpoints.rs`; the Tauri command is three lines of glue.
+
+#### The ticket verification key
+
+The transport verifies each ticket against the key in the candidates view — which the page
+supplies — so the shell pins that key itself instead of trusting the page:
+
+- On the first rendezvous open, the shell fetches the key from the configured origin
+  (`GET <server>/api/sessions/<id>/candidates` with the session capability) and stores it in
+  the shell's config directory: `~/Library/Application Support/PhoneConnect/` (macOS),
+  `%APPDATA%\PhoneConnect\` (Windows), `$XDG_CONFIG_HOME/phoneconnect` or
+  `~/.config/phoneconnect` (Linux), file `ticket-verification-key`.
+- Every later open requires the page-supplied key to equal the pin. On a mismatch the shell
+  asks the origin once more and refuses with `PinChanged`, naming whether the server rotated
+  its key or the page presented a key the server does not use.
+- A rotation is never silently accepted. The server generates its ticket signing key at
+  process start, so a server restart rotates it: confirm the new key with the operator, then
+  delete the pin file (the shell's documented reset) and reopen the endpoint. The pin file is
+  written `0600` through a temporary file and rename, so a crash cannot leave a truncated
+  anchor.
 
 An endpoint disappears from `localEndpoints()` when it is closed, when its capability
 expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when the path fails: the
@@ -198,11 +223,25 @@ What is proven is the native half:
   endpoint opened through it is reachable on `127.0.0.1`, carries bytes to the stub, two
   endpoints share one session, and it disappears from `endpoints()` after close or expiry. A
   persistent endpoint serves a second connection while a stale frame for the first is ignored;
-  a dead session is refused rather than reused; a relay outside the configured origin, a
-  page-supplied direct candidate, and a replaced verification key are rejected before any port
-  opens; a closed session and a ticket for another device are refused too.
+  a dead session is refused rather than reused; a relay outside the configured origin and a
+  page-chosen verification key are rejected before any port opens; a closed session and a
+  ticket for another device are refused too.
+- `native/tests/trust.rs` covers the pin: first use pins, a page key that differs is refused
+  with the remedy, a rotated server key is refused, the pin survives a restart without another
+  fetch, an unreachable server without a pin fails closed, and reset forgets the pin.
+- Unit tests in `native/src/endpoints.rs` show the server's default relay is on the shell's
+  default origin, and that a server-observed direct candidate is filtered out so the relay is
+  the selected path.
 - Unit tests in `native/src/proxy.rs` prove a `FramesLost` report ends every live stream with
   that error and that a full queue fails only its own stream.
+
+### Device-side contract (Android bridge, next task)
+
+The peer must scope sequence state **per request id**, not per session. Each local connection
+on the shell side gets `proxy-<stream>-<n>`, unique per hub; its sequence starts at 1 and ends
+with that connection. A re-established session restarts the counter at 1. A frame for a closed
+connection is dropped by the shell, so the device must not answer it or carry state across
+request ids.
 - The same tests would run unchanged against the Android agent once it answers proxy frames;
   the stub is the contract.
 - The Docker transport end-to-end test still proves a control frame crosses processes over
@@ -214,8 +253,10 @@ What is proven is the native half:
 `native/src/session_client.rs` wraps the shared transport:
 
 - `SessionClient::connect(ticket, candidates, setup)` runs `PathController::connect`, so the
-  ticket is verified, direct candidates are probed authenticated, and the lower-latency of
-  direct and relay wins.
+  ticket is verified and the lower-latency of a validated direct path and the relay wins. The
+  endpoint manager always hands it a relay-only candidate set (see above), so an endpoint is
+  relay-routed in this milestone even though the transport supports direct paths for callers
+  that pass server-observed candidates.
 - `SessionClient::connect_relay_only(setup)` is the fallback when UDP is unavailable or direct
   negotiation already failed. It still seals every frame.
 - `SessionPath::path_kind()` reports the path that was actually selected, and

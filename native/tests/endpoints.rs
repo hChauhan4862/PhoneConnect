@@ -15,6 +15,7 @@ use phoneconnect_native::endpoints::{
     EndpointError, EndpointManager, EndpointPolicy, OpenEndpointRequest, SessionAccess,
 };
 use phoneconnect_native::proxy::ProxyLimits;
+use phoneconnect_native::trust::{PIN_FILE_NAME, TicketTrust, TrustError};
 use phoneconnect_transport::IdentityKey;
 use phoneconnect_transport::candidates::WireCandidate;
 use phoneconnect_transport::{CandidateKind, RendezvousCandidates};
@@ -29,6 +30,7 @@ fn manager() -> EndpointManager {
         IdentityKey::generate().expect("identity"),
         ProxyLimits::default(),
         EndpointPolicy::new(url::Url::parse(SERVER).expect("server URL")),
+        None,
     )
 }
 
@@ -314,6 +316,26 @@ async fn an_invalid_stream_or_zero_ttl_is_refused() {
     );
 }
 
+/// A manager with a pre-seeded trust pin, so no fetch is needed and the pin is authoritative.
+fn manager_with_pin(name: &str, pin_value: &str) -> (EndpointManager, std::path::PathBuf) {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-state")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("test directory");
+    let pin = directory.join(PIN_FILE_NAME);
+    std::fs::write(&pin, format!("{pin_value}\n")).expect("seed the pin");
+    let server = url::Url::parse(SERVER).expect("server URL");
+    let trust = Arc::new(TicketTrust::new(server.clone(), pin));
+    let manager = EndpointManager::new(
+        IdentityKey::generate().expect("identity"),
+        ProxyLimits::default(),
+        EndpointPolicy::new(server),
+        Some(trust),
+    );
+    (manager, directory)
+}
+
 async fn wait_until_no_endpoints(manager: &EndpointManager) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -410,7 +432,7 @@ async fn a_dead_session_is_not_reused_for_a_new_endpoint() {
 
 #[tokio::test]
 async fn a_relay_outside_the_configured_origin_is_refused_through_open() {
-    let manager = manager();
+    let (manager, directory) = manager_with_pin("endpoint-origin", "key");
     let request = rendezvous(
         ticket(DEVICE, "sess_rendezvous"),
         candidates("http://evil.example/api/sessions", "key", None),
@@ -424,4 +446,35 @@ async fn a_relay_outside_the_configured_origin_is_refused_through_open() {
         "{error:?}"
     );
     assert!(manager.endpoints().await.is_empty());
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[tokio::test]
+async fn a_page_chosen_verification_key_is_refused_by_the_pin() {
+    let (manager, directory) = manager_with_pin("endpoint-pin", "pinned-key");
+    let pin = directory.join(PIN_FILE_NAME);
+    let relay = format!("{SERVER}/api/sessions");
+    let error = manager
+        .open(rendezvous(
+            ticket(DEVICE, "sess_rendezvous"),
+            candidates(&relay, "page-chosen-key", None),
+        ))
+        .await
+        .expect_err("the pinned key wins over the page");
+    match error {
+        EndpointError::Trust(TrustError::PinChanged { remedy, .. }) => {
+            assert!(remedy.contains("delete"), "{remedy}");
+        }
+        other => panic!("expected a pin change, got {other:?}"),
+    }
+    assert!(
+        manager.endpoints().await.is_empty(),
+        "a refused key binds no port"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pin).expect("pin").trim(),
+        "pinned-key",
+        "the pin is never replaced by a page value"
+    );
+    std::fs::remove_dir_all(&directory).ok();
 }

@@ -27,6 +27,13 @@ pub const STREAM_FRAME_LIMIT: u32 = 4 * 1024 * 1024;
 /// Maximum accepted length of a device, session, or request identifier.
 pub const MAX_IDENTIFIER_LEN: usize = 128;
 
+/// Origin of a self-hosted PhoneConnect server.
+///
+/// One constant so the server's advertised relay base and the native shell's default server
+/// URL cannot drift: an endpoint is only usable when the relay it dials is on the origin the
+/// shell loaded, and `localhost` and `127.0.0.1` are different origins.
+pub const DEFAULT_SERVER_ORIGIN: &str = "http://127.0.0.1:8080";
+
 pub mod v1 {
     //! `phoneconnect.v1` protobuf types and their protocol helpers.
     include!(concat!(env!("OUT_DIR"), "/phoneconnect.v1.rs"));
