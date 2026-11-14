@@ -5,6 +5,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.os.Looper
+import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -53,6 +54,8 @@ class SetupActivityTest {
         context.getSharedPreferences(AgentSettings.PREFERENCES_NAME, Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences(AgentDiagnostics.PREFERENCES_NAME, Context.MODE_PRIVATE).edit().clear().commit()
         ConnectionService.captureEnded()
+        TestSetupActivity.writeSettingsGranted = false
+        TestSetupActivity.policyGranted = false
     }
 
     @After
@@ -245,6 +248,44 @@ class SetupActivityTest {
         assertTrue("the screen must say capture is off, was '$status'", status.contains("off", ignoreCase = true))
     }
 
+    @Test
+    fun `the brightness grant opens the system settings screen for this package`() {
+        val activity = setupActivity()
+
+        activity.findViewById<Button>(R.id.grant_write_settings).performClick()
+
+        val started = shadowOf(activity).nextStartedActivity
+        assertEquals(Settings.ACTION_MANAGE_WRITE_SETTINGS, started.action)
+        assertEquals(
+            "the grant must be requested for this package, not for every app",
+            "package:${context.packageName}",
+            started.data.toString(),
+        )
+    }
+
+    @Test
+    fun `the Do Not Disturb grant opens the notification policy access screen`() {
+        val activity = setupActivity()
+
+        activity.findViewById<Button>(R.id.grant_policy_access).performClick()
+
+        val started = shadowOf(activity).nextStartedActivity
+        assertEquals(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS, started.action)
+    }
+
+    @Test
+    fun `the screen reports which grants the user has given`() {
+        TestSetupActivity.writeSettingsGranted = true
+        val activity = setupActivity()
+
+        val status = activity.findViewById<TextView>(R.id.grants_status).text.toString()
+        assertTrue("the allowed grant must be visible, was '$status'", status.contains("Brightness changes: allowed"))
+        assertTrue(
+            "a missing grant must be visible, was '$status'",
+            status.contains("Do Not Disturb changes: not allowed"),
+        )
+    }
+
     private fun setupActivity(): SetupActivity {
         TestSetupActivity.storeOverride = store
         return Robolectric.buildActivity(
@@ -276,8 +317,14 @@ class SetupActivityTest {
 
         override fun screenCaptureIntent(): Intent = Intent("com.phoneconnect.test.CAPTURE_CONSENT")
 
+        override fun canWriteSettings(): Boolean = writeSettingsGranted
+
+        override fun hasPolicyAccess(): Boolean = policyGranted
+
         companion object {
             lateinit var storeOverride: EnrollmentStore
+            var writeSettingsGranted = false
+            var policyGranted = false
         }
     }
 

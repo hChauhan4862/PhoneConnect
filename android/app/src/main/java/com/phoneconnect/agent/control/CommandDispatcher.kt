@@ -42,6 +42,7 @@ open class CommandDispatcher(
     private val props: SystemPropertiesHandler? = null,
     private val shell: ShellHandler? = null,
     private val logcat: LogcatHandler? = null,
+    private val control: ControlHandler? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -92,6 +93,15 @@ open class CommandDispatcher(
         LOGCAT_TAIL -> runCatching {
             (logcat ?: throw CommandFailure.unknown(name)).tail()
         }
+        // Device control reads and writes framework services, so it runs off the command
+        // receive loop; the reboot refusal never touches the platform.
+        CONTROL_GET, CONTROL_SET -> withContext(ioDispatcher) {
+            val handler = control ?: return@withContext Result.failure(CommandFailure.unknown(name))
+            runCatching { handler.handle(name, args) }
+        }
+        CONTROL_REBOOT -> runCatching {
+            (control ?: throw CommandFailure.unknown(name)).handle(name, args)
+        }
         else -> Result.failure(CommandFailure.unknown(name))
     }
 
@@ -117,6 +127,10 @@ open class CommandDispatcher(
         const val SYSTEM_PROPS = "system.props"
         const val SHELL_EXEC = "shell.exec"
         const val LOGCAT_TAIL = "logcat.tail"
+
+        const val CONTROL_GET = "control.get"
+        const val CONTROL_SET = "control.set"
+        const val CONTROL_REBOOT = "control.reboot"
 
         /** The server's default deadline, used when a caller does not supply a budget. */
         const val DEFAULT_BUDGET_MS: Long = 10_000

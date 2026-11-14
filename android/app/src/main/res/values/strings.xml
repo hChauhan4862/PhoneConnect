@@ -26,4 +26,12 @@
     <string name="setup_capture_off">Screen capture is off. A snapshot command answers consent_required until you enable it here.</string>
     <string name="setup_capture_on">Screen capture is enabled. Android cannot keep this grant across a restart, so enable it again after the app restarts.</string>
     <string name="setup_capture_not_granted">Screen capture was not granted. The snapshot command stays unavailable.</string>
+
+    <string name="setup_grant_write_settings">Allow brightness changes</string>
+    <string name="setup_grant_policy_access">Allow Do Not Disturb changes</string>
+    <string name="setup_grants_status">Brightness changes: %1$s\nDo Not Disturb changes: %2$s</string>
+    <string name="setup_grants_status_initial">Brightness changes: not allowed\nDo Not Disturb changes: not allowed</string>
+    <string name="setup_grant_granted">allowed</string>
+    <string name="setup_grant_missing">not allowed — use the button above and allow it in Android settings</string>
+    <string name="setup_grants_unavailable">Android did not open that settings screen on this device, so the grant cannot be given here.</string>
 </resources>

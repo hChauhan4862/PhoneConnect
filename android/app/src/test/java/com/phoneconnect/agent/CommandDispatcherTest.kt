@@ -1,10 +1,13 @@
 package com.phoneconnect.agent
 
+import androidx.test.core.app.ApplicationProvider
 import com.phoneconnect.agent.control.AppPlatform
+import com.phoneconnect.agent.control.AndroidControlPlatform
 import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CapturedFrame
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.CommandFailure
+import com.phoneconnect.agent.control.ControlHandler
 import com.phoneconnect.agent.control.DeviceDescription
 import com.phoneconnect.agent.control.DeviceInfoHandler
 import com.phoneconnect.agent.control.FileHandler
@@ -261,6 +264,60 @@ class CommandDispatcherTest {
         val failure = dispatcher.dispatch(CommandDispatcher.SHELL_EXEC).exceptionOrNull()
 
         assertEquals("unknown_command", (failure as CommandFailure).code)
+    }
+
+    @Test
+    fun `control reads run off the command receive loop`() = runBlocking {
+        val recording = RecordingDispatcher(Dispatchers.IO)
+        val withControl = CommandDispatcher(
+            telemetry = telemetry,
+            control = ControlHandler(
+                AndroidControlPlatform(ApplicationProvider.getApplicationContext()),
+            ),
+            ioDispatcher = recording,
+        )
+
+        val output = withControl.dispatch(CommandDispatcher.CONTROL_GET, JSONObject()).getOrThrow()
+
+        assertEquals(
+            "the device must say which changes it refuses",
+            true,
+            output.getJSONObject(ControlHandler.UNAVAILABLE).has("wifi"),
+        )
+        assertTrue("reading framework services must not run on the command receive loop", recording.used.get())
+    }
+
+    @Test
+    fun `a control command without a configured handler is still answered by name`() = runBlocking {
+        for (name in listOf(
+            CommandDispatcher.CONTROL_GET,
+            CommandDispatcher.CONTROL_SET,
+            CommandDispatcher.CONTROL_REBOOT,
+        )) {
+            val failure = dispatcher.dispatch(name).exceptionOrNull()
+            assertTrue("$name must be answered, got $failure", failure is CommandFailure)
+            assertEquals("unknown_command", (failure as CommandFailure).code)
+        }
+    }
+
+    @Test
+    fun `a refused control set is the handler's machine reason`() = runBlocking {
+        val withControl = CommandDispatcher(
+            telemetry = telemetry,
+            control = ControlHandler(
+                AndroidControlPlatform(ApplicationProvider.getApplicationContext()),
+            ),
+        )
+
+        val failure = withControl
+            .dispatch(
+                CommandDispatcher.CONTROL_SET,
+                JSONObject().put("key", "wifi").put("value", true),
+            )
+            .exceptionOrNull()
+
+        assertEquals("not_permitted", (failure as CommandFailure).code)
+        assertEquals("wifi_setter_removed", failure.message)
     }
 
     /** Records that work was dispatched instead of run inline, then delegates to a real pool. */

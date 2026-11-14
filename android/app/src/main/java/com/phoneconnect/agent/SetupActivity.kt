@@ -2,16 +2,20 @@ package com.phoneconnect.agent
 
 import android.Manifest
 import android.app.Activity
+import android.app.NotificationManager
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import com.phoneconnect.agent.net.HubClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +42,9 @@ open class SetupActivity : Activity() {
     private lateinit var enableCaptureButton: Button
     private lateinit var disableCaptureButton: Button
     private lateinit var captureStatusView: TextView
+    private lateinit var grantWriteSettingsButton: Button
+    private lateinit var grantPolicyAccessButton: Button
+    private lateinit var grantsStatusView: TextView
 
     /** What this screen last knew about the projection; the service is the authority. */
     private var captureOn = false
@@ -61,14 +68,20 @@ open class SetupActivity : Activity() {
         enableCaptureButton = findViewById(R.id.enable_capture)
         disableCaptureButton = findViewById(R.id.disable_capture)
         captureStatusView = findViewById(R.id.capture_status)
+        grantWriteSettingsButton = findViewById(R.id.grant_write_settings)
+        grantPolicyAccessButton = findViewById(R.id.grant_policy_access)
+        grantsStatusView = findViewById(R.id.grants_status)
 
         hubField.setText(AgentSettings(this).hubUrl().orEmpty())
         enrollButton.setOnClickListener { enroll() }
         enableCaptureButton.setOnClickListener { requestScreenCapture() }
         disableCaptureButton.setOnClickListener { stopScreenCapture() }
+        grantWriteSettingsButton.setOnClickListener { openWriteSettings() }
+        grantPolicyAccessButton.setOnClickListener { openPolicyAccess() }
 
         captureOn = ConnectionService.screenCaptureEnabled()
         showCaptureState()
+        showGrantState()
         requestNotificationPermission()
         showInitialState()
 
@@ -152,6 +165,42 @@ open class SetupActivity : Activity() {
         disableCaptureButton.isEnabled = captureOn
     }
 
+    /**
+     * The two grants `control.set` gates on are given in Android's own settings, never by this
+     * app: the buttons open those screens, and the status line reports what Android says.
+     */
+    private fun openWriteSettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, "package:$packageName".toUri()),
+            )
+        } catch (_: ActivityNotFoundException) {
+            grantsStatusView.text = getString(R.string.setup_grants_unavailable)
+        }
+    }
+
+    private fun openPolicyAccess() {
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+        } catch (_: ActivityNotFoundException) {
+            grantsStatusView.text = getString(R.string.setup_grants_unavailable)
+        }
+    }
+
+    private fun showGrantState() {
+        grantsStatusView.text = getString(
+            R.string.setup_grants_status,
+            getString(if (canWriteSettings()) R.string.setup_grant_granted else R.string.setup_grant_missing),
+            getString(if (hasPolicyAccess()) R.string.setup_grant_granted else R.string.setup_grant_missing),
+        )
+    }
+
+    /** Test seams: the real answers come from the settings provider and the notification service. */
+    internal open fun canWriteSettings(): Boolean = Settings.System.canWrite(this)
+
+    internal open fun hasPolicyAccess(): Boolean =
+        getSystemService(NotificationManager::class.java)?.isNotificationPolicyAccessGranted == true
+
     public override fun onResume() {
         super.onResume()
         // A projection can end from the system UI ("Stop sharing"), which this screen cannot
@@ -162,6 +211,8 @@ open class SetupActivity : Activity() {
             captureOn = enabled
             showCaptureState()
         }
+        // The user may have allowed a grant in the system screen this app opened.
+        showGrantState()
     }
 
     override fun onDestroy() {

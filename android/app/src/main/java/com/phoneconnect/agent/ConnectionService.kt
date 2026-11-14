@@ -16,8 +16,10 @@ import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.phoneconnect.agent.control.AndroidAppPlatform
+import com.phoneconnect.agent.control.AndroidControlPlatform
 import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CommandDispatcher
+import com.phoneconnect.agent.control.ControlHandler
 import com.phoneconnect.agent.control.FileHandler
 import com.phoneconnect.agent.control.LogcatHandler
 import com.phoneconnect.agent.control.MediaProjectionScreenCapture
@@ -216,6 +218,7 @@ open class ConnectionService : Service() {
                 props = SystemPropertiesHandler(),
                 shell = ShellHandler(),
                 logcat = LogcatHandler(),
+                control = ControlHandler(AndroidControlPlatform(this)),
             ),
             telemetry = sampler,
         )
