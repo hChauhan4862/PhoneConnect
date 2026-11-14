@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthError;
 use crate::leases::LeaseError;
-use crate::management::{CommandRecord, Dispatch, DispatchError};
+use crate::management::{CommandRecord, Dispatch, DispatchError, rate_limited_response};
 use crate::store::{AuditEntry, StoreError};
 use crate::{ApiJson, AppState};
 
@@ -117,22 +117,11 @@ impl CommandError {
 
 impl IntoResponse for CommandError {
     fn into_response(self) -> Response {
-        let status = self.status();
-        // A throttled caller is told when the budget refills; every other refusal is the
-        // same `{"error": code}` envelope as the rest of the API.
-        let retry_after_seconds = match &self {
-            Self::RateLimited { retry_after_ms } => Some(((*retry_after_ms + 999) / 1_000).max(1)),
-            _ => None,
-        };
-        let mut response = (status, Json(json!({ "error": self.code() }))).into_response();
-        if let Some(seconds) = retry_after_seconds {
-            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, value);
-            }
+        match self {
+            // A throttled caller is told when the budget refills.
+            Self::RateLimited { retry_after_ms } => rate_limited_response(retry_after_ms),
+            other => (other.status(), Json(json!({ "error": other.code() }))).into_response(),
         }
-        response
     }
 }
 

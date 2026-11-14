@@ -34,8 +34,11 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    (`/api/devices/{id}/control`) inside the same service: it announces the device with
    `hello`, reports a `TelemetrySampler` sample on connect and every 30 s, and answers each
    `command` frame with exactly one `result`. It refuses to *start* a command whose absolute
-   `expires_at_ms` has already passed (answered `timeout`, never executed) and refuses
-   non-object `args` as `invalid_args`. Its reconnect backoff is bounded (1 s doubling to
+   `expires_at_ms` has already passed (answered `timeout`, never executed), clamps a running
+   handler to the remaining server budget rather than its full `deadline_ms`, and refuses
+   non-object `args` as `invalid_args`. Its server-clock estimate is re-learned on every new
+   socket and revised downward when several samples agree, so a device clock correction cannot
+   wedge every command into `timeout`. Its reconnect backoff is bounded (1 s doubling to
    60 s); a repeatedly refused credential stops it as `offline` instead of looping. The
    channel never starts a service, posts a notification, or publishes a status: the service
    reports its state in the existing notification.

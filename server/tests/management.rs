@@ -5,6 +5,7 @@ mod common;
 
 use common::TestApp;
 use common::control;
+use phoneconnect_server::management;
 use serde_json::json;
 
 #[tokio::test]
@@ -279,6 +280,68 @@ async fn a_failed_upgrade_does_not_displace_the_live_channel() {
 }
 
 #[tokio::test]
+async fn a_full_flush_of_results_keeps_the_channel_open() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // The worst legitimate case: every in-flight command is answered in one burst. The frame
+    // budget must be at least the in-flight cap, or the device is cut off mid-flush and the
+    // commands it did execute are reported as offline.
+    assert!(
+        management::limits::BYTE_BURST
+            >= (management::MAX_RESULT_BYTES * management::MAX_IN_FLIGHT_PER_DEVICE) as f64,
+        "the byte burst must cover a full-size result for every in-flight command"
+    );
+    let mut command_ids = Vec::new();
+    for index in 0..phoneconnect_server::management::MAX_IN_FLIGHT_PER_DEVICE {
+        // Pace the dispatches past the creation throttle; the clock does not advance while
+        // the device answers, so the result burst is exactly one burst.
+        app.clock.advance_ms(100);
+        let (status, body) = app
+            .dispatch_command(
+                &device_id,
+                "user-a",
+                json!({ "name": "device.ping", "args": { "index": index }, "timeout_ms": 60_000 }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::ACCEPTED,
+            "command {index}: {body}"
+        );
+        command_ids.push(body["command_id"].as_str().expect("command_id").to_owned());
+    }
+    for _ in 0..command_ids.len() {
+        let frame = control::next_json(&mut socket).await;
+        assert_eq!(frame["type"], "command");
+    }
+
+    for command_id in &command_ids {
+        control::send(
+            &mut socket,
+            control::result(command_id, "ok", json!({ "pong": true })),
+        )
+        .await;
+    }
+
+    for command_id in &command_ids {
+        let body = wait_for_completion(&app, command_id, "user-a").await;
+        assert_eq!(
+            body["status"], "ok",
+            "every executed command keeps its result: {body}"
+        );
+    }
+    assert!(
+        app.state.management.is_online(&device_id),
+        "a device that answers everything it owes must stay connected"
+    );
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
 async fn a_closed_channel_fails_pending_commands_as_device_offline() {
     let app = TestApp::new();
     let (device_id, credential) = app.enroll_new("user-a").await;
@@ -320,6 +383,18 @@ async fn a_malformed_frame_closes_the_channel_with_a_reason() {
     control::wait_offline(&app, &device_id).await;
 
     server.abort();
+}
+
+async fn wait_for_completion(app: &TestApp, command_id: &str, user_id: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let (status, body) = app.command(command_id, user_id).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        if body["status"] != "pending" {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("command {command_id} never completed");
 }
 
 async fn wait_for_hello(

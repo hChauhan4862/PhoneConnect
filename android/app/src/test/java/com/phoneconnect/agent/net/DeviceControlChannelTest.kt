@@ -326,6 +326,193 @@ class DeviceControlChannelTest {
         assertTrue("the handler must not run for unusable arguments", executed.isEmpty())
     }
 
+    @Test
+    fun `a forward device-clock step is revised down so fresh commands run again`() = runBlocking {
+        val serverBase = 1_760_000_000_000L
+        val deviceNow = java.util.concurrent.atomic.AtomicLong(1_000)
+        val results = Channel<JSONObject>(Channel.BUFFERED)
+        val sent = java.util.concurrent.atomic.AtomicInteger()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        val frame = JSONObject(text)
+                        when (frame.optString("type")) {
+                            "hello" -> webSocket.send(
+                                command("cmd_1", "device.ping", expiresAtMs = serverBase + 10_000),
+                            )
+
+                            "result" -> {
+                                results.trySend(frame)
+                                // An NTP correction moves the device clock forward by 600 s
+                                // after the first answer; every later sample then implies a
+                                // much smaller offset than the stored one.
+                                if (sent.getAndIncrement() == 0) {
+                                    deviceNow.addAndGet(600_000)
+                                }
+                                if (sent.get() <= 4) {
+                                    webSocket.send(
+                                        command(
+                                            "cmd_${sent.get() + 1}",
+                                            "device.ping",
+                                            expiresAtMs = serverBase + 10_000,
+                                        ),
+                                    )
+                                }
+                            }
+
+                            else -> Unit
+                        }
+                    }
+                },
+            ),
+        )
+        val channel = DeviceControlChannel(
+            hub = hub,
+            dispatcher = CommandDispatcher(telemetry = telemetry),
+            telemetry = telemetry,
+            telemetryIntervalMs = 60_000,
+            clock = { deviceNow.get() },
+        )
+        val job = launch(Dispatchers.IO) { channel.run(Store()) { } }
+
+        assertEquals("ok", withTimeout(20_000) { results.receive() }.getString("status"))
+        // The stored estimate is still the pre-step one, so the first fresh commands look
+        // expired; several agreeing lower samples revise it and the channel recovers instead of
+        // refusing every command until the process restarts.
+        repeat(2) {
+            val refused = withTimeout(20_000) { results.receive() }
+            assertEquals("error", refused.getString("status"))
+            assertEquals("timeout", refused.getString("error"))
+        }
+        val recovered = withTimeout(20_000) { results.receive() }
+        assertEquals("ok", recovered.getString("status"))
+
+        job.cancel()
+    }
+
+    @Test
+    fun `a new socket re-learns the server clock`() = runBlocking {
+        val serverBase = 1_760_000_000_000L
+        val deviceNow = java.util.concurrent.atomic.AtomicLong(1_000)
+        val results = Channel<JSONObject>(Channel.BUFFERED)
+        val sockets = java.util.concurrent.atomic.AtomicInteger()
+        val listener = object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                sockets.incrementAndGet()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                val frame = JSONObject(text)
+                when (frame.optString("type")) {
+                    "hello" -> webSocket.send(
+                        command("cmd_${sockets.get()}", "device.ping", expiresAtMs = serverBase + 10_000),
+                    )
+
+                    "result" -> {
+                        results.trySend(frame)
+                        if (sockets.get() == 1) {
+                            // The device clock steps while the first socket is up, then the
+                            // channel reconnects: the new socket must not inherit the stale
+                            // estimate.
+                            deviceNow.addAndGet(600_000)
+                            webSocket.close(1008, "replaced")
+                        }
+                    }
+
+                    else -> Unit
+                }
+            }
+        }
+        server.enqueue(MockResponse().withWebSocketUpgrade(listener))
+        server.enqueue(MockResponse().withWebSocketUpgrade(listener))
+        val channel = DeviceControlChannel(
+            hub = hub,
+            dispatcher = CommandDispatcher(telemetry = telemetry),
+            telemetry = telemetry,
+            telemetryIntervalMs = 60_000,
+            pause = { },
+            clock = { deviceNow.get() },
+        )
+        val job = launch(Dispatchers.IO) { channel.run(Store()) { } }
+
+        assertEquals("ok", withTimeout(20_000) { results.receive() }.getString("status"))
+        val second = withTimeout(20_000) { results.receive() }
+
+        job.cancel()
+        assertEquals("cmd_2", second.getString("request_id"))
+        assertEquals("ok", second.getString("status"))
+    }
+
+    @Test
+    fun `a command is stopped by its remaining server budget, not the full deadline`() = runBlocking {
+        val serverBase = 1_760_000_000_000L
+        val results = Channel<JSONObject>(Channel.BUFFERED)
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val slow = object : CommandDispatcher(telemetry = telemetry) {
+            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+                if (name == "device.ping") return Result.success(JSONObject().put("pong", true))
+                try {
+                    kotlinx.coroutines.delay(30_000)
+                } catch (stopped: kotlinx.coroutines.CancellationException) {
+                    cancelled.set(true)
+                    throw stopped
+                }
+                return Result.success(JSONObject())
+            }
+        }
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        val frame = JSONObject(text)
+                        when (frame.optString("type")) {
+                            "hello" -> webSocket.send(
+                                command("cmd_1", "device.ping", expiresAtMs = serverBase + 10_000),
+                            )
+
+                            "result" -> {
+                                results.trySend(frame)
+                                if (frame.optString("request_id") == "cmd_1") {
+                                    // A second command the server issued with only 1.5 s of its
+                                    // absolute budget left, but a 10 s deadline.
+                                    webSocket.send(
+                                        command("cmd_slow", "device.info", expiresAtMs = serverBase + 1_500),
+                                    )
+                                }
+                            }
+
+                            else -> Unit
+                        }
+                    }
+                },
+            ),
+        )
+        val channel = DeviceControlChannel(
+            hub = hub,
+            dispatcher = slow,
+            telemetry = telemetry,
+            telemetryIntervalMs = 60_000,
+            clock = { 1_000 },
+        )
+        val job = launch(Dispatchers.IO) { channel.run(Store()) { } }
+
+        assertEquals("ok", withTimeout(20_000) { results.receive() }.getString("status"))
+        val startedAt = System.nanoTime()
+        val stopped = withTimeout(20_000) { results.receive() }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+        job.cancel()
+        assertEquals("cmd_slow", stopped.getString("request_id"))
+        assertEquals("error", stopped.getString("status"))
+        assertEquals("timeout", stopped.getString("error"))
+        assertTrue(
+            "the handler must stop near its remaining budget, not its 10 s deadline; took ${elapsedMs}ms",
+            elapsedMs in 1_000..5_000,
+        )
+        assertTrue("the handler must be cancelled, not left running", cancelled.get())
+    }
+
     private class Store : EnrollmentStore {
         override suspend fun info(): EnrollmentInfo =
             EnrollmentInfo("dev_1", EnrollmentState.ENROLLED, 1_000)

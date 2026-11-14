@@ -76,8 +76,14 @@ class DeviceControlChannel(
      * transit delay, so the maximum is the closest underestimate: the estimate never runs
      * ahead of the server, a fresh command is never falsely expired, and a command that
      * waited out its deadline is still caught once the wait exceeds the least delay seen.
+     *
+     * The estimate is bounded in lifetime: a new socket re-learns it, and a long-lived one
+     * accepts a materially lower value once enough samples agree (a forward device-clock
+     * correction makes every later sample imply a smaller offset; keeping only the old
+     * maximum would then refuse every fresh command until the process restarted).
      */
     private var serverOffsetMs: Long? = null
+    private var lowerOffsetSamples = 0
     override suspend fun run(
         store: EnrollmentStore,
         onState: suspend (ManagementChannelState) -> Unit,
@@ -136,6 +142,9 @@ class DeviceControlChannel(
 
     /** One connected socket: announce the device, then samples up and commands down. */
     private suspend fun runSocket(socket: ControlSocket) {
+        // A new connection starts with no assumption about the server clock.
+        serverOffsetMs = null
+        lowerOffsetSamples = 0
         if (!socket.send(deviceInfo.hello().toString())) return
         coroutineScope {
             val samples = launch {
@@ -211,10 +220,14 @@ class DeviceControlChannel(
             return
         }
 
-        val result = withTimeoutOrNull(deadlineMs) {
+        // Starting a command with 1 s of server budget left must not give it the full 10 s
+        // deadline: the caller is told `timeout` on the server's clock, and the work stops
+        // with it. Without a server-clock estimate there is nothing to clamp against.
+        val budgetMs = remainingBudgetMs(expiresAtMs, nowMs, deadlineMs)
+        val result = withTimeoutOrNull(budgetMs) {
             withContext(Dispatchers.Default) { dispatcher.dispatch(name, args) }
         } ?: Result.failure(
-            CommandFailure("timeout", "$name did not finish within ${deadlineMs}ms"),
+            CommandFailure("timeout", "$name did not finish within ${budgetMs}ms"),
         )
         socket.send(resultFrame(requestId, result).toString())
     }
@@ -230,12 +243,43 @@ class DeviceControlChannel(
         return nowMs + offset >= expiresAtMs
     }
 
+    /**
+     * How long the handler may run: the smaller of the requested duration and what is left of
+     * the command's absolute server budget.
+     */
+    private fun remainingBudgetMs(expiresAtMs: Long, nowMs: Long, deadlineMs: Long): Long {
+        if (expiresAtMs <= 0L) return deadlineMs
+        val offset = serverOffsetMs ?: return deadlineMs
+        val remaining = expiresAtMs - (nowMs + offset)
+        return remaining.coerceIn(1L, deadlineMs)
+    }
+
     private fun observeServerClock(sentAtMs: Long, nowMs: Long) {
         val implied = sentAtMs - nowMs
         val current = serverOffsetMs
-        if (current == null || implied > current) {
-            serverOffsetMs = implied
+        if (current == null) {
+            adoptServerOffset(implied)
+            return
         }
+        if (implied > current) {
+            adoptServerOffset(implied)
+            return
+        }
+        if (current - implied <= OFFSET_REVISION_SLACK_MS) {
+            lowerOffsetSamples = 0
+            return
+        }
+        lowerOffsetSamples += 1
+        // A long gap is not evidence by itself: a command queued behind a slow handler also
+        // arrives after one. Only several samples that agree on a lower value are.
+        if (lowerOffsetSamples >= OFFSET_REVISION_SAMPLES) {
+            adoptServerOffset(implied)
+        }
+    }
+
+    private fun adoptServerOffset(offsetMs: Long) {
+        serverOffsetMs = offsetMs
+        lowerOffsetSamples = 0
     }
 
     private fun resultFrame(requestId: String, result: Result<JSONObject>): JSONObject {
@@ -274,6 +318,13 @@ class DeviceControlChannel(
 
         /** A credential refusal tolerated this many times before the channel stops. */
         const val MAX_AUTH_REFUSALS: Int = 5
+
+        /**
+         * Consecutive samples that must imply a materially lower offset before the estimate is
+         * revised downward. One queued command looks like that too; several in a row do not.
+         */
+        const val OFFSET_REVISION_SAMPLES: Int = 3
+        const val OFFSET_REVISION_SLACK_MS: Long = 500
 
         private val AUTH_REFUSAL_STATUSES = setOf(401, 403)
         private const val MAX_EXPONENT = 40

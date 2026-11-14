@@ -159,6 +159,8 @@ pub enum TelemetryError {
     InvalidSample { reason: &'static str },
     #[error("telemetry tracks at most {limit} devices")]
     Capacity { limit: usize },
+    #[error("telemetry is throttled; retry in {retry_after_ms}ms")]
+    RateLimited { retry_after_ms: i64 },
 }
 
 struct DeviceTelemetry {
@@ -360,6 +362,9 @@ impl IntoResponse for TelemetryIngestError {
                 Json(json!({ "error": "device_scope_mismatch" })),
             )
                 .into_response(),
+            Self::Invalid(TelemetryError::RateLimited { retry_after_ms }) => {
+                crate::management::rate_limited_response(retry_after_ms)
+            }
             Self::Invalid(error) => {
                 let (status, code) = match error {
                     TelemetryError::InvalidDevice => (StatusCode::BAD_REQUEST, "invalid_device"),
@@ -369,6 +374,10 @@ impl IntoResponse for TelemetryIngestError {
                     TelemetryError::Capacity { .. } => {
                         (StatusCode::TOO_MANY_REQUESTS, "telemetry_capacity")
                     }
+                    // Handled above: it carries a `Retry-After` header.
+                    TelemetryError::RateLimited { .. } => {
+                        (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+                    }
                 };
                 (status, Json(json!({ "error": code }))).into_response()
             }
@@ -377,6 +386,10 @@ impl IntoResponse for TelemetryIngestError {
 }
 
 /// `POST /api/devices/{id}/telemetry`: one bounded report from the device itself.
+///
+/// This route feeds the same global ingest mutex as the management channel, so it is charged
+/// from the same per-device ingress budget: a flood here is refused exactly as a flood on the
+/// channel is.
 pub async fn ingest_telemetry(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
@@ -386,6 +399,17 @@ pub async fn ingest_telemetry(
     let device = state.auth.require_device(&headers).await?;
     if device.device_id != device_id {
         return Err(TelemetryIngestError::DeviceScopeMismatch { device_id });
+    }
+    let reported_bytes = serde_json::to_vec(&sample)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    if let Some(retry_after_ms) = state
+        .management
+        .charge_ingest(&device.device_id, reported_bytes)
+    {
+        return Err(TelemetryIngestError::Invalid(TelemetryError::RateLimited {
+            retry_after_ms,
+        }));
     }
     Ok(Json(state.telemetry.ingest(&device.device_id, sample)?))
 }

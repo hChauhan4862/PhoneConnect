@@ -224,6 +224,53 @@ async fn a_device_reports_telemetry_only_for_itself() {
 }
 
 #[tokio::test]
+async fn the_http_telemetry_route_shares_the_per_device_budget() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("owner-1").await;
+
+    // The management channel's budget is the one that protects ingest; the HTTP route feeds
+    // the same mutex, so it must be charged from the same budget.
+    let mut accepted = 0;
+    let (status, headers, body) = loop {
+        let (status, headers, body) = app
+            .request_with_headers(
+                Method::POST,
+                &format!("/api/devices/{device_id}/telemetry"),
+                Some(&credential),
+                Some(json!({ "sampled_at_ms": app.now(), "battery_percent": 50 })),
+            )
+            .await;
+        if status != StatusCode::OK {
+            break (status, headers, body);
+        }
+        accepted += 1;
+        assert!(
+            accepted < 500,
+            "the HTTP telemetry route is never throttled"
+        );
+    };
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"], "rate_limited");
+    assert!(
+        headers.get("retry-after").is_some(),
+        "a throttled report says when to retry"
+    );
+    assert!(
+        (40..500).contains(&accepted),
+        "the burst covers a real burst, not an unlimited stream: {accepted}"
+    );
+
+    // The agent's normal cadence is one report every 30 s, which must always pass.
+    app.clock.advance_ms(30_000);
+    let (status, body) = app.ingest_telemetry(&device_id, &credential, 50).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a normal cadence is accepted: {body}"
+    );
+}
+
+#[tokio::test]
 async fn the_status_surface_reports_telemetry_freshness() {
     let app = TestApp::new();
     let (device_id, credential) = app.enroll_new("owner-1").await;

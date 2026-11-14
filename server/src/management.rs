@@ -85,18 +85,42 @@ pub const CLOSE_RATE_LIMITED: &str = "rate_limited";
 pub mod limits {
     /// Inbound frames per second from one device.
     pub const FRAMES_PER_SECOND: f64 = 20.0;
-    /// Burst of inbound frames, so a reconnecting device can send its hello and first sample
-    /// at once.
-    pub const FRAME_BURST: f64 = 40.0;
 
-    /// Inbound bytes per second from one device. A full 2 MiB result still fits a single
-    /// frame; a stream of them does not.
+    /// Burst of inbound frames. **Invariant:** it must fit everything a device can
+    /// legitimately owe in one flush — one result per in-flight command — plus the hello and
+    /// telemetry around them. A smaller burst would cut a device off mid-flush and report
+    /// commands it did execute as `device_offline`.
+    pub const FRAME_BURST: f64 = super::MAX_IN_FLIGHT_PER_DEVICE as f64 + 32.0;
+
+    /// Inbound bytes per second from one device.
     pub const BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
-    pub const BYTE_BURST: f64 = 8.0 * 1024.0 * 1024.0;
+
+    /// Burst of inbound bytes. **Invariant:** every in-flight command may owe a full-size
+    /// result, so the burst covers [`MAX_RESULT_BYTES`] × [`MAX_IN_FLIGHT_PER_DEVICE`] plus a
+    /// little telemetry headroom. Larger results are refused by name, not by the bucket.
+    pub const BYTE_BURST: f64 =
+        (super::MAX_RESULT_BYTES * super::MAX_IN_FLIGHT_PER_DEVICE + 1024 * 1024) as f64;
 
     /// Command creations per device per second on the HTTP path.
     pub const COMMAND_CREATES_PER_SECOND: f64 = 10.0;
     pub const COMMAND_BURST: f64 = 20.0;
+}
+
+/// The one shape a throttled caller sees: `429 rate_limited` with `Retry-After`. Both the
+/// management channel's command path and the HTTP telemetry route use it.
+pub fn rate_limited_response(retry_after_ms: i64) -> Response {
+    let seconds = ((retry_after_ms + 999) / 1_000).max(1);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        axum::Json(json!({ "error": "rate_limited" })),
+    )
+        .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// The description a device sends in its `hello` frame, before any command is dispatched.

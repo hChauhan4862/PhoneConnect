@@ -70,9 +70,7 @@ impl TestApp {
         bearer: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let (status, _headers, value) = self
-            .request_with_headers(method, uri, bearer, body)
-            .await;
+        let (status, _headers, value) = self.request_with_headers(method, uri, bearer, body).await;
         (status, value)
     }
 
