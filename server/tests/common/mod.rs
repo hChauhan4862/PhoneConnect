@@ -402,4 +402,229 @@ impl TestApp {
         )
         .await
     }
+
+    /// `POST /api/devices/{id}/commands?user_id=...`: dispatch one management command.
+    pub async fn dispatch_command(
+        &self,
+        device_id: &str,
+        user_id: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/commands?user_id={user_id}"),
+            Some(ADMIN_TOKEN),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `POST /api/devices/{id}/commands` exactly as given, so a test can vary the query.
+    pub async fn dispatch_command_at(&self, uri: &str, body: Value) -> (StatusCode, Value) {
+        self.request(Method::POST, uri, Some(ADMIN_TOKEN), Some(body))
+            .await
+    }
+
+    /// `GET /api/commands/{id}?user_id=...`: one command's current state.
+    pub async fn command(&self, command_id: &str, user_id: &str) -> (StatusCode, Value) {
+        self.request(
+            Method::GET,
+            &format!("/api/commands/{command_id}?user_id={user_id}"),
+            Some(ADMIN_TOKEN),
+            None,
+        )
+        .await
+    }
+}
+
+/// A live management channel: the tests serve the real router on a loopback port, so the
+/// WebSocket upgrade, the registry, and the device-facing frames are exercised end to end.
+pub mod control {
+    use std::time::Duration;
+
+    use axum::http::{Method, StatusCode};
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use super::TestApp;
+
+    pub type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    pub fn path(device_id: &str) -> String {
+        format!("/api/devices/{device_id}/control")
+    }
+
+    /// Serves the router on a loopback port and returns the `ws://` base.
+    pub async fn serve(app: &TestApp) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let router = phoneconnect_server::build_router(app.state.clone());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("ws://{address}"), handle)
+    }
+
+    /// The HTTP answer a rejected WebSocket handshake receives: exactly what an agent sees
+    /// when its credential is refused.
+    pub async fn reject(base: &str, device_id: &str, bearer: &str) -> (u16, Value) {
+        match connect(base, device_id, bearer).await {
+            Err(Error::Http(response)) => {
+                let status = response.status().as_u16();
+                let body = response
+                    .body()
+                    .as_ref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .unwrap_or_default();
+                let value = if body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(&body).unwrap_or(Value::String(body))
+                };
+                (status, value)
+            }
+            Err(other) => panic!("expected an HTTP rejection, got {other:?}"),
+            Ok(_) => panic!("expected the handshake to be refused"),
+        }
+    }
+
+    /// A plain GET without upgrade headers, for the transport refusal it earns.
+    pub async fn plain_get(app: &TestApp, device_id: &str, bearer: &str) -> (StatusCode, String) {
+        use tower::ServiceExt;
+
+        let request = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(path(device_id))
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = phoneconnect_server::build_router(app.state.clone())
+            .oneshot(request)
+            .await
+            .expect("router responds");
+        let status = response.status();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collected")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub async fn connect(base: &str, device_id: &str, credential: &str) -> Result<Socket, Error> {
+        let url = format!("{base}{}", path(device_id));
+        let mut request = url.into_client_request().expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {credential}")
+                .parse()
+                .expect("bearer header"),
+        );
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    /// Connects and waits until the registry has registered the device, so a command sent
+    /// immediately after cannot race the server's upgrade task.
+    pub async fn connect_ok(
+        app: &TestApp,
+        device_id: &str,
+        credential: &str,
+    ) -> (Socket, String, tokio::task::JoinHandle<()>) {
+        let (base, server) = serve(app).await;
+        let socket = connect(&base, device_id, credential)
+            .await
+            .expect("authorized device attaches to the control channel");
+        wait_online(app, device_id).await;
+        (socket, base, server)
+    }
+
+    pub async fn wait_online(app: &TestApp, device_id: &str) {
+        for _ in 0..200 {
+            if app.state.management.is_online(device_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the device never became online on the management channel");
+    }
+
+    pub async fn wait_offline(app: &TestApp, device_id: &str) {
+        for _ in 0..200 {
+            if !app.state.management.is_online(device_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the device stayed online after its channel ended");
+    }
+
+    pub async fn send(socket: &mut Socket, value: Value) {
+        socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .expect("frame sent");
+    }
+
+    pub async fn send_text(socket: &mut Socket, text: &str) {
+        socket
+            .send(Message::Text(text.to_owned().into()))
+            .await
+            .expect("frame sent");
+    }
+
+    pub async fn next_message(socket: &mut Socket) -> Message {
+        tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a message arrives within the deadline")
+            .expect("the stream is open")
+            .expect("a valid message")
+    }
+
+    pub async fn next_json(socket: &mut Socket) -> Value {
+        match next_message(socket).await {
+            Message::Text(text) => serde_json::from_str(&text).expect("a JSON text frame"),
+            other => panic!("expected a JSON text frame, got {other:?}"),
+        }
+    }
+
+    pub async fn next_close(socket: &mut Socket) -> (u16, String) {
+        match next_message(socket).await {
+            Message::Close(Some(frame)) => {
+                (u16::from(frame.code), frame.reason.as_str().to_owned())
+            }
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
+
+    /// A `result` frame for `request_id`.
+    pub fn result(request_id: &str, status: &str, output: Value) -> Value {
+        json!({
+            "type": "result",
+            "request_id": request_id,
+            "status": status,
+            "output": output,
+            "error": null,
+            "message": null
+        })
+    }
+
+    /// A `result` error frame for `request_id`.
+    pub fn error_result(request_id: &str, error: &str, message: &str) -> Value {
+        json!({
+            "type": "result",
+            "request_id": request_id,
+            "status": "error",
+            "output": null,
+            "error": error,
+            "message": message
+        })
+    }
 }

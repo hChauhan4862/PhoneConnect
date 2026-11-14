@@ -197,6 +197,35 @@ impl ControlLease {
     }
 }
 
+/// One durable audit row. Command records live in memory by design; this is the trace that
+/// survives a restart and is what the audit surface reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditEntry {
+    pub at_ms: UnixMs,
+    pub actor: String,
+    pub action: String,
+    pub device_id: String,
+    /// `accepted` or `refused`; the outcome of the attempt, never a shaped success.
+    pub outcome: String,
+    pub error: Option<String>,
+}
+
+/// Newest audit rows returned by one query. The HTTP surface applies its own page limit;
+/// this is the hard bound that keeps a query from reading the whole log.
+pub const MAX_AUDIT_PAGE: usize = 1_000;
+
+impl AuditEntry {
+    /// The columns as the store returns them.
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.actor.trim().is_empty() || self.action.trim().is_empty() {
+            return Err(StoreError::Backend(
+                "an audit row needs an actor and an action".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// How many stale records one retention run deleted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RetentionCounts {
@@ -375,6 +404,17 @@ pub trait DeviceStore: Send + Sync {
         &self,
         cutoff_ms: UnixMs,
     ) -> Result<RetentionCounts, StoreError>;
+
+    /// Appends one audit row. The audit log is append-only: a row is never updated or
+    /// deleted by the store, only by retention.
+    async fn insert_audit(&self, entry: AuditEntry) -> Result<(), StoreError>;
+
+    /// Newest-first audit rows, optionally for one device, at most [`MAX_AUDIT_PAGE`].
+    async fn list_audit(
+        &self,
+        device_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, StoreError>;
 }
 
 const SCHEMA: &str = "
@@ -424,6 +464,17 @@ CREATE TABLE IF NOT EXISTS lease_sessions (
     linked_at_ms INTEGER NOT NULL,
     PRIMARY KEY (lease_id, session_id)
 );
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at_ms INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_log_by_device
+    ON audit_log(device_id, at_ms DESC, id DESC);
 ";
 
 /// SQLite-backed [`DeviceStore`] for tests and single-node deployments.
@@ -1058,6 +1109,78 @@ impl DeviceStore for SqliteStore {
             })
         })
     }
+
+    async fn insert_audit(&self, entry: AuditEntry) -> Result<(), StoreError> {
+        entry.validate()?;
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO audit_log (at_ms, actor, action, device_id, outcome, error)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        entry.at_ms,
+                        entry.actor,
+                        entry.action,
+                        entry.device_id,
+                        entry.outcome,
+                        entry.error,
+                    ],
+                )
+                .map_err(backend_error)?;
+            Ok(())
+        })
+    }
+
+    async fn list_audit(
+        &self,
+        device_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, StoreError> {
+        let limit = limit.clamp(1, MAX_AUDIT_PAGE) as i64;
+        self.with_connection(|connection| {
+            let rows = match device_id {
+                Some(device_id) => {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT at_ms, actor, action, device_id, outcome, error
+                             FROM audit_log WHERE device_id = ?1
+                             ORDER BY at_ms DESC, id DESC LIMIT ?2",
+                        )
+                        .map_err(backend_error)?;
+                    statement
+                        .query_map(params![device_id, limit], audit_from_row)
+                        .map_err(backend_error)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(backend_error)?
+                }
+                None => {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT at_ms, actor, action, device_id, outcome, error
+                             FROM audit_log ORDER BY at_ms DESC, id DESC LIMIT ?1",
+                        )
+                        .map_err(backend_error)?;
+                    statement
+                        .query_map(params![limit], audit_from_row)
+                        .map_err(backend_error)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(backend_error)?
+                }
+            };
+            Ok(rows)
+        })
+    }
+}
+
+fn audit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {
+    Ok(AuditEntry {
+        at_ms: row.get(0)?,
+        actor: row.get(1)?,
+        action: row.get(2)?,
+        device_id: row.get(3)?,
+        outcome: row.get(4)?,
+        error: row.get(5)?,
+    })
 }
 
 const LEASE_SELECT: &str = "SELECT lease_id, device_id, owner_id, holder_id, granted_by,

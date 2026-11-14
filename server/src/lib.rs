@@ -8,9 +8,11 @@
 
 pub mod admin;
 pub mod auth;
+pub mod commands;
 pub mod config;
 pub mod enrollment;
 pub mod leases;
+pub mod management;
 pub mod relay;
 pub mod rendezvous;
 pub mod retention;
@@ -35,6 +37,7 @@ pub use relay::PeerRole;
 
 use auth::{AuthError, Authenticator};
 use leases::LeaseStore;
+use management::DeviceRegistry;
 use relay::{Relay, RelayLimits};
 use rendezvous::{Rendezvous, TicketAuthority, TicketError};
 use store::{Clock, DeviceStore};
@@ -48,6 +51,9 @@ pub struct AppState {
     pub relay: Arc<Relay>,
     pub leases: Arc<LeaseStore>,
     pub telemetry: Arc<TelemetryAggregator>,
+    /// The management channel: one authenticated device connection per device and the
+    /// bounded in-flight command table commands are dispatched through.
+    pub management: Arc<DeviceRegistry>,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -110,6 +116,7 @@ impl AppState {
             Arc::clone(&clock),
         ));
         let telemetry = Arc::new(TelemetryAggregator::new(Arc::clone(&clock)));
+        let management = Arc::new(DeviceRegistry::new(Arc::clone(&clock)));
         Ok(Self {
             store,
             auth,
@@ -117,6 +124,7 @@ impl AppState {
             relay,
             leases,
             telemetry,
+            management,
             clock,
         })
     }
@@ -192,6 +200,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/devices/{device_id}/telemetry",
             post(telemetry::ingest_telemetry),
         )
+        // The management channel: telemetry and commands over one authenticated device
+        // WebSocket, and the HTTP surface the one web UI dispatches through.
+        .route(
+            "/api/devices/{device_id}/control",
+            get(management::control_socket),
+        )
+        .route(
+            "/api/devices/{device_id}/commands",
+            post(commands::dispatch_command),
+        )
+        .route("/api/commands/{command_id}", get(commands::command_state))
         .route(
             "/api/devices/{device_id}/lease",
             post(leases::acquire_lease).get(leases::lease_status),

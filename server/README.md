@@ -18,6 +18,10 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
   relay transport route.
 - `src/leases.rs` — control leases: one holder per device, explicit grant and handoff,
   read-only secondary access, and revocation that closes the lease's streams.
+- `src/management.rs` — the device management channel: one authenticated WebSocket per
+  device, the in-memory command table, deadlines, and bounded results.
+- `src/commands.rs` — the command HTTP surface: authorization, dispatch, polling, and the
+  audit row written for every attempt.
 - `src/telemetry.rs` — bounded per-device telemetry aggregation, explicit freshness, and
   30-day aggregate deletion.
 - `src/status.rs` — the status surface the web UI renders: device, session, path evidence,
@@ -51,6 +55,9 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/leases/{id}/revoke` | admin | Immediate revocation; body is `{actor_id}`. Returns the revocation event, including the stream capabilities it invalidated. Idempotent. |
 | `GET` | `/api/devices/{id}/sessions/next` | device credential | The newest live session for this device, with a device ticket and a `control` flag; `204` when there is none. |
 | `POST` | `/api/devices/{id}/telemetry` | device credential matching `{id}` | One bounded telemetry report; the response is the bounded aggregate. |
+| `GET` (upgrade) | `/api/devices/{id}/control` | device credential matching `{id}` | The management channel: a WebSocket carrying JSON telemetry and commands. A new connection replaces the old one with a `replaced` close. |
+| `POST` | `/api/devices/{id}/commands?user_id=` | admin | Dispatches one command; body is `{name, args?, timeout_ms?}` and the response is `202 {command_id}`. Refusals are `403 lease_read_only`, `409 device_offline`, `409 device_revoked`, `429 command_capacity`, `400 invalid_timeout`. |
+| `GET` | `/api/commands/{id}?user_id=` | admin | One command's state: `pending`, `ok`, `error`, or `timeout`, with `output`, `error`, `message`, and timestamps. |
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
 An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA
@@ -223,10 +230,41 @@ login or MFA, the admin-token holder asserts `actor_id`/`user_id` in the request
 rules constrain what a client may do once its identity is accepted; they do not authenticate
 that identity. Local accounts and MFA (production-ops plan) turn them into a real boundary.
 
+## Management channel and commands
+
+Besides the sealed peer relay, every enrolled device keeps a management WebSocket at
+`/api/devices/{id}/control`, authorized by its device credential. It carries JSON the server
+reads — this is the deliberate, documented trade that gives the one web UI any device feature
+at all; relay frames stay ciphertext.
+
+Frames are fixed:
+
+- device → server `{"type":"hello","model","android_version","sdk"}`,
+  `{"type":"telemetry","sample":…}`, and
+  `{"type":"result","request_id","status":"ok"|"error","output","error","message"}`;
+- server → device `{"type":"command","request_id","name","args","deadline_ms"}`, where
+  `deadline_ms` is a duration the device may spend, not an absolute timestamp.
+
+One connection per device: a second connection replaces the first, which is closed with the
+`replaced` code and whose in-flight commands complete as `error`/`device_offline`. A frame
+that is not valid JSON closes the channel with `malformed_frame`; an invalid telemetry
+*value* is dropped and surfaces as stale telemetry instead.
+
+Commands live in memory only: at most 64 in flight per device, a 10 s default and 60 s
+maximum deadline, and at most 2 MiB per result (an oversized result refuses the command with
+`result_too_large`). A command whose deadline passes reads as `timeout`; nothing pending is
+ever left looking successful. The device owns the command vocabulary: the server forwards any
+name, and an unimplemented one comes back as `unknown_command`.
+
+Dispatch requires the admin token *and* the actor's access to the device (its owner, or the
+active lease holder); the actor is the `user_id` query parameter because the admin token
+carries no identity. Every attempt writes one `audit_log` row with actor, action, device,
+outcome, and error code — that row is the durable trace, not the command itself.
+
 ## Telemetry
 
-`POST /api/devices/{id}/telemetry` accepts one report and keeps a bounded window per device:
-at most 16 retained samples and one small aggregate (min/max/mean plus the latest value), for
+`POST /api/devices/{id}/telemetry` and the management channel's `telemetry` frames each
+accept one report and keep a bounded window per device: at most 16 retained samples and one small aggregate (min/max/mean plus the latest value), for
 at most 200 devices. A 201st device is refused `429 telemetry_capacity` rather than evicting a
 tracked device. A non-finite CPU reading, a battery outside 0-100, or memory usage above the
 reported total is refused `400 invalid_sample`. Aggregates live in memory only: no raw sample
