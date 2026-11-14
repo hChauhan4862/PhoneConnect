@@ -16,6 +16,46 @@ import androidx.core.graphics.createBitmap
 internal class MirrorFrame(val bitmap: Bitmap, val capturedAtMs: Long)
 
 /**
+ * Which frame reader is installed, and whether the mirror can still capture.
+ *
+ * Swapping a reader, closing the mirror, and the "the mirror closed while a resize was still
+ * talking to the platform" race are decided here, on plain values, so the caller always knows
+ * exactly which reader it still owns and which one it must close. A reader that is returned by
+ * [install] was never installed and must be closed by the caller; one returned by [detach] was
+ * installed and must be closed by the caller. Nothing here closes anything itself, so a test can
+ * count how many times each reader is released.
+ */
+internal class ReaderSlot<R : Any>(initial: R) {
+    private var current: R? = initial
+
+    var open: Boolean = true
+        private set
+
+    /** The installed reader, or `null` once the slot is closed. */
+    fun installed(): R? = current
+
+    /**
+     * Installs [replacement]. Returns the reader the caller must close: the previous one when the
+     * swap happened, or [replacement] itself when the slot is already closed (it stays
+     * uninstalled, so closing it is the caller's only duty).
+     */
+    fun install(replacement: R): R {
+        if (!open) return replacement
+        val previous = current ?: return replacement
+        current = replacement
+        return previous
+    }
+
+    /** Closes the slot and returns the installed reader, once. */
+    fun detach(): R? {
+        open = false
+        val held = current
+        current = null
+        return held
+    }
+}
+
+/**
  * A mirrored surface for one projection: the virtual display plus the newest frame it produced.
  *
  * A capture copies [newestFrame] on demand, so a screen that has not changed still yields its
@@ -100,7 +140,7 @@ internal class MediaProjectionMirror(
         } ?: return@OnImageAvailableListener
         var previous: Image? = null
         val stale = synchronized(lock) {
-            if (!open || frames !== reader) {
+            if (!slot.open || slot.installed() !== reader) {
                 true
             } else {
                 previous = latest
@@ -116,19 +156,21 @@ internal class MediaProjectionMirror(
         }
     }
 
-    private var frames: ImageReader = newReader(initial)
+    private val slot: ReaderSlot<ImageReader> = ReaderSlot(newReader(initial))
     private var display: VirtualDisplay? = null
     private var latest: Image? = null
     private var latestAtMs: Long = 0L
 
-    @Volatile
-    override var open: Boolean = true
-        private set
+    /** True while the reader slot is live; [ReaderSlot.detach] is the single place it ends. */
+    override val open: Boolean
+        get() = slot.open
 
     /** Creates the display. Called once, right after construction; throws when refused. */
     fun start(): ScreenMirror {
         // The listener exists before the display does, so a frame delivered while
         // `createVirtualDisplay` is still running is cached rather than treated as stale.
+        val initialFrames = slot.installed()
+            ?: throw IllegalStateException("the mirror was closed before its display was created")
         val created = try {
             projection.createVirtualDisplay(
                 VIRTUAL_DISPLAY_NAME,
@@ -136,7 +178,7 @@ internal class MediaProjectionMirror(
                 height,
                 densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                frames.surface,
+                initialFrames.surface,
                 null,
                 null,
             )
@@ -159,65 +201,68 @@ internal class MediaProjectionMirror(
         ) {
             return true
         }
-        val surface = synchronized(lock) { if (open) display else null } ?: return false
+        val surface = synchronized(lock) { if (slot.open) display else null } ?: return false
         val replacement = try {
             newReader(screen)
         } catch (_: RuntimeException) {
             return false
         }
-        // The new reader becomes the one whose frames are kept before the display is pointed at
-        // it: a frame arriving right after `setSurface` must not be dropped as stale.
-        val previous = synchronized(lock) {
-            val held = frames
-            frames = replacement
-            held
-        }
+        // The replacement is published only after the platform accepted both calls. A reader
+        // that was never installed is closed here, so a close() racing this resize can never
+        // orphan the reader that was installed before it.
         try {
             surface.setSurface(replacement.surface)
             surface.resize(screen.widthPixels, screen.heightPixels, screen.densityDpi)
         } catch (_: RuntimeException) {
-            // The display may already point at the replacement surface, so this mirror cannot be
-            // trusted; the caller retires the grant and closes everything.
-            synchronized(lock) { if (frames === replacement) frames = previous }
-            replacement.setOnImageAvailableListener(null, null)
-            replacement.close()
+            replacement.detachAndClose()
             return false
         }
-        val cached = synchronized(lock) {
-            width = screen.widthPixels
-            height = screen.heightPixels
-            densityDpi = screen.densityDpi
-            val held = latest
-            latest = null
-            latestAtMs = 0
-            held
+        var previous: ImageReader? = null
+        var cached: Image? = null
+        val published = synchronized(lock) {
+            if (!slot.open) {
+                false
+            } else {
+                width = screen.widthPixels
+                height = screen.heightPixels
+                densityDpi = screen.densityDpi
+                previous = slot.install(replacement)
+                cached = latest
+                latest = null
+                latestAtMs = 0
+                true
+            }
+        }
+        if (!published) {
+            // The mirror closed while the platform was being resized: the replacement was never
+            // installed, and close() already released whatever had been.
+            replacement.detachAndClose()
+            return false
+        }
+        if (previous !== replacement) {
+            previous?.detachAndClose()
         }
         cached?.close()
-        previous.setOnImageAvailableListener(null, null)
-        previous.close()
         return true
     }
 
     override fun newestFrame(): MirrorFrame? = synchronized(lock) {
-        if (!open) return null
+        if (!slot.open) return null
         val image = latest ?: return null
         MirrorFrame(image.toBitmap(), latestAtMs)
     }
 
     override fun close() {
-        open = false
-        frames.setOnImageAvailableListener(null, null)
-        val cached = synchronized(lock) {
-            val held = latest
+        val (readers, frame, surface) = synchronized(lock) {
+            val heldReaders = slot.detach()
+            val heldFrame = latest
             latest = null
-            held
-        }
-        cached?.close()
-        val surface = synchronized(lock) {
-            val held = display
+            val heldSurface = display
             display = null
-            held
+            Triple(heldReaders, heldFrame, heldSurface)
         }
+        readers?.detachAndClose()
+        frame?.close()
         if (surface != null) {
             try {
                 surface.release()
@@ -225,12 +270,16 @@ internal class MediaProjectionMirror(
                 // Already released.
             }
         }
+        thread.quitSafely()
+    }
+
+    private fun ImageReader.detachAndClose() {
+        setOnImageAvailableListener(null, null)
         try {
-            frames.close()
+            close()
         } catch (_: RuntimeException) {
             // Already closed.
         }
-        thread.quitSafely()
     }
 
     private fun newReader(screen: ScreenMetrics): ImageReader =

@@ -297,6 +297,43 @@ class MediaProjectionScreenCaptureTest {
     }
 
     @Test
+    fun `a resize queued before a re-grant cannot retire the newer grant`() {
+        val teardown = DeferredExecutor()
+        val first = FakeSource()
+        val second = FakeSource()
+        var next: FakeSource = first
+        var ended = 0
+        val capture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { DEFAULT_METRICS },
+            clock = { NOW },
+            teardown = teardown,
+            openSource = { _, _ -> next },
+        )
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
+        capture.capture(Int.MAX_VALUE, 100)
+        val firstMirror = first.mirror!!
+
+        // A rotation queues a resize; the user grants again before it runs.
+        first.reportContentSize(1200, 2400)
+        next = second
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
+        firstMirror.resizeSucceeds = false
+
+        teardown.runQueued()
+
+        assertTrue("the newer grant must survive a stale resize", capture.available())
+        assertEquals("the newer grant must not be told capture ended", 0, ended)
+        assertEquals("the stale resize must not touch the older mirror", 0, firstMirror.resizes)
+        assertTrue("the replaced projection must be stopped", first.stopped)
+        assertEquals("the replaced mirror must be closed", true, firstMirror.closed)
+
+        val frame = capture.capture(Int.MAX_VALUE, 100)
+        assertEquals("the newer grant must be the one used", 1, second.opened)
+        assertEquals(1080, frame.width)
+    }
+
+    @Test
     fun `a new grant after a release opens a mirror at the new size`() {
         var metrics = DEFAULT_METRICS
         val first = FakeSource()

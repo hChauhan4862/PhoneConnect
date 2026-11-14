@@ -130,13 +130,13 @@ internal class MediaProjectionScreenCapture(
 
     override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame =
         synchronized(captureLock) {
-            val active = synchronized(lock) { source }
-                ?: throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
+            val (grant, active) = synchronized(lock) { generation to source }
+            active ?: throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             val screen = metrics()
             if (screen.widthPixels <= 0 || screen.heightPixels <= 0 || screen.densityDpi <= 0) {
                 throw CommandFailure("capture_failed", "the display size is not available")
             }
-            val frames = mirrorFor(active, screen)
+            val frames = mirrorFor(grant, active, screen)
             val frame = awaitFrame(frames, timeoutMs)
             try {
                 val bitmap = frame.bitmap
@@ -169,12 +169,17 @@ internal class MediaProjectionScreenCapture(
      * one it owns can be resized, so a size change keeps the grant; only a refused resize ends
      * it rather than returning a frame at the wrong size.
      */
-    private fun mirrorFor(active: MirrorSource, screen: ScreenMetrics): ScreenMirror {
-        val existing = synchronized(lock) { mirror }
+    private fun mirrorFor(grant: Long, active: MirrorSource, screen: ScreenMetrics): ScreenMirror {
+        val (ours, existing) = synchronized(lock) { (generation == grant) to mirror }
+        if (!ours) {
+            // A re-grant replaced this capture's grant while it was starting; the next command
+            // uses the new one. Nothing here may touch the grant that replaced it.
+            throw CommandFailure("capture_failed", SUPERSEDED_MESSAGE)
+        }
         if (existing != null) {
             if (!existing.open) {
                 // The mirror was closed under us: the projection is over, not a size problem.
-                discardGrant()
+                discardGrant(grant)
                 throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             }
             if (existing.width == screen.widthPixels && existing.height == screen.heightPixels) {
@@ -185,20 +190,21 @@ internal class MediaProjectionScreenCapture(
             if (existing.resize(screen)) {
                 return existing
             }
-            discardGrant()
+            discardGrant(grant)
             throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, SIZE_CHANGED_MESSAGE)
         }
         val created = try {
             active.open(screen)
         } catch (_: SecurityException) {
-            discardGrant()
+            discardGrant(grant)
             throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
         } catch (_: RuntimeException) {
             throw CommandFailure("capture_failed", "the platform refused a virtual display")
         }
         val raced = synchronized(lock) {
-            // `handleEnded` may have cleared the source while the display was being created.
-            if (source === active) {
+            // `handleEnded` or a re-grant may have replaced the source while the display was
+            // being created.
+            if (generation == grant && source === active) {
                 mirror = created
                 null
             } else {
@@ -207,7 +213,7 @@ internal class MediaProjectionScreenCapture(
         }
         if (raced != null) {
             raced.close()
-            throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
+            throw CommandFailure("capture_failed", SUPERSEDED_MESSAGE)
         }
         return created
     }
@@ -266,21 +272,30 @@ internal class MediaProjectionScreenCapture(
         if (current.width == width && current.height == height) return
         teardown.execute {
             synchronized(captureLock) {
-                if (!current.open) return@synchronized
+                // Re-check the grant: the user may have re-granted while this resize was queued,
+                // and a failure must never retire a grant that is newer than the one it resized.
+                val still = synchronized(lock) {
+                    if (generation != grant) null else mirror
+                }
+                if (still !== current || !current.open) return@synchronized
                 if (!current.resize(ScreenMetrics(width, height, metrics().densityDpi))) {
-                    discardGrant()
+                    discardGrant(grant)
                     return@synchronized
                 }
             }
         }
     }
 
-    /** Drops the current grant because its mirror can no longer answer for this screen. */
-    private fun discardGrant() {
+    /**
+     * Drops [grant] because its mirror can no longer answer for this screen. A grant that has
+     * already been replaced is left alone: a stale resize or end must not retire the new one.
+     */
+    private fun discardGrant(grant: Long) {
         var previousSource: MirrorSource? = null
         var previousMirror: ScreenMirror? = null
         var ended: (() -> Unit)? = null
         synchronized(lock) {
+            if (generation != grant) return
             // Any callback still in flight from this grant is now stale.
             generation += 1
             previousSource = source
@@ -332,10 +347,14 @@ internal class MediaProjectionScreenCapture(
     }
 
     companion object {
-        /** A screen size change cannot reuse the grant's one virtual display. */
+        /** Only used when the platform refuses to resize the display the grant already owns. */
         const val SIZE_CHANGED_MESSAGE =
-            "the screen size changed since capture was enabled, so the projection cannot mirror " +
-                "it; enable screen capture again on the device"
+            "the screen size changed and the platform would not resize the projection to it; " +
+                "enable screen capture again on the device"
+
+        /** A capture that raced a replaced grant: the next command uses the new one. */
+        internal const val SUPERSEDED_MESSAGE =
+            "the screen capture grant changed while the snapshot was starting; try again"
 
         /** How long a capture waits between checks for the first frame. */
         const val FRAME_POLL_MS: Long = 20

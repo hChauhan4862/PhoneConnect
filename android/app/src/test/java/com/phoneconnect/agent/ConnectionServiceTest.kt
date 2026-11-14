@@ -394,6 +394,56 @@ class ConnectionServiceTest {
     }
 
     @Test
+    fun `a resize queued before a re-grant keeps the newer grant foreground`() {
+        val queued = java.util.ArrayDeque<Runnable>()
+        val first = ServiceMirrorSource()
+        val second = ServiceMirrorSource()
+        var next: MirrorSource = first
+        val capture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { ScreenMetrics(1080, 2400, 420) },
+            clock = { 1_760_000_000_000 },
+            teardown = Executor { queued.add(it) },
+            openSource = { _, _ -> next },
+        )
+        TestConnectionService.screenCapture = capture
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+        capture.capture(Int.MAX_VALUE, 100)
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            controller.get().foregroundServiceType,
+        )
+
+        // The platform reports a new size (resize queued), then the user grants again.
+        first.reportContentSize(1200, 2400)
+        next = second
+        controller.get().onStartCommand(grantIntent(), 0, 2)
+        shadowOf(Looper.getMainLooper()).idle()
+        // The queued resize would fail if it ran against the grant it was queued for.
+        first.mirror!!.resizeSucceeds = false
+
+        while (queued.isNotEmpty()) queued.poll()?.run()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(
+            "a stale resize must not retire the newer grant",
+            ConnectionService.screenCaptureEnabled(),
+        )
+        assertEquals(
+            "the newer grant must stay a mediaProjection foreground service",
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            controller.get().foregroundServiceType,
+        )
+        assertTrue("the replaced projection must be stopped", first.stopped)
+        assertEquals("the newer projection must not be stopped", false, second.stopped)
+    }
+
+    @Test
     fun `destroy shuts the screen teardown worker down`() {
         val ran = CountDownLatch(1)
         ScreenTeardown.execute { ran.countDown() }
@@ -518,9 +568,13 @@ class ConnectionServiceTest {
     private class ServiceMirrorSource : MirrorSource {
         var stopped = false
             private set
+        var mirror: ServiceMirror? = null
+            private set
         private var ended: (() -> Unit)? = null
+        private var resized: ((Int, Int) -> Unit)? = null
 
-        override fun open(screen: ScreenMetrics): ScreenMirror = ServiceMirror(screen)
+        override fun open(screen: ScreenMetrics): ScreenMirror =
+            ServiceMirror(screen).also { mirror = it }
 
         override fun stop() {
             stopped = true
@@ -530,10 +584,16 @@ class ConnectionServiceTest {
             ended = listener
         }
 
-        override fun onContentResized(listener: (width: Int, height: Int) -> Unit) = Unit
+        override fun onContentResized(listener: (width: Int, height: Int) -> Unit) {
+            resized = listener
+        }
 
         fun end() {
             ended?.invoke()
+        }
+
+        fun reportContentSize(width: Int, height: Int) {
+            resized?.invoke(width, height)
         }
     }
 
@@ -548,9 +608,13 @@ class ConnectionServiceTest {
         override var height: Int = screen.heightPixels
             private set
 
-        override fun newestFrame(): MirrorFrame? = null
+        var resizeSucceeds = true
+
+        override fun newestFrame(): MirrorFrame =
+            MirrorFrame(androidx.core.graphics.createBitmap(width, height), 1_760_000_000_000)
 
         override fun resize(screen: ScreenMetrics): Boolean {
+            if (!resizeSucceeds) return false
             width = screen.widthPixels
             height = screen.heightPixels
             return true
