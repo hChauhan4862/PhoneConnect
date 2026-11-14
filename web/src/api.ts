@@ -234,12 +234,19 @@ export interface ControlSetOutput {
 /// One durable audit row: who attempted what, on which device, and how it ended. It carries
 /// identity, the action, the outcome, and a machine error code only — never a command
 /// argument, a file path, a file byte, or an image.
+///
+/// `outcome` belongs to the server's vocabulary, not to this build: a `command.dispatch` row
+/// carries `accepted` or `refused`, and a `command.outcome` row carries `timeout` or
+/// `device_offline`. It is typed as a string so a label this build has never seen is still
+/// rendered as itself rather than being guessed into a refusal.
 export interface AuditEntryView {
   at_ms: number;
   actor: string;
+  /// `command.dispatch`, `command.outcome`, or one of the revocation actions
+  /// (`device.revoke`, `session.revoke`, `lease.revoke`, `lease.handoff`).
   action: string;
   device_id: string;
-  outcome: "accepted" | "refused";
+  outcome: string;
   error: string | null;
 }
 

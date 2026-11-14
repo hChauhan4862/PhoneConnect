@@ -47,9 +47,13 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `AppsRoute`,
   `ScreenRoute`, `ConsoleRoute`, `AuditRoute`, `NotFoundRoute`. `AuditRoute` asks the server
   for the newest rows, filters by exact device id on the server (an unknown device is an empty
-  answer, never another device's rows), shows a refusal with the stored machine code, clears
-  the previous device's rows the moment the filter changes, and renders a failed read as an
-  alert — never as an empty log or an "all clear".
+  answer, never another device's rows), shows a refusal with the stored machine code, labels a
+  `command.outcome` row (`timeout`/`device_offline`) as "no answer" instead of a refusal — an
+  outcome label this build does not know is rendered verbatim — names the dispatch and outcome
+  actions so one command's two rows read together, prints the asserted-actor and
+  delivered-not-executed caveat in visible text, clears the previous device's rows the moment
+  the filter changes, and renders a failed read as an alert — never as an empty log or an
+  "all clear".
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
   `TelemetryPanel` (bounded aggregates and explicit freshness), `CommandPanel` (dispatch
   and poll), and `FileList` (one directory's entries). `FileList` is presentational: `FilesRoute`
@@ -86,11 +90,13 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   that", while an `ok` whose output is not a confirmation, or a poll that fails after the
   command was accepted, says "The device may not have completed that" — and an `unconfirmed`
   answer says "The device could not confirm that", because no lead may deny a change the device
-  may have made. Two terminal codes are the server's rather than the device's — `timeout` (the
-  server's deadline expired) and `device_offline` (the channel dropped with the command still
-  pending) — so they are unknown outcomes too, not refusals. Every unknown outcome re-reads the
-  readings for any key, so no stale value (or a stale `brightness_mode`) can sit under an alert
-  that says the outcome is unknown.
+  may have made. The rule lives in `src/data/failures.ts` and every screen applies it: the
+  terminal codes that are the server's rather than the device's — `timeout` (the deadline
+  expired), `device_offline` (the channel dropped with the command still pending),
+  `command_unknown` (the record was trimmed) and `pending` (the poll budget ended) — are
+  unknown outcomes, not refusals. Every unknown outcome re-reads the readings for any key, so
+  no stale value (or a stale `brightness_mode`) can sit under an alert that says the outcome is
+  unknown.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

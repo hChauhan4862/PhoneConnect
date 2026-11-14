@@ -87,6 +87,57 @@ describe("the audit screen", () => {
     expect(api.listAudit).toHaveBeenCalledWith({ deviceId: undefined, limit: 50 });
   });
 
+  it("renders a command.outcome timeout row as no answer, never as a refusal", async () => {
+    const api = fakeApi([
+      entry({ at_ms: NOW + 1, action: "command.outcome", outcome: "timeout" }),
+      entry({ at_ms: NOW, action: "command.dispatch", outcome: "accepted" }),
+    ]);
+
+    renderRoute(api);
+
+    const table = await screen.findByRole("table", { name: /audit entries/i });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows).toHaveLength(2);
+    // The dispatch attempt and the missing answer read as a pair, not two unrelated rows.
+    expect(within(rows[0]).getByText("Outcome")).toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent(/No answer — timed out/);
+    expect(within(rows[0]).queryByText("Refused")).toBeNull();
+    expect(within(rows[1]).getByText("Dispatch")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("Accepted")).toBeInTheDocument();
+  });
+
+  it("renders a command.outcome device_offline row as no answer, never as a refusal", async () => {
+    const api = fakeApi([
+      entry({
+        at_ms: NOW + 1,
+        action: "command.outcome",
+        outcome: "device_offline",
+      }),
+      entry({ at_ms: NOW, action: "command.dispatch", outcome: "accepted" }),
+    ]);
+
+    renderRoute(api);
+
+    const table = await screen.findByRole("table", { name: /audit entries/i });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(within(rows[0]).getByText("Outcome")).toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent(/No answer — the device's channel ended/);
+    expect(within(rows[0]).queryByText("Refused")).toBeNull();
+  });
+
+  it("renders an outcome label this build does not know verbatim", async () => {
+    const api = fakeApi([
+      entry({ action: "command.outcome", outcome: "channel_lost" }),
+    ]);
+
+    renderRoute(api);
+
+    const table = await screen.findByRole("table", { name: /audit entries/i });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(within(rows[0]).getByText("channel_lost")).toBeInTheDocument();
+    expect(within(rows[0]).queryByText("Refused")).toBeNull();
+  });
+
   it("filters by device on the server, never by hiding rows locally", async () => {
     const user = userEvent.setup();
     const api = fakeApi([

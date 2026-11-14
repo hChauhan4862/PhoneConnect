@@ -8,6 +8,11 @@
 /// caller asserted with its token, which the server cannot verify until accounts land, and
 /// `accepted` means the command reached the device's channel, not that the device ran it. The
 /// page says both in visible text, because a table headed "Actor" reads as verified fact.
+///
+/// Two actions describe one command's life: `command.dispatch` records the attempt, and a
+/// `command.outcome` row records that no device answer ever arrived (`timeout` or
+/// `device_offline`). The outcome column renders those as "no answer", never as a refusal, and
+/// an outcome label this build does not know is shown verbatim rather than guessed.
 
 import { useEffect, useState, type FormEvent } from "react";
 
@@ -74,7 +79,10 @@ export function AuditRoute({ api }: { api: ApiClient }) {
       </nav>
       <h1 id="audit-heading">Audit log</h1>
       <p className="muted">
-        Every command attempt and revocation the server recorded. Newest first. Not live:
+        Every command attempt, every command that ended without a device answer, and every
+        revocation the server recorded. A command that was accepted and then never answered
+        leaves two rows for its device: a <code>command.dispatch</code> row for the attempt and
+        a <code>command.outcome</code> row for the missing answer. Newest first. Not live:
         refresh to read the newest rows.
       </p>
       <p role="note" className="caveat">
@@ -162,41 +170,75 @@ export function AuditRoute({ api }: { api: ApiClient }) {
               </tr>
             </thead>
             <tbody>
-              {entries.map((entry, index) => (
-                <tr key={`${entry.at_ms}-${entry.device_id}-${entry.actor}-${index}`}>
-                  <td>
-                    <time dateTime={new Date(entry.at_ms).toISOString()}>
-                      {formatDateTime(entry.at_ms)}
-                    </time>
-                  </td>
-                  <td>{entry.device_id}</td>
-                  <td>{entry.actor}</td>
-                  <td>
-                    <code>{entry.action}</code>
-                  </td>
-                  <td>
-                    <span
-                      className={
-                        entry.outcome === "accepted"
-                          ? "outcome outcome-accepted"
-                          : "outcome outcome-refused"
-                      }
-                    >
-                      {entry.outcome === "accepted" ? "Accepted" : "Refused"}
-                    </span>
-                    {entry.error ? (
-                      <>
-                        {" "}
-                        <code>{entry.error}</code>
-                      </>
-                    ) : null}
-                  </td>
-                </tr>
-              ))}
+              {entries.map((entry, index) => {
+                const outcome = describeOutcome(entry.outcome);
+                const action = describeAction(entry.action);
+                return (
+                  <tr key={`${entry.at_ms}-${entry.device_id}-${entry.actor}-${index}`}>
+                    <td>
+                      <time dateTime={new Date(entry.at_ms).toISOString()}>
+                        {formatDateTime(entry.at_ms)}
+                      </time>
+                    </td>
+                    <td>{entry.device_id}</td>
+                    <td>{entry.actor}</td>
+                    <td>
+                      {action ? (
+                        <span className={`action action-${action.key}`}>{action.label}</span>
+                      ) : null}{" "}
+                      <code>{entry.action}</code>
+                    </td>
+                    <td>
+                      <span className={outcome.className}>{outcome.label}</span>
+                      {entry.error ? (
+                        <>
+                          {" "}
+                          <code>{entry.error}</code>
+                        </>
+                      ) : null}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </>
       )}
     </section>
   );
+}
+
+/// An outcome in the words a reader can act on. `accepted` means delivered to the device's
+/// channel, never that the device executed it; `timeout` and `device_offline` come from a
+/// `command.outcome` row and mean no answer arrived, which is not a refusal. A label this build
+/// does not know is rendered verbatim, so a later server is never silently called "Refused".
+function describeOutcome(outcome: string): { label: string; className: string } {
+  switch (outcome) {
+    case "accepted":
+      return { label: "Accepted", className: "outcome outcome-accepted" };
+    case "refused":
+      return { label: "Refused", className: "outcome outcome-refused" };
+    case "timeout":
+      return { label: "No answer — timed out", className: "outcome outcome-unanswered" };
+    case "device_offline":
+      return {
+        label: "No answer — the device's channel ended",
+        className: "outcome outcome-unanswered",
+      };
+    default:
+      return { label: outcome, className: "outcome outcome-unanswered" };
+  }
+}
+
+/// The two command actions, named so a dispatch row and the outcome row of the same command
+/// read as one pair instead of two unrelated rows. Revocations keep their machine code alone.
+function describeAction(action: string): { key: string; label: string } | null {
+  switch (action) {
+    case "command.dispatch":
+      return { key: "dispatch", label: "Dispatch" };
+    case "command.outcome":
+      return { key: "outcome", label: "Outcome" };
+    default:
+      return null;
+  }
 }

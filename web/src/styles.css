@@ -11,6 +11,7 @@
   --error-border: #e4a3a3;
   --ok-text: #1a6b3c;
   --error-text: #9b2c2c;
+  --warn-text: #7a5200;
 }
 
 body {
@@ -210,6 +211,14 @@ form {
 
 .outcome-refused {
   color: var(--error-text);
+}
+
+.outcome-unanswered {
+  color: var(--warn-text);
+}
+
+.action {
+  font-weight: 600;
 }
 
 .muted {
