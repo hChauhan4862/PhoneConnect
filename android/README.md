@@ -167,6 +167,18 @@ unit test. This file describes how they are built; the matrix is the authority o
     `not_applied` / `brightness_mode_automatic` and the brightness is not written at all: a
     value the display would ignore is never reported as applied.
 
+    **A brightness change that fails puts the mode back.** Turning automatic off is a committed
+    setting, so every failure after it — the write refused, the value did not stick, nothing
+    could be read back, or the mode could not be confirmed manual — first restores the mode the
+    call found and then answers. A failed change therefore leaves the device as the user left
+    it. If the restore itself fails the reason says so, because the device is now manual and the
+    caller must know: `brightness_not_applied_mode_left_manual`,
+    `read_back_unavailable_mode_left_manual`, `write_settings_required_mode_left_manual`. Only a
+    mode the call actually read is reported: an unreadable previous mode omits `mode_changed`
+    rather than claiming a change that may not have happened, and a mode that cannot be read
+    back after the write is `unconfirmed` / `read_back_unavailable`, never a fabricated
+    `MANUAL`.
+
     A write is confirmed by reading the value back: if the settings provider accepted the
     brightness but the setting did not stick, the audio service accepted the volume but the
     stream reports another index, or the interruption filter did not change, the answer is

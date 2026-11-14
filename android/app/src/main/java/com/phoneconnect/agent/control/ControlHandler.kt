@@ -154,6 +154,21 @@ object ControlReason {
      */
     const val READ_BACK_UNAVAILABLE = "read_back_unavailable"
 
+    /**
+     * The brightness change failed after automatic brightness was turned off, and the mode
+     * could not be put back: the device is left manual and the caller is told.
+     */
+    const val BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL =
+        "brightness_not_applied_mode_left_manual"
+
+    /** As [BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL], for a write that could not be confirmed. */
+    const val READ_BACK_UNAVAILABLE_MODE_LEFT_MANUAL =
+        "read_back_unavailable_mode_left_manual"
+
+    /** As [BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL], for a grant revoked mid-change. */
+    const val WRITE_SETTINGS_REQUIRED_MODE_LEFT_MANUAL =
+        "write_settings_required_mode_left_manual"
+
     /** The audio service accepted the volume change but the stream reports another index. */
     const val VOLUME_NOT_APPLIED = "volume_not_applied"
 
@@ -270,36 +285,112 @@ class ControlHandler(private val platform: ControlPlatform) {
         // a value written to the setting would never reach it: the mode is turned off first and
         // that side effect is reported in the answer. An unreadable mode is treated as
         // automatic, because writing a value the display might ignore is the failure this
-        // guards against.
-        val mode = observed(platform::brightnessMode)
-        val modeChanged = mode != BRIGHTNESS_MODE_MANUAL
-        if (modeChanged) {
+        // guards against — but then the previous mode is unknown, so `mode_changed` is not
+        // claimed.
+        val previousMode = observed(platform::brightnessMode)
+        val turnedOff = previousMode != BRIGHTNESS_MODE_MANUAL
+        if (turnedOff) {
             writeMode(BRIGHTNESS_MODE_MANUAL)
         }
         val accepted = try {
             platform.writeBrightness(value)
         } catch (_: SecurityException) {
             // The user turned the grant off between the check and the write.
-            throw CommandFailure(NOT_PERMITTED, ControlReason.WRITE_SETTINGS_REQUIRED)
+            throw brightnessFailure(
+                NOT_PERMITTED,
+                ControlReason.WRITE_SETTINGS_REQUIRED,
+                previousMode,
+                turnedOff,
+            )
         }
         if (!accepted) {
-            throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_NOT_APPLIED)
+            throw brightnessFailure(
+                NOT_APPLIED,
+                ControlReason.BRIGHTNESS_NOT_APPLIED,
+                previousMode,
+                turnedOff,
+            )
         }
         // The value itself is read back from the store that was written: a provider that
         // accepted the write but kept another value did not apply the change.
         val current = observed(platform::brightness)
-            ?: throw CommandFailure(UNCONFIRMED, ControlReason.READ_BACK_UNAVAILABLE)
+            ?: throw brightnessFailure(
+                UNCONFIRMED,
+                ControlReason.READ_BACK_UNAVAILABLE,
+                previousMode,
+                turnedOff,
+            )
         if (current != value) {
-            throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_NOT_APPLIED)
+            throw brightnessFailure(
+                NOT_APPLIED,
+                ControlReason.BRIGHTNESS_NOT_APPLIED,
+                previousMode,
+                turnedOff,
+            )
         }
-        // A device that turned automatic back on between the two writes did not keep the value.
+        // A mode that cannot be read back is a mode the answer cannot claim, and a device that
+        // turned automatic back on between the writes did not keep the value.
         val finalMode = observed(platform::brightnessMode)
-        if (finalMode != null && finalMode != BRIGHTNESS_MODE_MANUAL) {
-            throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_MODE_AUTOMATIC)
+            ?: throw brightnessFailure(
+                UNCONFIRMED,
+                ControlReason.READ_BACK_UNAVAILABLE,
+                previousMode,
+                turnedOff,
+            )
+        if (finalMode != BRIGHTNESS_MODE_MANUAL) {
+            throw brightnessFailure(
+                NOT_APPLIED,
+                ControlReason.BRIGHTNESS_MODE_AUTOMATIC,
+                previousMode,
+                turnedOff,
+            )
         }
-        return applied(ControlKey.BRIGHTNESS, value)
-            .put(ControlKey.BRIGHTNESS_MODE, finalMode ?: BRIGHTNESS_MODE_MANUAL)
-            .put(MODE_CHANGED, modeChanged)
+        val answer = applied(ControlKey.BRIGHTNESS, value)
+            .put(ControlKey.BRIGHTNESS_MODE, finalMode)
+        // Only a mode this call actually read can be reported as changed.
+        if (previousMode != null) {
+            answer.put(MODE_CHANGED, turnedOff)
+        }
+        return answer
+    }
+
+    /**
+     * The failure a brightness change answers, with the automatic mode this call turned off put
+     * back first. A change that fails after switching the display to manual must not leave the
+     * user's automatic brightness off without saying so, so a restore that does not work is
+     * named in the reason.
+     */
+    private fun brightnessFailure(
+        code: String,
+        reason: String,
+        previousMode: Int?,
+        turnedOff: Boolean,
+    ): CommandFailure {
+        if (!turnedOff) return CommandFailure(code, reason)
+        if (previousMode != null && restoreMode(previousMode)) return CommandFailure(code, reason)
+        return CommandFailure(code, reasonLeftManual(reason))
+    }
+
+    /** Puts the display back under the mode this call found; `false` when it could not. */
+    private fun restoreMode(previous: Int): Boolean = try {
+        platform.writeBrightnessMode(previous)
+    } catch (_: SecurityException) {
+        false
+    }
+
+    private fun reasonLeftManual(reason: String): String = when (reason) {
+        ControlReason.BRIGHTNESS_NOT_APPLIED ->
+            ControlReason.BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL
+
+        ControlReason.READ_BACK_UNAVAILABLE ->
+            ControlReason.READ_BACK_UNAVAILABLE_MODE_LEFT_MANUAL
+
+        ControlReason.WRITE_SETTINGS_REQUIRED ->
+            ControlReason.WRITE_SETTINGS_REQUIRED_MODE_LEFT_MANUAL
+
+        // `brightness_mode_automatic` is the one failure where the display is not left manual:
+        // the device turned the mode back on itself, so its own token already says so.
+        else -> reason
     }
 
     /** Turns automatic brightness off, or refuses rather than leaving a value that cannot hold. */

@@ -209,7 +209,7 @@ class ControlHandlerTest {
     fun `an automatic mode that will not turn off is not_applied and nothing is written`() {
         platform.writeSettings = true
         platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
-        platform.brightnessModeWriteAccepted = false
+        platform.modeWriteResults += false
 
         val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
 
@@ -271,6 +271,123 @@ class ControlHandlerTest {
 
         assertEquals("not_permitted", failure.code)
         assertEquals(ControlReason.WRITE_SETTINGS_REQUIRED, failure.message)
+        assertEquals(
+            "the automatic mode this call turned off must be put back",
+            Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC),
+            platform.brightnessMode,
+        )
+    }
+
+    @Test
+    fun `a failed brightness puts the automatic mode back`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.brightnessAfterWrite = { Reading.of(255) }
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("not_applied", failure.code)
+        assertEquals(ControlReason.BRIGHTNESS_NOT_APPLIED, failure.message)
+        assertEquals(
+            "the mode must not stay manual when the brightness did not stick",
+            ControlHandler.BRIGHTNESS_MODE_AUTOMATIC,
+            platform.brightnessMode.value,
+        )
+        assertEquals(
+            "the restore is a write the caller can see: ${platform.writes}",
+            listOf(
+                "brightness_mode" to ControlHandler.BRIGHTNESS_MODE_MANUAL,
+                "brightness" to 120,
+                "brightness_mode" to ControlHandler.BRIGHTNESS_MODE_AUTOMATIC,
+            ),
+            platform.writes,
+        )
+    }
+
+    @Test
+    fun `a failed brightness whose mode cannot be restored says the mode was left manual`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.brightnessAfterWrite = { Reading.of(255) }
+        platform.modeWriteResults += true
+        platform.modeWriteResults += false
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("not_applied", failure.code)
+        assertEquals(
+            ControlReason.BRIGHTNESS_NOT_APPLIED + MODE_LEFT_MANUAL,
+            failure.message,
+        )
+        assertEquals(
+            "the mode stayed manual because the restore failed",
+            ControlHandler.BRIGHTNESS_MODE_MANUAL,
+            platform.brightnessMode.value,
+        )
+    }
+
+    @Test
+    fun `an unconfirmed brightness whose mode cannot be restored says the mode was left manual`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.brightnessAfterWrite = { Reading.unavailable(ControlReason.PLATFORM_READ_FAILED) }
+        platform.modeWriteResults += true
+        platform.modeWriteResults += false
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("unconfirmed", failure.code)
+        assertEquals(ControlReason.READ_BACK_UNAVAILABLE + MODE_LEFT_MANUAL, failure.message)
+    }
+
+    @Test
+    fun `a write refused after the mode change and not restored says the mode was left manual`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.writeBrightnessError = SecurityException("caller is not allowed")
+        platform.modeWriteResults += true
+        platform.modeWriteResults += false
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 10))
+
+        assertEquals("not_permitted", failure.code)
+        assertEquals(ControlReason.WRITE_SETTINGS_REQUIRED + MODE_LEFT_MANUAL, failure.message)
+    }
+
+    @Test
+    fun `an unreadable post-write mode is unconfirmed, never a fabricated manual`() {
+        platform.writeSettings = true
+        platform.modeReads += Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.modeReads += Reading.unavailable(ControlReason.PLATFORM_READ_FAILED)
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("unconfirmed", failure.code)
+        assertEquals(ControlReason.READ_BACK_UNAVAILABLE, failure.message)
+        assertEquals(
+            "the mode this call turned off must be put back",
+            ControlHandler.BRIGHTNESS_MODE_AUTOMATIC,
+            platform.brightnessMode.value,
+        )
+    }
+
+    @Test
+    fun `an unreadable pre-write mode does not claim the mode changed`() {
+        platform.writeSettings = true
+        platform.modeReads += Reading.unavailable(ControlReason.PLATFORM_READ_FAILED)
+        platform.modeReads += Reading.of(ControlHandler.BRIGHTNESS_MODE_MANUAL)
+
+        val output = handler.handle(
+            CommandDispatcher.CONTROL_SET,
+            JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120),
+        )
+
+        assertEquals(true, output.getBoolean("applied"))
+        assertFalse(
+            "an unknown previous mode must not be reported as a change",
+            output.has(MODE_CHANGED),
+        )
+        assertEquals(ControlHandler.BRIGHTNESS_MODE_MANUAL, output.getInt(ControlKey.BRIGHTNESS_MODE))
     }
 
     @Test
@@ -482,7 +599,13 @@ class ControlHandlerTest {
         var writeSettings = false
         var policyAccess = false
         var writeSettingsChecks = 0
-        var brightnessModeWriteAccepted = true
+
+        /** Scripted mode reads, consumed in order; the field is the fallback. */
+        val modeReads = mutableListOf<Reading<Int>>()
+
+        /** Scripted mode-write answers, consumed in order; `true` is the fallback. */
+        val modeWriteResults = mutableListOf<Boolean>()
+
         var writeBrightnessError: RuntimeException? = null
         var volumeWriteError: RuntimeException? = null
         var dndWriteError: RuntimeException? = null
@@ -492,7 +615,7 @@ class ControlHandlerTest {
 
         override fun brightness(): Reading<Int> = brightnessAfterWrite?.invoke() ?: brightnessRead()
 
-        override fun brightnessMode(): Reading<Int> = brightnessMode
+        override fun brightnessMode(): Reading<Int> = modeReads.removeFirstOrNull() ?: brightnessMode
 
         override fun volumeMusic(): Reading<Int> = volumeAfterWrite ?: volumeRead
 
@@ -527,7 +650,7 @@ class ControlHandlerTest {
         }
 
         override fun writeBrightnessMode(mode: Int): Boolean {
-            if (!brightnessModeWriteAccepted) return false
+            if (modeWriteResults.removeFirstOrNull() == false) return false
             writes += "brightness_mode" to mode
             brightnessMode = Reading.of(mode)
             return true
@@ -553,5 +676,6 @@ class ControlHandlerTest {
     private companion object {
         const val UNAVAILABLE = "unavailable"
         const val MODE_CHANGED = "mode_changed"
+        const val MODE_LEFT_MANUAL = "_mode_left_manual"
     }
 }
