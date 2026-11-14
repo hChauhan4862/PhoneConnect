@@ -58,6 +58,20 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `GET` (upgrade) | `/api/devices/{id}/control` | device credential matching `{id}` | The management channel: a WebSocket carrying JSON telemetry and commands. A new connection replaces the old one with a `replaced` close. |
 | `POST` | `/api/devices/{id}/commands?user_id=` | admin | Dispatches one command; body is `{name, args?, timeout_ms?}` and the response is `202 {command_id}`. Refusals are `403 lease_read_only`, `409 device_offline`, `409 device_revoked`, `429 command_capacity`, `400 invalid_timeout`. |
 | `GET` | `/api/commands/{id}?user_id=` | admin | One command's state: `pending`, `ok`, `error`, or `timeout`, with `output`, `error`, `message`, and timestamps. |
+| `POST` | `/api/devices/{id}/files/list?user_id=` | admin | Forwards `files.list`; body is `{path}`. Responds `202 {command_id}`, polled like any command. |
+| `POST` | `/api/devices/{id}/files/read?user_id=` | admin | Forwards `files.read`; body is `{path, offset?, length?}`. |
+| `POST` | `/api/devices/{id}/files/write?user_id=` | admin | Forwards `files.write`; body is `{path, data_base64, append?}`. A write whose body decodes past 1 MiB is refused with `413 too_large` before it is dispatched; `400 invalid_base64` otherwise. |
+| `POST` | `/api/devices/{id}/files/mkdir?user_id=` | admin | Forwards `files.mkdir`; body is `{path}`. |
+| `POST` | `/api/devices/{id}/files/delete?user_id=` | admin | Forwards `files.delete`; body is `{path}`. The device removes a file or an empty directory only. |
+| `POST` | `/api/devices/{id}/files/rename?user_id=` | admin | Forwards `files.rename`; body is `{from, to}`. |
+
+The file routes are commands with a typed front door: the same authorization, capacity,
+deadline, and audit row as `POST /commands`, and the same refusals (`403 lease_read_only`,
+`409 device_offline`, `429 command_capacity`). The device's `PathGuard` is the safety
+authority; the server's own checks are structural (`invalid_request`) plus the write size cap.
+File bytes are never written to disk, stored in the database, or logged: an accepted write is
+forwarded as the caller's own base64, and the command record keeps only the device's answer
+(`bytes_written`, entries, or one read chunk) in the bounded in-memory table.
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
 An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA

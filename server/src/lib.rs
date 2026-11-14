@@ -11,6 +11,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod enrollment;
+pub mod files;
 pub mod leases;
 pub mod management;
 pub mod relay;
@@ -211,6 +212,32 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(commands::dispatch_command),
         )
         .route("/api/commands/{command_id}", get(commands::command_state))
+        // File operations are commands with a typed front door: the server authorizes,
+        // bounds, and forwards, and the device's path guard is the safety authority.
+        .route(
+            "/api/devices/{device_id}/files/list",
+            post(files::list_files),
+        )
+        .route(
+            "/api/devices/{device_id}/files/read",
+            post(files::read_file),
+        )
+        .route(
+            "/api/devices/{device_id}/files/write",
+            post(files::write_file),
+        )
+        .route(
+            "/api/devices/{device_id}/files/mkdir",
+            post(files::make_directory),
+        )
+        .route(
+            "/api/devices/{device_id}/files/delete",
+            post(files::delete_entry),
+        )
+        .route(
+            "/api/devices/{device_id}/files/rename",
+            post(files::rename_entry),
+        )
         .route(
             "/api/devices/{device_id}/lease",
             post(leases::acquire_lease).get(leases::lease_status),

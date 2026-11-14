@@ -100,7 +100,7 @@ impl CommandError {
         }
     }
 
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::Auth(error) => error.status(),
             Self::Lease(error) => error.status(),
@@ -150,7 +150,7 @@ impl From<DispatchError> for CommandError {
     }
 }
 
-fn required_user(query: &CommandQuery) -> Result<String, CommandError> {
+pub(crate) fn required_user(query: &CommandQuery) -> Result<String, CommandError> {
     query
         .user_id
         .as_deref()
@@ -173,9 +173,15 @@ pub async fn dispatch_command(
     state.auth.require_admin(&headers)?;
     let actor = required_user(&query)?;
 
-    let outcome = dispatch_for(&state, &device_id, &actor, &request).await;
-    record_attempt(&state, &device_id, &actor, &outcome).await;
-    let dispatch = outcome?;
+    let dispatch = dispatch_for_actor(
+        &state,
+        &device_id,
+        &actor,
+        &request.name,
+        request.args.clone(),
+        request.timeout_ms,
+    )
+    .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CommandAccepted {
@@ -184,11 +190,35 @@ pub async fn dispatch_command(
     ))
 }
 
+/// Authorizes and dispatches one command for an already authenticated [actor], writing the
+/// audit row the command route writes. The feature routes (files, and later apps) use this so
+/// there is one dispatch path — authorization, capacity, deadlines, audit — not one per
+/// feature.
+pub async fn dispatch_for_actor(
+    state: &AppState,
+    device_id: &str,
+    actor: &str,
+    name: &str,
+    args: Option<Value>,
+    timeout_ms: Option<i64>,
+) -> Result<Dispatch, CommandError> {
+    let outcome = dispatch_for(state, device_id, actor, name, args, timeout_ms).await;
+    match &outcome {
+        Ok(_) => record_attempt(state, device_id, actor, "accepted", None).await,
+        Err(error) => {
+            record_attempt(state, device_id, actor, "refused", Some(error.code())).await;
+        }
+    }
+    outcome
+}
+
 async fn dispatch_for(
     state: &AppState,
     device_id: &str,
     actor: &str,
-    request: &DispatchCommandRequest,
+    name: &str,
+    args: Option<Value>,
+    timeout_ms: Option<i64>,
 ) -> Result<Dispatch, CommandError> {
     let device = state.store.device(device_id).await?;
     if device.is_revoked() {
@@ -205,33 +235,33 @@ async fn dispatch_for(
             user_id: actor.to_owned(),
         }));
     }
-    Ok(state.management.dispatch(
-        &device.device_id,
-        &request.name,
-        request.args.clone(),
-        request.timeout_ms,
-    )?)
+    Ok(state
+        .management
+        .dispatch(&device.device_id, name, args, timeout_ms)?)
 }
 
-/// Writes the durable trace for one attempt. A refused attempt is as traceable as an
-/// accepted one; an audit failure is reported operationally, never as the command's outcome.
+/// Records a request the server refused before it could reach [`dispatch_for_actor`] (an
+/// oversized write, say), so a refusal is as traceable as an accepted dispatch.
+pub async fn record_refusal(state: &AppState, device_id: &str, actor: &str, code: &str) {
+    record_attempt(state, device_id, actor, "refused", Some(code)).await;
+}
+
+/// Writes the durable trace for one attempt. An audit failure is reported operationally,
+/// never as the command's outcome.
 async fn record_attempt(
     state: &AppState,
     device_id: &str,
     actor: &str,
-    outcome: &Result<Dispatch, CommandError>,
+    outcome: &'static str,
+    error: Option<&str>,
 ) {
-    let (outcome_label, error) = match outcome {
-        Ok(_) => ("accepted", None),
-        Err(error) => ("refused", Some(error.code().to_owned())),
-    };
     let entry = AuditEntry {
         at_ms: state.now_ms(),
         actor: actor.to_owned(),
         action: AUDIT_ACTION_DISPATCH.to_owned(),
         device_id: device_id.to_owned(),
-        outcome: outcome_label.to_owned(),
-        error,
+        outcome: outcome.to_owned(),
+        error: error.map(str::to_owned),
     };
     if let Err(error) = state.store.insert_audit(entry).await {
         eprintln!("phoneconnect: command audit write failed: {error}");
