@@ -12,8 +12,11 @@ import android.os.Build
 import android.os.IBinder
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
+import com.phoneconnect.agent.control.CommandDispatcher
+import com.phoneconnect.agent.net.DeviceControlChannel
 import com.phoneconnect.agent.net.HubClient
 import com.phoneconnect.agent.net.TransportSessionRunner
+import com.phoneconnect.agent.telemetry.TelemetrySampler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,6 +32,17 @@ sealed interface StartResult {
 
     /** The system refused the start (background-start restrictions); the reason is for the UI. */
     data class Refused(val reason: String) : StartResult
+}
+
+/**
+ * The management connection the service runs beside the sealed session.
+ *
+ * An implementation owns its own bounded retry loop and reports every state change through
+ * `onState`. It never starts a service, posts a notification, or publishes a status: there is
+ * exactly one foreground service and one notification, and [ConnectionService] owns both.
+ */
+fun interface ManagementChannel {
+    suspend fun run(store: EnrollmentStore, onState: suspend (ManagementChannelState) -> Unit)
 }
 
 /**
@@ -51,9 +65,13 @@ open class ConnectionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var notifications: NotificationController
     private var loop: Job? = null
+    private var managementJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var detachedStatus = false
     private var lastStatus: ConnectionStatus? = null
+
+    /** Written and read on the main thread only. */
+    private var managementState = ManagementChannelState.OFFLINE
 
     override fun onCreate() {
         super.onCreate()
@@ -84,6 +102,8 @@ open class ConnectionService : Service() {
         releaseNetworkRecovery()
         loop?.cancel()
         loop = null
+        managementJob?.cancel()
+        managementJob = null
         serviceScope.cancel()
         // A terminal status is deliberately left visible after the service stops.
         if (!detachedStatus) {
@@ -112,6 +132,24 @@ open class ConnectionService : Service() {
         return TransportSessionRunner(hub)
     }
 
+    /**
+     * Composition point for the management channel: the service's second connection.
+     * `null` means this build cannot manage the device (no hub URL configured).
+     */
+    internal open fun managementChannel(): ManagementChannel? {
+        val hubUrl = AgentSettings(this).hubUrl() ?: return null
+        val hub = HubClient.create(hubUrl).getOrElse { return null }
+        val sampler = TelemetrySampler.fromContext(this)
+        return DeviceControlChannel(
+            hub = hub,
+            dispatcher = CommandDispatcher(telemetry = sampler),
+            telemetry = sampler,
+        )
+    }
+
+    /** Dispatcher for the management channel's socket work; tests override it. */
+    internal open fun managementDispatcher(): CoroutineDispatcher = Dispatchers.IO
+
     /** Composition point for enrollment storage. */
     internal open fun enrollmentStore(): EnrollmentStore = KeystoreEnrollmentStore(this)
 
@@ -132,19 +170,52 @@ open class ConnectionService : Service() {
         loop = serviceScope.launch {
             // SharedPreferences loads and Keystore access stay off the main thread.
             val store = withContext(storageDispatcher()) { enrollmentStore() }
+            // The second connection: same service, same notification, its own retry loop.
+            // It is a sibling of the session loop, not its child: a terminal session
+            // outcome must be able to stop the service without waiting for it.
+            managementChannel()?.let { channel ->
+                managementJob = serviceScope.launch { runManagement(channel, store) }
+            }
             val supervisor = ConnectionSupervisor(
                 store = store,
                 sessions = runner,
                 policy = ReconnectPolicy(),
-                status = { status ->
-                    lastStatus = status
-                    ConnectionStatusBus.publish(status)
-                    notifications.update(status)
-                },
+                status = ::publishStatus,
+                management = { managementState },
             )
             registerNetworkRecovery(supervisor)
             handleOutcome(supervisor.run())
         }
+    }
+
+    private suspend fun runManagement(channel: ManagementChannel, store: EnrollmentStore) {
+        withContext(managementDispatcher()) {
+            channel.run(store) { state ->
+                withContext(Dispatchers.Main.immediate) { publishManagementState(state) }
+            }
+        }
+    }
+
+    /** The one place a status reaches the bus and the notification. */
+    private fun publishStatus(status: ConnectionStatus) {
+        val effective = if (status is ConnectionStatus.Connected) {
+            status.copy(management = managementState)
+        } else {
+            status
+        }
+        lastStatus = effective
+        ConnectionStatusBus.publish(effective)
+        notifications.update(effective)
+    }
+
+    /** A management state change updates the same notification, never a second one. */
+    private fun publishManagementState(state: ManagementChannelState) {
+        managementState = state
+        val connected = lastStatus as? ConnectionStatus.Connected ?: return
+        val updated = connected.copy(management = state)
+        lastStatus = updated
+        ConnectionStatusBus.publish(updated)
+        notifications.update(updated)
     }
 
     /**
@@ -170,6 +241,8 @@ open class ConnectionService : Service() {
     private fun stopConnection() {
         loop?.cancel()
         loop = null
+        managementJob?.cancel()
+        managementJob = null
         releaseNetworkRecovery()
         notifications.clear()
     }

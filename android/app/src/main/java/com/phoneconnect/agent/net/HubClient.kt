@@ -92,6 +92,10 @@ class HubClient(
         return toWebSocketUrl(endpoint)
     }
 
+    /** The management channel's WebSocket URL for one device. */
+    fun controlUrl(deviceId: String): String =
+        toWebSocketUrl(url("api", "devices", deviceId, "control").toString())
+
     suspend fun enroll(token: String, identityPublicKey: String): Result<EnrolledDevice> = runCatching {
         val body = JSONObject()
             .put("token", token)

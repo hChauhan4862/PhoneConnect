@@ -1,8 +1,9 @@
 # PhoneConnect Android agent
 
 An ordinary user-installed APK (no device-owner provisioning). It enrolls against a
-self-hosted hub, holds one authenticated session over the server relay, and keeps exactly one
-foreground connection service with exactly one visible status notification.
+self-hosted hub, holds one authenticated session over the server relay plus one authenticated
+management connection, and keeps exactly one foreground connection service with exactly one
+visible status notification.
 
 ADB is used only to sideload the app; it is never the runtime identity or the transport.
 
@@ -29,6 +30,13 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 5. **Reconnect.** `ConnectionSupervisor` retries with bounded jittered backoff, resets after a
    healthy session, and stops for the terminal class (revoked device, relay 409, unenrolled,
    ended session) with the invalidation that failure implies.
+6. **Management.** `DeviceControlChannel` keeps a second WebSocket
+   (`/api/devices/{id}/control`) inside the same service: it announces the device with
+   `hello`, reports a `TelemetrySampler` sample on connect and every 30 s, and answers each
+   `command` frame with exactly one `result`. Its reconnect backoff is bounded (1 s doubling
+   to 60 s); a repeatedly refused credential stops it as `offline` instead of looping. The
+   channel never starts a service, posts a notification, or publishes a status: the service
+   reports its state in the existing notification.
 
 ## Layout
 
@@ -50,6 +58,10 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `net/HubClient.kt` | Enroll, session discovery, ticket, candidates, relay URL (HTTPS or loopback HTTP only). |
 | `net/RelayFrameChannel.kt` | Relay WebSocket transport with the 10 s keepalive ping. |
 | `net/TransportSessionRunner.kt` | One session: identity → discovery → ticket → epoch → relay → frames. |
+| `net/DeviceControlChannel.kt` | The management WebSocket: hello, telemetry, command results, bounded reconnect. |
+| `control/CommandDispatcher.kt` | Routes command names to handlers; an unimplemented name is `unknown_command`. |
+| `control/DeviceInfoHandler.kt` | `device.info` and the `hello` description, from `Build` only. |
+| `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
 | `RecoveryReceiver.kt` | Boot and post-update recovery with `goAsync`, refusing gracefully when the OS refuses. |
 | `AgentSettings.kt` / `AgentDiagnostics.kt` | Hub URL and the last background-start refusal. |
 
@@ -132,7 +144,9 @@ still stop the agent. The notification and setup screen say so and show recovery
 - **Ticket signatures are not verified.** The Ed25519 signature is carried from the hub but
   not checked; TLS authenticity to the hub is the trust anchor, exactly as the Rust transport
   documents for trust-on-first-use. Porting Ed25519 verification is follow-up work.
-- **Command, telemetry, and feature adapters are a follow-up task.** The session stays
-  authenticated and framed; inbound control payloads are not yet dispatched.
+- **Only three management commands exist.** `device.info`, `device.ping`, and `telemetry.now`
+  are implemented; files, apps, screen capture, console/logcat, and toggles are follow-up
+  tasks that add handler files to the same dispatcher. CPU percentage is reported as `null`:
+  Android does not expose per-app CPU counters to an ordinary app.
 - **Instrumentation tests cannot run in this environment** (no AVD, no emulator system
   images), so the emulator smoke test and real-Keystore/OEM behaviour are unverified here.

@@ -51,6 +51,8 @@ class ConnectionSupervisor(
     private val policy: ReconnectPolicy,
     private val status: (ConnectionStatus) -> Unit,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /** Read at connect time so the notification reports the management channel too. */
+    private val management: () -> ManagementChannelState = { ManagementChannelState.OFFLINE },
 ) {
     private val networkRestored = Channel<Unit>(Channel.CONFLATED)
 
@@ -74,7 +76,7 @@ class ConnectionSupervisor(
                 sessions.run(store) { path ->
                     healthy = true
                     attempt = 0
-                    status(ConnectionStatus.Connected(path, clock()))
+                    status(ConnectionStatus.Connected(path, clock(), management()))
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled

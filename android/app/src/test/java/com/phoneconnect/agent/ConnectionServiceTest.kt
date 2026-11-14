@@ -12,6 +12,7 @@ import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -242,6 +243,56 @@ class ConnectionServiceTest {
         )
     }
 
+    @Test
+    fun `the management channel shares the one service and notification`() = runBlocking {
+        val channel = RecordingManagementChannel()
+        TestConnectionService.installManagement(channel)
+        TestConnectionService.install {
+            SessionRunner { _, onConnected ->
+                onConnected(ConnectionPath.RELAY)
+                awaitCancellation()
+            }
+        }
+        val controller = Robolectric.buildService(
+            TestConnectionService::class.java,
+            ConnectionService.startIntent(context),
+        )
+        controller.create().startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("a management connection must not add a notification", 1, shadowOf(manager).size())
+        assertTrue("the channel is started beside the session", channel.started)
+
+        channel.report(ManagementChannelState.ONLINE)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("a management state change reuses the one notification", 1, shadowOf(manager).size())
+        val text = (notificationText() ?: "").lowercase()
+        assertTrue("the notification must report remote management, got '$text'", text.contains("management"))
+        assertTrue("the notification must still report the session, got '$text'", text.contains("relay"))
+
+        controller.destroy()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue("destroying the one service stops the second connection", channel.cancelled)
+    }
+
+    @Test
+    fun `a terminal outcome stops the service even while management is connected`() {
+        val channel = RecordingManagementChannel()
+        TestConnectionService.installManagement(channel)
+        TestConnectionService.install { RecordingRunner(terminal = ConnectionFailure.DeviceRevoked) }
+        val controller = Robolectric.buildService(
+            TestConnectionService::class.java,
+            ConnectionService.startIntent(context),
+        )
+        controller.create().startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // An endless second connection must not keep the service alive past a terminal one.
+        assertTrue("a revoked device must stop the service", shadowOf(controller.get()).isStoppedBySelf())
+        assertTrue(channel.started)
+    }
+
     private fun notificationText(): String? = shadowOf(manager)
         .getNotification(NotificationController.NOTIFICATION_ID)
         ?.extras
@@ -299,21 +350,59 @@ class ConnectionServiceTest {
     private class TestConnectionService : ConnectionService() {
         override fun sessionRunner(): SessionRunner? = installed?.invoke()
 
+        override fun managementChannel(): ManagementChannel? = management
+
+        override fun managementDispatcher() = Dispatchers.Unconfined
+
         override fun enrollmentStore(): EnrollmentStore = store
 
         override fun storageDispatcher() = Dispatchers.Unconfined
 
         companion object {
             private var installed: (() -> SessionRunner?)? = null
+            private var management: ManagementChannel? = null
             var store: FakeStore = FakeStore(enrolled = true)
 
             fun install(provider: () -> SessionRunner?) {
                 installed = provider
             }
 
+            fun installManagement(channel: ManagementChannel?) {
+                management = channel
+            }
+
             fun clear() {
                 installed = null
+                management = null
             }
+        }
+    }
+
+    /** Records the management channel's lifecycle without opening a socket. */
+    private class RecordingManagementChannel : ManagementChannel {
+        private var report: (suspend (ManagementChannelState) -> Unit)? = null
+        var started = false
+            private set
+        var cancelled = false
+            private set
+
+        override suspend fun run(
+            store: EnrollmentStore,
+            onState: suspend (ManagementChannelState) -> Unit,
+        ) {
+            started = true
+            report = onState
+            onState(ManagementChannelState.CONNECTING)
+            try {
+                awaitCancellation()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                this.cancelled = true
+                throw cancelled
+            }
+        }
+
+        fun report(state: ManagementChannelState) {
+            runBlocking { report?.invoke(state) }
         }
     }
 

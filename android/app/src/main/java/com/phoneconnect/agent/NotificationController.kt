@@ -74,6 +74,11 @@ class NotificationController(
         is ConnectionStatus.Connected -> when (status.path) {
             ConnectionPath.DIRECT -> "Connected over a direct path."
             ConnectionPath.RELAY -> "Connected over the server relay."
+        } + when (status.management) {
+            ManagementChannelState.ONLINE -> " Remote management is online."
+            ManagementChannelState.CONNECTING -> " Remote management is connecting."
+            ManagementChannelState.RETRYING -> " Remote management is retrying."
+            ManagementChannelState.OFFLINE -> " Remote management is offline."
         }
 
         is ConnectionStatus.Reconnecting ->

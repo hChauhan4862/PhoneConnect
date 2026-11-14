@@ -141,15 +141,27 @@ class EnrollmentStoreTest {
             mainSources.filterValues { it.contains("annotation class IdentityBoundary") }.keys,
         )
         assertEquals(
+            // The management channel is the second transport boundary: it authenticates its
+            // own WebSocket with the device credential and decrypts nothing else.
             "only the identity boundary may opt in",
-            setOf("KeystoreEnrollmentStore.kt", "EnrollmentFlow.kt", "TransportSessionRunner.kt"),
+            setOf(
+                "KeystoreEnrollmentStore.kt",
+                "EnrollmentFlow.kt",
+                "TransportSessionRunner.kt",
+                "DeviceControlChannel.kt",
+            ),
             mainSources.filterValues { it.contains("@OptIn(IdentityBoundary::class)") }.keys,
         )
 
         val decryptCallers = mainSources.filterValues { it.contains("openIdentity(") }.keys
         assertEquals(
-            "only the boundary's declaration, its storage, and the session runner may open an identity",
-            setOf("EnrollmentStore.kt", "KeystoreEnrollmentStore.kt", "TransportSessionRunner.kt"),
+            "only the boundary's declaration, its storage, and the two transports may open an identity",
+            setOf(
+                "EnrollmentStore.kt",
+                "KeystoreEnrollmentStore.kt",
+                "TransportSessionRunner.kt",
+                "DeviceControlChannel.kt",
+            ),
             decryptCallers,
         )
     }
