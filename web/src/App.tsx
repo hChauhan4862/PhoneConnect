@@ -9,9 +9,11 @@ import { createHttpApi, type ApiClient } from "./api";
 import { AccessGateRoute } from "./routes/AccessGateRoute";
 import { AppsRoute } from "./routes/AppsRoute";
 import { CommandsRoute } from "./routes/CommandsRoute";
+import { ConsoleRoute } from "./routes/ConsoleRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
 import { DeviceStatusRoute } from "./routes/DeviceStatusRoute";
 import { FilesRoute } from "./routes/FilesRoute";
+import { ScreenRoute } from "./routes/ScreenRoute";
 import { TelemetryRoute } from "./routes/TelemetryRoute";
 import { NotFoundRoute } from "./routes/NotFoundRoute";
 import { createHostAdapter, HostAdapterContext } from "./host/HostAdapter";
@@ -118,6 +120,12 @@ function AuthenticatedShell({
       ) : null}
       {route.name === "apps" ? (
         <AppsRoute api={api} deviceId={route.deviceId} userId={session.userId} />
+      ) : null}
+      {route.name === "screen" ? (
+        <ScreenRoute api={api} deviceId={route.deviceId} userId={session.userId} />
+      ) : null}
+      {route.name === "console" ? (
+        <ConsoleRoute api={api} deviceId={route.deviceId} userId={session.userId} />
       ) : null}
       {route.name === "devices" ? (
         <DeviceListRoute api={api} userId={session.userId} />

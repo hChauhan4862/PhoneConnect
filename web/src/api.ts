@@ -181,6 +181,21 @@ export interface AppKillOutput {
   kill_requested: boolean;
 }
 
+/// `screen.snapshot` output: one PNG frame, the size it was actually captured at (the device
+/// downscales to stay under the result cap), and when the frame was taken.
+export interface ScreenSnapshotOutput {
+  png_base64: string;
+  width: number;
+  height: number;
+  captured_at_ms: number;
+}
+
+/// `system.props` output: the allowlisted properties the device reported. A property the
+/// platform would not report is `null`, never an invented value.
+export interface SystemPropsOutput {
+  selected: Record<string, string | null>;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -267,6 +282,17 @@ export interface ApiClient {
     userId: string,
     packageName: string,
     enabled: boolean,
+  ): Promise<CommandAccepted>;
+  /// One screen frame. Without the consent the user granted on the device's setup screen the
+  /// device answers `consent_required`; the screen renders that as an alert, never as a blank
+  /// image. The frame is not stored anywhere: it exists in this response only.
+  captureScreen(deviceId: string, userId: string): Promise<CommandAccepted>;
+  /// The documented system properties, optionally narrowed to `keys`. A name outside the
+  /// device's allowlist is its `not_permitted`.
+  systemProperties(
+    deviceId: string,
+    userId: string,
+    keys?: string[],
   ): Promise<CommandAccepted>;
 }
 
@@ -379,6 +405,18 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
       appsRequest(deviceId, userId, "clear", { package: packageName }),
     setAppEnabled: (deviceId, userId, packageName, enabled) =>
       appsRequest(deviceId, userId, "set_enabled", { package: packageName, enabled }),
+    captureScreen: (deviceId, userId) =>
+      request<CommandAccepted>(
+        "POST",
+        `/api/devices/${encodeURIComponent(deviceId)}/screen/snapshot?user_id=${encodeURIComponent(userId)}`,
+        {},
+      ),
+    systemProperties: (deviceId, userId, keys) =>
+      request<CommandAccepted>(
+        "POST",
+        `/api/devices/${encodeURIComponent(deviceId)}/console/props?user_id=${encodeURIComponent(userId)}`,
+        keys === undefined ? {} : { keys },
+      ),
   };
 
   function filesRequest(

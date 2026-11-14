@@ -152,6 +152,34 @@ form {
   border-bottom: 1px solid var(--border);
 }
 
+.snapshot img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.snapshot figcaption {
+  margin-top: 0.5rem;
+  color: var(--muted);
+}
+
+.property-list {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0;
+}
+
+.property-list dt {
+  color: var(--muted);
+}
+
+.property-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .muted {
   color: var(--muted);
 }

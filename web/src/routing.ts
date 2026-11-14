@@ -10,6 +10,8 @@ export type Route =
   | { name: "commands"; deviceId: string }
   | { name: "files"; deviceId: string }
   | { name: "apps"; deviceId: string }
+  | { name: "screen"; deviceId: string }
+  | { name: "console"; deviceId: string }
   | { name: "unknown"; path: string };
 
 export function devicePath(deviceId: string): string {
@@ -30,6 +32,14 @@ export function filesPath(deviceId: string): string {
 
 export function appsPath(deviceId: string): string {
   return `${devicePath(deviceId)}/apps`;
+}
+
+export function screenPath(deviceId: string): string {
+  return `${devicePath(deviceId)}/screen`;
+}
+
+export function consolePath(deviceId: string): string {
+  return `${devicePath(deviceId)}/console`;
 }
 
 function decodeSegment(segment: string): string | null {
@@ -60,6 +70,12 @@ export function matchRoute(pathname: string): Route {
   }
   if (segments.length === 3 && segments[2] === "apps") {
     return { name: "apps", deviceId };
+  }
+  if (segments.length === 3 && segments[2] === "screen") {
+    return { name: "screen", deviceId };
+  }
+  if (segments.length === 3 && segments[2] === "console") {
+    return { name: "console", deviceId };
   }
   return { name: "unknown", path: pathname };
 }

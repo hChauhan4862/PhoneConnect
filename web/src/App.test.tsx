@@ -122,6 +122,8 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
     stopApp: vi.fn(async () => ({ command_id: "cmd_1" })),
     clearApp: vi.fn(async () => ({ command_id: "cmd_1" })),
     setAppEnabled: vi.fn(async () => ({ command_id: "cmd_1" })),
+    captureScreen: vi.fn(async () => ({ command_id: "cmd_1" })),
+    systemProperties: vi.fn(async () => ({ command_id: "cmd_1" })),
     command: vi.fn(async () => ({
       command_id: "cmd_1",
       device_id: "dev_1",
@@ -586,6 +588,53 @@ describe("the apps screen route", () => {
     expect(
       screen.getByRole("link", { name: /back to status/i }),
     ).toHaveAttribute("href", "/devices/dev_1");
+  });
+});
+
+describe("the screen and console routes", () => {
+  it("renders the screen page at the device's screen path without capturing on its own", async () => {
+    installHost("browser");
+    const api = createFakeApi(statusFixture());
+    renderApp(api, "/devices/dev_1/screen");
+
+    expect(
+      await screen.findByRole("heading", { name: /^screen$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /capture screen/i }),
+    ).toBeInTheDocument();
+    expect(api.captureScreen).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("link", { name: /back to status/i }),
+    ).toHaveAttribute("href", "/devices/dev_1");
+  });
+
+  it("renders the console page at the device's console path", async () => {
+    installHost("browser");
+    const api = createFakeApi(statusFixture());
+    renderApp(api, "/devices/dev_1/console");
+
+    expect(
+      await screen.findByRole("heading", { name: /^console$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /read logcat/i }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("link", { name: /back to status/i }),
+    ).toHaveAttribute("href", "/devices/dev_1");
+  });
+
+  it("links to both screens from the status page", async () => {
+    installHost("browser");
+    renderApp(createFakeApi(statusFixture()));
+
+    expect(
+      await screen.findByRole("link", { name: /screen snapshot/i }),
+    ).toHaveAttribute("href", "/devices/dev_1/screen");
+    expect(
+      screen.getByRole("link", { name: /system properties and console/i }),
+    ).toHaveAttribute("href", "/devices/dev_1/console");
   });
 });
 

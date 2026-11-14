@@ -7,7 +7,7 @@ import { LeasePanel } from "../components/LeasePanel";
 import { RouteLink } from "../components/RouteLink";
 import { SessionPanel } from "../components/SessionPanel";
 import { TelemetryPanel } from "../components/TelemetryPanel";
-import { appsPath, commandsPath, filesPath } from "../routing";
+import { appsPath, commandsPath, consolePath, filesPath, screenPath } from "../routing";
 
 export function DeviceStatusRoute({
   api,
@@ -71,6 +71,12 @@ export function DeviceStatusRoute({
       </p>
       <p>
         <RouteLink to={appsPath(status.device.device_id)}>Browse apps</RouteLink>
+      </p>
+      <p>
+        <RouteLink to={screenPath(status.device.device_id)}>Screen snapshot</RouteLink>
+      </p>
+      <p>
+        <RouteLink to={consolePath(status.device.device_id)}>System properties and console</RouteLink>
       </p>
       <HostActions deviceId={status.device.device_id} />
     </>

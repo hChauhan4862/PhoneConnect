@@ -28,8 +28,9 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   current route. It contains no screen logic.
 - `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
   `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry),
-  `/devices/:id/commands` (the command console), `/devices/:id/files` (the file browser), and
-  `/devices/:id/apps` (the app inventory).
+  `/devices/:id/commands` (the command console), `/devices/:id/files` (the file browser),
+  `/devices/:id/apps` (the app inventory), `/devices/:id/screen` (one screen snapshot), and
+  `/devices/:id/console` (system properties and the two documented refusals).
   The server's SPA fallback serves the same document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
@@ -38,7 +39,7 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
   `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `AppsRoute`,
-  `NotFoundRoute`.
+  `ScreenRoute`, `ConsoleRoute`, `NotFoundRoute`.
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
   `TelemetryPanel` (bounded aggregates and explicit freshness), `CommandPanel` (dispatch
   and poll), and `FileList` (one directory's entries). `FileList` is presentational: `FilesRoute`
@@ -49,7 +50,14 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   refusal (`launch_blocked`) as an alert with its machine code, says only that Android was
   *asked* to kill a package, and renders `apps.clear`/`apps.set_enabled` as disabled controls
   with the signature-permission reason and the ADB path — never as buttons that fail
-  silently. `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
+  silently. `ScreenRoute` captures only when the user presses its button (opening the page
+  never prompts the device), drops the previous frame the moment a new capture starts, renders
+  the PNG with alt text plus `captured_at_ms` and the width/height actually captured, and shows
+  every refusal — `consent_required` first among them — as an alert with its machine code, never
+  as a blank or stale image. `ConsoleRoute` renders the device's documented system properties
+  (an unreadable property is "not reported", never invented) and shows `shell.exec` and
+  `logcat.tail` as disabled controls with the device's own constant reason, because an ordinary
+  app can never run either. `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
   `ok` shows output, and a refused dispatch (`device_offline`, `device_revoked`,
   `lease_read_only`) is an alert, never a pending row that looks like it is working. `LeasePanel` offers revoke and
   handoff to the owner *or* the holder, because the server lets the owner revoke a lease they
