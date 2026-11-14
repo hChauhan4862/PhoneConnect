@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.nio.file.DirectoryIteratorException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -39,26 +40,29 @@ class FileHandler(private val guard: PathGuard) {
         }
 
         val entries = ArrayList<JSONObject>()
-        Files.newDirectoryStream(path).use { children ->
-            for (child in children) {
-                // An entry the root cannot serve is not listed: a dangling or escaping link
-                // is invisible rather than offered and then refused.
-                val real = runCatching { child.toRealPath() }.getOrNull() ?: continue
-                if (!real.startsWith(guard.root())) continue
-                val attributes = runCatching {
-                    Files.readAttributes(real, BasicFileAttributes::class.java)
-                }.getOrNull() ?: continue
-                entries.add(
-                    JSONObject()
-                        .put("name", child.fileName.toString())
-                        .put("path", guard.relative(real))
-                        .put("is_dir", attributes.isDirectory)
-                        // A directory has no file size; reporting its inode size would be a
-                        // platform detail, not a fact about its contents.
-                        .put("size_bytes", if (attributes.isDirectory) 0L else attributes.size())
-                        .put("modified_ms", attributes.lastModifiedTime().toMillis()),
-                )
+        var encodedBytes = 0
+        try {
+            Files.newDirectoryStream(path).use { children ->
+                for (child in children) {
+                    val entry = describe(child) ?: continue
+                    // One listing is one command result, and the server accepts at most 2 MiB.
+                    // Stop before materializing an oversized answer and say so; a silently
+                    // truncated listing would be a fabricated one.
+                    val encoded = entry.toString().length + 1
+                    if (entries.size >= MAX_LIST_ENTRIES || encodedBytes + encoded > MAX_LIST_BYTES) {
+                        throw listingTooLarge(path)
+                    }
+                    encodedBytes += encoded
+                    entries.add(entry)
+                }
             }
+        } catch (error: DirectoryIteratorException) {
+            // Iteration wraps its own I/O fault; report it like the open, never as an
+            // `internal_error` carrying the platform's absolute path.
+            val cause = error.cause as? IOException ?: IOException("directory iteration failed")
+            throw ioFailure("list", path, cause)
+        } catch (error: IOException) {
+            throw ioFailure("list", path, error)
         }
         return JSONObject().put(
             "entries",
@@ -199,6 +203,26 @@ class FileHandler(private val guard: PathGuard) {
         }
     }
 
+    /**
+     * One entry, or `null` when the root cannot serve it: a dangling or escaping link is
+     * invisible rather than offered and then refused.
+     */
+    private fun describe(child: Path): JSONObject? {
+        val real = runCatching { child.toRealPath() }.getOrNull() ?: return null
+        if (!real.startsWith(guard.root())) return null
+        val attributes = runCatching {
+            Files.readAttributes(real, BasicFileAttributes::class.java)
+        }.getOrNull() ?: return null
+        return JSONObject()
+            .put("name", child.fileName.toString())
+            .put("path", guard.relative(real))
+            .put("is_dir", attributes.isDirectory)
+            // A directory has no file size; reporting its inode size would be a platform
+            // detail, not a fact about its contents.
+            .put("size_bytes", if (attributes.isDirectory) 0L else attributes.size())
+            .put("modified_ms", attributes.lastModifiedTime().toMillis())
+    }
+
     private fun requireNotRoot(path: Path) {
         if (path == guard.root()) {
             throw CommandFailure(PathError.INVALID, "the shared root cannot be changed")
@@ -224,6 +248,12 @@ class FileHandler(private val guard: PathGuard) {
     private fun tooLarge() = CommandFailure(
         "too_large",
         "a write may carry at most $MAX_WRITE_BYTES decoded bytes",
+    )
+
+    private fun listingTooLarge(path: Path) = CommandFailure(
+        "listing_too_large",
+        "${display(path)} has more entries than one listing may carry " +
+            "(limit $MAX_LIST_ENTRIES entries or $MAX_LIST_BYTES bytes)",
     )
 
     private fun ioFailure(operation: String, path: Path, error: IOException): CommandFailure {
@@ -259,6 +289,15 @@ class FileHandler(private val guard: PathGuard) {
     companion object {
         /** At most one chunk of decoded bytes per read response. */
         const val MAX_READ_BYTES: Int = 256 * 1024
+
+        /** Entries one listing may carry before it is refused as `listing_too_large`. */
+        const val MAX_LIST_ENTRIES: Int = 4_096
+
+        /**
+         * Estimated encoded size one listing may carry. The server accepts a 2 MiB result, so
+         * staying well under it keeps `files.list` a usable answer instead of a refusal.
+         */
+        private const val MAX_LIST_BYTES: Int = 1_000_000
 
         /** At most one mebibyte of decoded bytes per write request. */
         const val MAX_WRITE_BYTES: Int = 1024 * 1024

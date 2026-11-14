@@ -8,6 +8,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -79,6 +80,44 @@ class FileHandlerTest {
 
         assertEquals("not_a_directory", failure { handler.list(args("path" to "a.txt")) }.code)
         assertEquals("not_found", failure { handler.list(args("path" to "missing")) }.code)
+    }
+
+    @Test
+    fun `listing an unreadable directory is io_error without the device path`() {
+        val locked = File(root, "locked").apply { mkdirs() }
+        locked.setReadable(false, false)
+        assumeTrue(
+            "file permissions are not enforced for this user",
+            locked.list() == null,
+        )
+
+        try {
+            val error = failure { handler.list(args("path" to "locked")) }
+
+            assertEquals("io_error", error.code)
+            assertFalse(
+                "the message must not name the device's absolute path: ${error.message}",
+                error.message.orEmpty().contains(root.absolutePath),
+            )
+        } finally {
+            locked.setReadable(true, true)
+        }
+    }
+
+    @Test
+    fun `a listing larger than one page is refused rather than materialized`() {
+        val big = File(root, "big").apply { mkdirs() }
+        repeat(FileHandler.MAX_LIST_ENTRIES + 1) { index ->
+            assertTrue(File(big, "f%05d.txt".format(index)).createNewFile())
+        }
+
+        val error = failure { handler.list(args("path" to "big")) }
+
+        assertEquals("listing_too_large", error.code)
+        assertTrue(
+            "the message names the limit: ${error.message}",
+            error.message.orEmpty().contains(FileHandler.MAX_LIST_ENTRIES.toString()),
+        )
     }
 
     @Test

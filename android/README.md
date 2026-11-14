@@ -49,7 +49,10 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    touches the filesystem, and the handlers run on `Dispatchers.IO`, never on the command
    receive loop. A read returns at most 256 KiB of decoded bytes per chunk with an honest
    `truncated`; a write accepts at most 1 MiB decoded (`too_large` beyond that); delete removes
-   a file or an *empty* directory and is never recursive (`dir_not_empty`).
+   a file or an *empty* directory and is never recursive (`dir_not_empty`). A listing is capped
+   at 4 096 entries (or ~1 MB encoded) and refused as `listing_too_large` instead of being
+   materialized, and an I/O fault is `io_error` with a root-relative path — never the platform
+   message that names the device's absolute path.
 
 ## Layout
 

@@ -11,6 +11,9 @@
 //! - at most [`MAX_IN_FLIGHT_PER_DEVICE`] pending commands per device;
 //! - a result may not exceed [`MAX_RESULT_BYTES`], and an oversized one refuses the command
 //!   with `result_too_large` instead of being held;
+//! - the retained answers together may not exceed [`MAX_RETAINED_OUTPUT_BYTES`]: the oldest
+//!   completed records are dropped (as past the count cap) so a device answering large file
+//!   chunks cannot grow the table without bound;
 //! - commands live in memory only; the audit row written by the HTTP surface is the durable
 //!   trace, so there is no commands table;
 //! - one device cannot degrade ingest for the others: its inbound frames and bytes are
@@ -59,6 +62,17 @@ pub const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 /// Retained command records. Completed records are dropped oldest-first past this; pending
 /// ones are bounded by [`MAX_IN_FLIGHT_PER_DEVICE`] per connected device.
 const MAX_RETAINED_COMMANDS: usize = 4 * 1024;
+
+/// Aggregate output retained by completed commands.
+///
+/// Count alone is not a memory bound: `files.read` answers ~350 KiB of base64 each, so 4 096
+/// records could hold ~1.4 GiB, and command creation is fast enough to reach that in minutes.
+/// This is one budget for the whole table — not per device, so a busy fleet cannot multiply it
+/// — on the bytes of retained answers. Once it is crossed the oldest completed records are
+/// dropped whole, exactly as past the count cap, and `GET /api/commands/{id}` answers
+/// `command_unknown` for a trimmed record. Pending commands hold no output and are never
+/// dropped.
+pub const MAX_RETAINED_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Longest accepted command name. Names belong to the device; the server only bounds them.
 const MAX_COMMAND_NAME_BYTES: usize = 128;
@@ -156,6 +170,10 @@ pub struct CommandRecord {
     /// When the command becomes `timeout`. Not part of the wire record.
     #[serde(skip)]
     pub deadline_at_ms: UnixMs,
+    /// Serialized size of `output`, charged against [`MAX_RETAINED_OUTPUT_BYTES`]. Not part
+    /// of the wire record.
+    #[serde(skip)]
+    retained_output_bytes: usize,
 }
 
 /// A command that was handed to the device's channel.
@@ -280,6 +298,8 @@ struct RegistryInner {
     next_connection_id: u64,
     connections: HashMap<String, Connection>,
     commands: HashMap<String, CommandRecord>,
+    /// Sum of every retained record's `retained_output_bytes`.
+    retained_output_bytes: usize,
     completed: VecDeque<String>,
     /// Per-device inbound budgets, keyed by device so a reconnect does not reset them.
     ingest: HashMap<String, IngestBudget>,
@@ -330,19 +350,25 @@ impl RegistryInner {
             .count()
     }
 
-    /// Drops the oldest completed records past the cap. Pending records are never dropped.
+    /// Drops the oldest completed records past the count cap or the retained-output budget.
+    /// Pending records are never dropped; their answers do not exist yet.
     fn trim(&mut self) {
-        while self.commands.len() > MAX_RETAINED_COMMANDS {
+        while self.commands.len() > MAX_RETAINED_COMMANDS
+            || self.retained_output_bytes > MAX_RETAINED_OUTPUT_BYTES
+        {
             let Some(command_id) = self.completed.pop_front() else {
                 break;
             };
-            if self
+            let Some(retained) = self
                 .commands
                 .get(&command_id)
-                .is_some_and(|record| record.status != CommandStatus::Pending)
-            {
-                self.commands.remove(&command_id);
-            }
+                .filter(|record| record.status != CommandStatus::Pending)
+                .map(|record| record.retained_output_bytes)
+            else {
+                continue;
+            };
+            self.commands.remove(&command_id);
+            self.retained_output_bytes = self.retained_output_bytes.saturating_sub(retained);
         }
     }
 }
@@ -536,6 +562,7 @@ impl DeviceRegistry {
                 created_at_ms: now,
                 completed_at_ms: None,
                 deadline_at_ms: now + deadline_ms,
+                retained_output_bytes: 0,
             },
         );
         if sender.try_send(frame).is_err() {
@@ -581,6 +608,7 @@ impl DeviceRegistry {
                 request_id: request_id.to_owned(),
             });
         }
+        let mut retained_output_bytes = 0;
         match status {
             ResultStatus::Ok => {
                 let bytes = match output.as_ref() {
@@ -599,6 +627,8 @@ impl DeviceRegistry {
                     record.status = CommandStatus::Ok;
                     record.output = output;
                     record.message = message;
+                    // What this answer costs the retained-output budget.
+                    retained_output_bytes = bytes;
                 }
             }
             ResultStatus::Error => {
@@ -608,7 +638,12 @@ impl DeviceRegistry {
             }
         }
         record.completed_at_ms = Some(now);
+        record.retained_output_bytes = retained_output_bytes;
         let command_id = request_id.to_owned();
+        // The mutable borrow of the record ends here, so the aggregate can be charged.
+        inner.retained_output_bytes = inner
+            .retained_output_bytes
+            .saturating_add(retained_output_bytes);
         inner.completed.push_back(command_id);
         inner.trim();
         Ok(())

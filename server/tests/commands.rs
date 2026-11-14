@@ -9,7 +9,9 @@ use axum::http::{Method, StatusCode};
 use common::TestApp;
 use common::control;
 use futures_util::StreamExt;
-use phoneconnect_server::management::{DEFAULT_COMMAND_TIMEOUT_MS, MAX_IN_FLIGHT_PER_DEVICE};
+use phoneconnect_server::management::{
+    DEFAULT_COMMAND_TIMEOUT_MS, MAX_IN_FLIGHT_PER_DEVICE, MAX_RETAINED_OUTPUT_BYTES,
+};
 use phoneconnect_server::store::DeviceStore;
 use serde_json::json;
 
@@ -315,6 +317,75 @@ async fn the_server_forwards_any_command_name_and_the_device_answers_unknown_com
     let body = wait_for_completion(&app, &command_id, "user-a").await;
     assert_eq!(body["status"], "error");
     assert_eq!(body["error"], "unknown_command");
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn retained_results_are_bounded_by_bytes_as_well_as_count() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // A `files.read` chunk is ~350 KiB of base64, so a count-only cap would let a few thousand
+    // records retain gigabytes. Each answer here is a full mebibyte.
+    let payload = "x".repeat(1024 * 1024);
+    let turns = MAX_RETAINED_OUTPUT_BYTES / payload.len() + 8;
+    let mut ids = Vec::new();
+    for _ in 0..turns {
+        // Pace command creation: this test is about retained bytes, not the creation rate.
+        app.clock.advance_ms(120);
+        let (status, body) = app
+            .dispatch_command(&device_id, "user-a", info_command())
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let command_id = body["command_id"].as_str().expect("command_id").to_owned();
+        let request = control::next_json(&mut socket).await;
+        assert_eq!(request["request_id"], command_id);
+        control::send(
+            &mut socket,
+            control::result(&command_id, "ok", json!({ "chunk": payload })),
+        )
+        .await;
+        ids.push(command_id);
+    }
+
+    // The newest answer is intact: the budget trims the oldest, never the answer being read.
+    // Frames are applied in order on one socket, so waiting for the last answer also means
+    // every earlier one was applied (and the trimming has run).
+    let newest = wait_for_completion(&app, ids.last().expect("commands"), "user-a").await;
+    assert_eq!(newest["status"], "ok");
+    assert_eq!(
+        newest["output"]["chunk"].as_str().map(str::len),
+        Some(payload.len())
+    );
+
+    // An old answer is gone exactly as if it were past the count cap: `command_unknown`.
+    let (status, body) = app.command(&ids[0], "user-a").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "command_unknown");
+
+    // And what is still resident fits the budget instead of growing with the count.
+    let mut retained = 0usize;
+    let mut live = 0usize;
+    for command_id in &ids {
+        let (status, record) = app.command(command_id, "user-a").await;
+        if status == StatusCode::OK {
+            live += 1;
+            retained += serde_json::to_vec(&record["output"]).expect("json").len();
+        }
+    }
+    assert!(live > 0, "the newest answers are retained");
+    assert!(
+        live < ids.len(),
+        "old answers were trimmed: {live} of {}",
+        ids.len()
+    );
+    assert!(
+        retained <= MAX_RETAINED_OUTPUT_BYTES,
+        "{retained} bytes retained, budget {MAX_RETAINED_OUTPUT_BYTES}"
+    );
 
     socket.close(None).await.expect("channel closed");
     server.abort();
