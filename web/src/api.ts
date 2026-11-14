@@ -221,10 +221,14 @@ export interface ControlReadingsOutput {
 export type ControlValue = number | boolean;
 
 /// `control.set` output: the change the device applied and confirmed by reading it back.
+/// `brightness_mode` / `mode_changed` are only on a brightness answer: the device turns
+/// automatic brightness off so the value holds, and says whether this call did it.
 export interface ControlSetOutput {
   key: string;
   value: ControlValue;
   applied: boolean;
+  brightness_mode?: number;
+  mode_changed?: boolean;
 }
 
 export interface RevocationEvent {

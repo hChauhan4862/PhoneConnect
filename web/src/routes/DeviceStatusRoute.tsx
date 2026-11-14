@@ -38,6 +38,10 @@ export function DeviceStatusRoute({
   }
   const status = resource.data;
   if (!status) return null;
+  // The server lets the owner or the holder of the control lease read and change device
+  // control; a secondary viewer gets neither. The panel is the server's rule, not a guess.
+  const access = status.lease.access;
+  const mayControl = access.is_owner || access.can_control;
 
   return (
     <>
@@ -62,7 +66,17 @@ export function DeviceStatusRoute({
         onChanged={resource.reload}
       />
       <TelemetryPanel telemetry={status.telemetry} />
-      <ControlPanel api={api} deviceId={status.device.device_id} userId={userId} />
+      {mayControl ? (
+        <ControlPanel api={api} deviceId={status.device.device_id} userId={userId} />
+      ) : (
+        <section className="panel" aria-labelledby="control-heading">
+          <h2 id="control-heading">Device control</h2>
+          <p className="muted">
+            Readings and changes require control access. You have read-only access to this
+            device; its owner can grant you the control lease.
+          </p>
+        </section>
+      )}
       <p>
         <RouteLink to={commandsPath(status.device.device_id)}>
           Open the command console

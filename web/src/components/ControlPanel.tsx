@@ -157,14 +157,15 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         setActionFailure(failureOfCommand(command));
         return;
       }
-      if (!readApplied(command.output)) {
+      const result = readApplied(command.output);
+      if (!result) {
         setActionFailure({
           code: "invalid_result",
           message: "the device's answer does not confirm the change",
         });
         return;
       }
-      setNotice(`The device confirmed the ${label} change; the readings were re-read.`);
+      setNotice(noticeFor(label, key, result));
       await read(() => mounted.current);
     } catch (error) {
       if (mounted.current) setActionFailure(failureOfError(error));
@@ -242,7 +243,13 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
           </div>
           {refused("brightness") ? (
             <p className="muted">{reasonText(refused("brightness") ?? "")}</p>
-          ) : null}
+          ) : (
+            <p className="muted">
+              Setting brightness turns automatic brightness off first, because a value written
+              under an ambient-light strategy would not reach the display; the device&apos;s
+              answer reports the mode it now runs under.
+            </p>
+          )}
 
           <div className="actions">
             <label htmlFor="control-volume">Music volume</label>
@@ -361,5 +368,24 @@ function readApplied(output: unknown): ControlSetOutput | null {
   if (value.applied !== true) return null;
   const applied = value.value;
   if (typeof applied !== "number" && typeof applied !== "boolean") return null;
-  return { key: value.key, value: applied, applied: true };
+  const mode = value.brightness_mode;
+  if (mode !== undefined && typeof mode !== "number") return null;
+  const changed = value.mode_changed;
+  if (changed !== undefined && typeof changed !== "boolean") return null;
+  return {
+    key: value.key,
+    value: applied,
+    applied: true,
+    brightness_mode: mode,
+    mode_changed: changed,
+  };
+}
+
+/// The confirmation never claims more than the answer did: a brightness change that turned
+/// automatic mode off says so.
+function noticeFor(label: string, key: string, result: ControlSetOutput): string {
+  if (key === "brightness" && result.mode_changed === true) {
+    return `The device confirmed the ${label} change and turned automatic brightness off so it holds.`;
+  }
+  return `The device confirmed the ${label} change.`;
 }

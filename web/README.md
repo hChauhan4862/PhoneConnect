@@ -64,9 +64,12 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   do not hold; "Read-only access" is reserved for a user who is neither. `SessionPanel` also
   shows the server's `control_refusals` count, so a refused control attempt on a read-only
   session is visible rather than silently dropped. `ControlPanel` (mounted on the status
-  screen) renders every reading the device reported and every key it refused as a disabled
-  control with the reason as visible text, only confirms a change once the device answers
-  `ok`, and re-reads `control.get` after a confirmed change instead of assuming the value took.
+  screen for the owner or the holder of the control lease, which is the server's own rule)
+  renders every reading the device reported and every key it refused as a disabled control
+  with the reason as visible text, only confirms a change once the device answers `ok`, and
+  re-reads `control.get` after a confirmed change instead of assuming the value took. A
+  secondary viewer gets a short "requires control access" line instead of the panel, because
+  `control.get` would answer `lease_read_only` — a refusal the viewer can do nothing about.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

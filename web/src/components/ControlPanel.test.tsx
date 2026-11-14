@@ -192,6 +192,44 @@ describe("the control panel", () => {
     expect(screen.getByText(/device confirmed/i)).toBeInTheDocument();
   });
 
+  it("reports the automatic-brightness side effect only when the device said it happened", async () => {
+    const user = userEvent.setup();
+    const granted: ControlReadingsOutput = {
+      ...READINGS,
+      unavailable: { ...READINGS.unavailable },
+    };
+    delete granted.unavailable.brightness;
+    delete granted.unavailable.dnd_filter;
+
+    const api = fakeApi([
+      command({ output: granted }),
+      command({
+        name: "control.set",
+        output: {
+          key: "brightness",
+          value: 120,
+          applied: true,
+          brightness_mode: 0,
+          mode_changed: true,
+        },
+      }),
+      command({ output: { ...granted, brightness: 120 } }),
+    ]);
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+    expect(screen.getByText(/turns automatic brightness off first/i)).toBeInTheDocument();
+
+    const field = screen.getByLabelText(/brightness value/i);
+    await user.clear(field);
+    await user.type(field, "120");
+    await user.click(screen.getByRole("button", { name: /set brightness/i }));
+
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByText(/turned automatic brightness off so it holds/i),
+    ).toBeInTheDocument();
+  });
+
   it("drops the readings when the re-read after a confirmed change fails", async () => {
     const user = userEvent.setup();
     const api = fakeApi([
@@ -212,8 +250,9 @@ describe("the control panel", () => {
 
     await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
     // The change was confirmed, but the map could not be re-read: the old values must not keep
-    // looking like the device's current answer.
+    // looking like the device's current answer, and the notice must not imply they are on screen.
     expect(screen.getByText(/device confirmed/i)).toBeInTheDocument();
+    expect(screen.getByText(/device confirmed/i)).not.toHaveTextContent(/re-read/i);
     expect(screen.queryByRole("list", { name: /control readings/i })).not.toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("device_offline");
   });
