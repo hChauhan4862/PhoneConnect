@@ -95,12 +95,9 @@ export interface NativeHostBridge {
     sessionId: string,
     capability: string,
   ): Promise<TicketKeyRotation> | TicketKeyRotation;
-  /// Pins `expectedCurrent` after the user confirmed it.
-  trustTicketKey?(
-    expectedCurrent: string,
-    sessionId: string,
-    capability: string,
-  ): Promise<void> | void;
+  /// Asks the shell to show its native confirmation and pin the new key only if the user
+  /// approves it. The page cannot supply the confirmation itself.
+  trustTicketKey?(sessionId: string, capability: string): Promise<void> | void;
 }
 
 function globals(source: Window): Record<string, unknown> {

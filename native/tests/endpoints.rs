@@ -467,7 +467,7 @@ async fn a_page_chosen_verification_key_is_refused_by_the_pin() {
         .expect_err("the pinned key wins over the page");
     match error {
         EndpointError::Trust(TrustError::PinChanged { remedy, .. }) => {
-            assert!(remedy.contains("accept"), "{remedy}");
+            assert!(remedy.contains("approve"), "{remedy}");
         }
         other => panic!("expected a pin change, got {other:?}"),
     }

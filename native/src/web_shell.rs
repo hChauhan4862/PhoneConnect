@@ -335,6 +335,12 @@ pub fn bridge_script() -> String {
       openEndpoint: function (request) {{ return invoke("open_endpoint", {{ request: request }}); }},
       closeEndpoint: function (deviceId, stream) {{
         return invoke("close_endpoint", {{ deviceId: deviceId, stream: stream }});
+      }},
+      pendingTicketKey: function (sessionId, capability) {{
+        return invoke("pending_ticket_key", {{ sessionId: sessionId, capability: capability }});
+      }},
+      trustTicketKey: function (sessionId, capability) {{
+        return invoke("trust_ticket_key", {{ sessionId: sessionId, capability: capability }});
       }}
     }})
   }});
@@ -572,6 +578,8 @@ mod tests {
             "native_identity_key",
             "open_endpoint",
             "close_endpoint",
+            "pending_ticket_key",
+            "trust_ticket_key",
         ] {
             assert!(script.contains(command), "{command} missing from {script}");
         }

@@ -122,9 +122,7 @@ describe("browserHost", () => {
       status: "unavailable",
       reason: expect.stringMatching(/native shell/),
     });
-    await expect(
-      host.trustTicketKey("new-key", "sess_1", "cap"),
-    ).resolves.toEqual({
+    await expect(host.trustTicketKey("sess_1", "cap")).resolves.toEqual({
       status: "unavailable",
       reason: expect.stringMatching(/native shell/),
     });
@@ -238,10 +236,10 @@ describe("nativeHost", () => {
       rotation: { pinned: "old-key", current: "new-key" },
     });
     expect(pendingTicketKey).toHaveBeenCalledWith("sess_1", "cap");
-    await expect(
-      host.trustTicketKey("new-key", "sess_1", "cap"),
-    ).resolves.toEqual({ status: "trusted" });
-    expect(trustTicketKey).toHaveBeenCalledWith("new-key", "sess_1", "cap");
+    await expect(host.trustTicketKey("sess_1", "cap")).resolves.toEqual({
+      status: "trusted",
+    });
+    expect(trustTicketKey).toHaveBeenCalledWith("sess_1", "cap");
   });
 
   it("reports a refused rotation instead of claiming success", async () => {
@@ -251,9 +249,7 @@ describe("nativeHost", () => {
     installBridge({ trustTicketKey });
     const host = createHostAdapter(nativeContext);
 
-    await expect(
-      host.trustTicketKey("new-key", "sess_1", "cap"),
-    ).resolves.toEqual({
+    await expect(host.trustTicketKey("sess_1", "cap")).resolves.toEqual({
       status: "refused",
       reason: "the server key changed again",
     });

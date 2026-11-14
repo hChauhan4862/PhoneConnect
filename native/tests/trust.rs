@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use phoneconnect_native::trust::{PIN_FILE_NAME, TicketTrust, TrustError};
+use phoneconnect_native::trust::{ConfirmationGate, PIN_FILE_NAME, TicketTrust, TrustError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -82,6 +82,55 @@ impl KeyServer {
 impl Drop for KeyServer {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// A gate a test scripts: it records the pair it was shown and answers as configured.
+struct ScriptedGate {
+    approve: bool,
+    seen: Mutex<Vec<(String, String)>>,
+    on_confirm: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl ScriptedGate {
+    fn approving() -> Self {
+        Self {
+            approve: true,
+            seen: Mutex::new(Vec::new()),
+            on_confirm: None,
+        }
+    }
+
+    fn declining() -> Self {
+        Self {
+            approve: false,
+            ..Self::approving()
+        }
+    }
+
+    fn with_action(mut self, action: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_confirm = Some(Box::new(action));
+        self
+    }
+
+    fn seen(&self) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl ConfirmationGate for ScriptedGate {
+    fn confirm_rotation(&self, pinned: &str, current: &str) -> Result<bool, TrustError> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((pinned.to_owned(), current.to_owned()));
+        if let Some(action) = &self.on_confirm {
+            action();
+        }
+        Ok(self.approve)
     }
 }
 
@@ -206,7 +255,7 @@ async fn a_page_key_that_differs_is_refused_with_a_remedy() {
                 detail.contains("still advertises the pinned"),
                 "the shell checks the server: {detail}"
             );
-            assert!(remedy.contains("accept"), "{remedy}");
+            assert!(remedy.contains("approve"), "{remedy}");
             assert!(remedy.contains(&path.display().to_string()), "{remedy}");
         }
         other => panic!("expected a pin change, got {other:?}"),
@@ -242,7 +291,7 @@ async fn a_rotated_server_key_is_refused_with_the_remedy() {
                 detail.contains("now advertises new-key"),
                 "the error names the rotation: {detail}"
             );
-            assert!(remedy.contains("accept"), "{remedy}");
+            assert!(remedy.contains("approve"), "{remedy}");
         }
         other => panic!("expected a pin change, got {other:?}"),
     }
@@ -384,41 +433,116 @@ async fn a_redirect_to_another_origin_is_not_followed() {
 }
 
 #[tokio::test]
-async fn a_rotation_is_accepted_only_when_the_confirmed_key_is_current() {
-    let server = KeyServer::start("old-key").await;
+async fn a_rotation_is_pinned_only_after_the_user_confirms_the_pair() {
+    let server = Arc::new(KeyServer::start("old-key").await);
     let path = pin_path("trust-accept");
     let trust = TicketTrust::new(server.url(), path.clone());
     trust
         .pinned_key("sess_accept", "capability")
         .await
         .expect("pin");
-
     server.rotate("new-key");
-    let pending = trust
-        .pending_rotation("sess_accept", "capability")
-        .await
-        .expect("the shell can show the rotation");
-    assert_eq!(pending.pinned, "old-key");
-    assert_eq!(pending.current, "new-key");
 
-    let error = trust
-        .accept_rotation("stale-key", "sess_accept", "capability")
-        .await
-        .expect_err("an unconfirmed key is not pinned");
-    assert!(
-        matches!(error, TrustError::RotationMoved { .. }),
-        "{error:?}"
-    );
-    assert_eq!(read_pin(&path), "old-key", "the pin is unchanged");
-
+    let gate = ScriptedGate::approving();
     trust
-        .accept_rotation("new-key", "sess_accept", "capability")
+        .accept_rotation(&gate, "sess_accept", "capability")
         .await
-        .expect("the user confirmed the new key");
+        .expect("the user confirmed the pair");
+    assert_eq!(
+        gate.seen(),
+        vec![("old-key".to_owned(), "new-key".to_owned())],
+        "the gate is shown exactly the pinned and current keys"
+    );
     assert_eq!(read_pin(&path), "new-key");
     assert_eq!(
         read_pin_field(&path, "origin"),
         server.url().origin().ascii_serialization()
+    );
+    std::fs::remove_dir_all(path.parent().expect("directory")).ok();
+}
+
+#[tokio::test]
+async fn a_declined_rotation_leaves_the_pin_untouched() {
+    let server = Arc::new(KeyServer::start("old-key").await);
+    let path = pin_path("trust-decline");
+    let trust = TicketTrust::new(server.url(), path.clone());
+    trust
+        .pinned_key("sess_decline", "capability")
+        .await
+        .expect("pin");
+    server.rotate("new-key");
+
+    // A page can trigger this call, but the gate is native code: a declined pair pins nothing.
+    let gate = ScriptedGate::declining();
+    let error = trust
+        .accept_rotation(&gate, "sess_decline", "capability")
+        .await
+        .expect_err("an unconfirmed rotation is refused");
+    assert!(
+        matches!(error, TrustError::RotationDeclined { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        gate.seen(),
+        vec![("old-key".to_owned(), "new-key".to_owned())]
+    );
+    assert_eq!(read_pin(&path), "old-key", "the pin is unchanged");
+    std::fs::remove_dir_all(path.parent().expect("directory")).ok();
+}
+
+#[tokio::test]
+async fn a_rotation_that_moves_while_the_prompt_is_open_is_refused() {
+    let server = Arc::new(KeyServer::start("old-key").await);
+    let path = pin_path("trust-moved");
+    let trust = TicketTrust::new(server.url(), path.clone());
+    trust
+        .pinned_key("sess_moved", "capability")
+        .await
+        .expect("pin");
+
+    server.rotate("new-key");
+    let rotating = Arc::clone(&server);
+    let gate = ScriptedGate::approving().with_action(move || rotating.rotate("third-key"));
+    let error = trust
+        .accept_rotation(&gate, "sess_moved", "capability")
+        .await
+        .expect_err("a key that moved after the prompt is not pinned");
+    assert!(
+        matches!(error, TrustError::RotationMoved { .. }),
+        "{error:?}"
+    );
+    assert_eq!(read_pin(&path), "old-key");
+    std::fs::remove_dir_all(path.parent().expect("directory")).ok();
+}
+
+#[tokio::test]
+async fn confirming_when_nothing_changed_does_not_prompt_or_write() {
+    let server = Arc::new(KeyServer::start("same-key").await);
+    let path = pin_path("trust-noop");
+    let trust = TicketTrust::new(server.url(), path.clone());
+    trust
+        .pinned_key("sess_noop", "capability")
+        .await
+        .expect("pin");
+    let before = std::fs::metadata(&path)
+        .expect("pin")
+        .modified()
+        .expect("mtime");
+    std::thread::sleep(Duration::from_millis(20));
+
+    let gate = ScriptedGate::approving();
+    trust
+        .accept_rotation(&gate, "sess_noop", "capability")
+        .await
+        .expect("nothing to confirm");
+    assert!(gate.seen().is_empty(), "no prompt without a rotation");
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("pin")
+            .modified()
+            .expect("mtime"),
+        before,
+        "the pin is not rewritten"
     );
     std::fs::remove_dir_all(path.parent().expect("directory")).ok();
 }

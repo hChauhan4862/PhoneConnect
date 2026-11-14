@@ -43,6 +43,15 @@ pub struct TicketTrust {
     http: reqwest::Client,
 }
 
+/// Asks a human to confirm a rotation.
+///
+/// The production gate shows a native dialog with both keys; a test supplies a scripted gate.
+/// Nothing else can approve a rotation, so a page can ask for the prompt but cannot answer it.
+pub trait ConfirmationGate: Send + Sync {
+    /// Shows `pinned` → `current` and returns whether the user approved *that pair*.
+    fn confirm_rotation(&self, pinned: &str, current: &str) -> Result<bool, TrustError>;
+}
+
 /// A rotation the shell can show a user before they accept it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +106,8 @@ pub enum TrustError {
         detail: String,
         remedy: String,
     },
+    #[error("the user declined the key rotation from {pinned} to {current}")]
+    RotationDeclined { pinned: String, current: String },
     #[error(
         "the server key changed again: confirmed {confirmed}, now {current}; ask for the new key \
          before trusting it"
@@ -180,21 +191,31 @@ impl TicketTrust {
         Ok(PendingRotation { pinned, current })
     }
 
-    /// Replaces the pin with `confirmed_current`, which the user saw and accepted.
+    /// Replaces the pin after the user approves the pair through `gate`.
     ///
-    /// The key is fetched again first: if the server changed since the user looked, this
-    /// refuses (`RotationMoved`) instead of pinning a key nobody confirmed.
+    /// The caller cannot supply the confirmation: `gate` is native code that shows both keys
+    /// and returns the human's answer. The key is fetched again after approval, so a server
+    /// that changed while the dialog was open is not pinned (`RotationMoved`). Approving when
+    /// the server already advertises the pinned key is a no-op.
     pub async fn accept_rotation(
         &self,
-        confirmed_current: &str,
+        gate: &dyn ConfirmationGate,
         session_id: &str,
         capability: &str,
     ) -> Result<(), TrustError> {
+        let pinned = self.read_pin()?.ok_or(TrustError::NoPin)?.key;
         let current = self.fetch_key(session_id, capability).await?;
-        if current != confirmed_current {
+        if current == pinned {
+            return Ok(());
+        }
+        if !gate.confirm_rotation(&pinned, &current)? {
+            return Err(TrustError::RotationDeclined { pinned, current });
+        }
+        let after = self.fetch_key(session_id, capability).await?;
+        if after != current {
             return Err(TrustError::RotationMoved {
-                confirmed: confirmed_current.to_owned(),
-                current,
+                confirmed: current,
+                current: after,
             });
         }
         self.write_pin(&current)
@@ -214,8 +235,8 @@ impl TicketTrust {
 
     fn remedy(&self) -> String {
         format!(
-            "confirm the new key with the server operator and accept it in the PhoneConnect \
-             shell; the pin is {}",
+            "confirm the new key with the server operator, then approve the prompt the \
+             PhoneConnect shell shows; the pin is {}",
             self.pin_path.display()
         )
     }

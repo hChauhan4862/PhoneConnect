@@ -110,7 +110,6 @@ export function createNativeHost(context: NativeHostContext): HostAdapter {
     },
 
     async trustTicketKey(
-      expectedCurrent: string,
       sessionId: string,
       capability: string,
     ): Promise<TrustTicketKeyResult> {
@@ -119,7 +118,7 @@ export function createNativeHost(context: NativeHostContext): HostAdapter {
         return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
       }
       try {
-        await bridge.trustTicketKey(expectedCurrent, sessionId, capability);
+        await bridge.trustTicketKey(sessionId, capability);
         return { status: "trusted" };
       } catch (error) {
         // The shell refuses a key that changed after the user looked; say so instead of

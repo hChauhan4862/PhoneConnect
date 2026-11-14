@@ -61,7 +61,7 @@ identityKey()                  // the shell's X25519 public key, for POST /api/s
 openEndpoint(request)          // establish/reuse a session, bind a port
 closeEndpoint(deviceId, stream)
 pendingTicketKey(sessionId, capability)  // show a rotation, never pin it
-trustTicketKey(expectedCurrent, sessionId, capability)  // pin after confirmation
+trustTicketKey(sessionId, capability)    // show the native dialog; pins only if the user approves
 ```
 
 `proxyCapabilities` is derived from what the endpoint manager is serving when the window is
@@ -130,10 +130,12 @@ supplies — so the shell pins that key itself instead of trusting the page:
   its key or the page presented a key the server does not use.
 - A rotation is never silently accepted. The server persists its signing key
   (`PHONECONNECT_TICKET_KEY_PATH`), so a restart does not rotate it; replacing that key does.
-  When it changes, the page (or the tray) shows `pendingTicketKey()` — old key, new key — and
-  only `trustTicketKey()` with the value the user confirmed replaces the pin. `trustTicketKey`
-  fetches again first and refuses (`RotationMoved`) if the server changed in between, so a
-  stale confirmation pins nothing.
+  When it changes, `pendingTicketKey()` gives the page the pinned and current keys so it can
+  explain the situation. Accepting is a native decision: `trustTicketKey()` shows a native
+  dialog with both keys, and only a human's approval pins the new value. The page can trigger
+  the prompt but cannot answer it — there is no parameter through which a script supplies the
+  confirmation. `trustTicketKey` fetches again after approval and refuses (`RotationMoved`) if
+  the server changed while the dialog was open, so a stale approval pins nothing.
 
 An endpoint disappears from `localEndpoints()` when it is closed, when its capability
 expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when the path fails: the

@@ -17,7 +17,9 @@ mod shell {
 
     use phoneconnect_native::endpoints::{EndpointManager, EndpointPolicy, OpenEndpointRequest};
     use phoneconnect_native::proxy::{LocalEndpoint, ProxyLimits};
-    use phoneconnect_native::trust::{PendingRotation, TicketTrust, default_pin_path};
+    use phoneconnect_native::trust::{
+        ConfirmationGate, PendingRotation, TicketTrust, TrustError, default_pin_path,
+    };
     use phoneconnect_native::web_shell::{
         self, NotificationInput, TrayStatus, bridge_script, capability_origins, host_context,
         host_context_script, is_same_origin, resolve_route, route_window_label, tray_tooltip,
@@ -27,6 +29,7 @@ mod shell {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     use tauri_plugin_notification::NotificationExt;
     use url::Url;
 
@@ -160,20 +163,49 @@ mod shell {
             .map_err(|error| error.to_string())
     }
 
-    /// Replaces the pinned key with the value the user confirmed. Nothing else writes a pin:
-    /// a rotation is never accepted automatically.
+    /// Asks the user to trust a new server key.
+    ///
+    /// The page can trigger this call, but only a native dialog can answer it: the decision
+    /// is a [`ConfirmationGate`] implemented here, not a value the page supplies.
     #[tauri::command]
     async fn trust_ticket_key(
+        app: AppHandle,
         state: State<'_, ShellState>,
-        expected_current: String,
         session_id: String,
         capability: String,
     ) -> Result<(), String> {
+        let gate = DialogConfirmationGate { app };
         state
             .trust
-            .accept_rotation(&expected_current, &session_id, &capability)
+            .accept_rotation(&gate, &session_id, &capability)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    /// Shows both keys and returns the human's answer.
+    struct DialogConfirmationGate {
+        app: AppHandle,
+    }
+
+    impl ConfirmationGate for DialogConfirmationGate {
+        fn confirm_rotation(&self, pinned: &str, current: &str) -> Result<bool, TrustError> {
+            // `blocking_show` must not run on the UI thread; Tauri async commands run on the
+            // async runtime, and this is a rare, explicit action.
+            Ok(self
+                .app
+                .dialog()
+                .message(format!(
+                    "The server's ticket verification key changed.\n\nPinned:\n{pinned}\n\n\
+                     New:\n{current}\n\nTrust the new key?"
+                ))
+                .title("Trust the new PhoneConnect key?")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Trust new key".to_owned(),
+                    "Cancel".to_owned(),
+                ))
+                .blocking_show())
+        }
     }
 
     /// The loopback endpoints currently exposed to the page.
@@ -202,6 +234,7 @@ mod shell {
 
         tauri::Builder::default()
             .plugin(tauri_plugin_notification::init())
+            .plugin(tauri_plugin_dialog::init())
             .manage(ShellState {
                 server_url,
                 endpoints,

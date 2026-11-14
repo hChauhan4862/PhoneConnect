@@ -72,9 +72,8 @@ export interface HostAdapter {
     sessionId: string,
     capability: string,
   ): Promise<TicketKeyRotationResult>;
-  /// Pins the key the user confirmed. Never called automatically.
+  /// Asks for a native confirmation and pins the key only if the user approves.
   trustTicketKey(
-    expectedCurrent: string,
     sessionId: string,
     capability: string,
   ): Promise<TrustTicketKeyResult>;

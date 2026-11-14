@@ -8,6 +8,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
 
@@ -19,6 +20,8 @@ pub const DEFAULT_TICKET_KEY_PATH: &str = "/data/ticket-signing-key";
 
 /// Bytes in an Ed25519 signing key.
 const KEY_LEN: usize = 32;
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningKeyError {
@@ -66,6 +69,7 @@ pub fn load_or_create(path: &Path) -> Result<SigningKey, SigningKeyError> {
 }
 
 fn read_key(path: &Path) -> Result<SigningKey, SigningKeyError> {
+    tighten_permissions(path)?;
     let contents = std::fs::read_to_string(path).map_err(|source| SigningKeyError::Read {
         path: path.to_path_buf(),
         source,
@@ -85,33 +89,28 @@ fn read_key(path: &Path) -> Result<SigningKey, SigningKeyError> {
 fn create_key(path: &Path) -> Result<SigningKey, SigningKeyError> {
     let mut secret = [0u8; KEY_LEN];
     getrandom::fill(&mut secret).map_err(|error| SigningKeyError::Random(error.to_string()))?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent).map_err(|source| SigningKeyError::Write {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
-        Ok(mut file) => {
-            let text = format!("{}\n", encode_hex(&secret));
-            file.write_all(text.as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|source| SigningKeyError::Write {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+    // Write a complete key to a private temporary file first, then publish it without
+    // overwriting. A crash can only leave the temporary behind, never a truncated key at the
+    // real path, and a racing process either publishes first or reads the winner's complete
+    // file.
+    let temporary = temporary_path(path);
+    write_secret(&temporary, &secret)?;
+    let published = std::fs::hard_link(&temporary, path);
+    let _ = std::fs::remove_file(&temporary);
+    match published {
+        Ok(()) => {
+            sync_directory(parent);
             Ok(SigningKey::from_bytes(&secret))
         }
-        // Another process won the race; use the key it created rather than replacing it.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_key(path),
         Err(source) => Err(SigningKeyError::Write {
             path: path.to_path_buf(),
@@ -119,6 +118,76 @@ fn create_key(path: &Path) -> Result<SigningKey, SigningKeyError> {
         }),
     }
 }
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    path.with_extension(format!("tmp-{}-{sequence}", std::process::id()))
+}
+
+fn write_secret(path: &Path, secret: &[u8; KEY_LEN]) -> Result<(), SigningKeyError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> io::Result<()> {
+        let mut file = options.open(path)?;
+        file.write_all(format!("{}\n", encode_hex(secret)).as_bytes())?;
+        file.sync_all()
+    })();
+    result.map_err(|source| {
+        let _ = std::fs::remove_file(path);
+        SigningKeyError::Write {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// On Unix, a key readable by group or others is tightened to `0600`.
+fn tighten_permissions(path: &Path) -> Result<(), SigningKeyError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|source| SigningKeyError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return Ok(());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| SigningKeyError::Write {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+        eprintln!(
+            "phoneconnect: tightened {} to 0600; it was readable by group or others",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Flushes the directory entry so a published key survives a crash.
+#[cfg(unix)]
+fn sync_directory(parent: Option<&Path>) {
+    if let Some(parent) = parent
+        && let Ok(directory) = std::fs::File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: Option<&Path>) {}
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -236,6 +305,95 @@ mod tests {
             std::fs::read_to_string(&path).expect("file"),
             "not-a-key\n",
             "the file is untouched"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn an_empty_key_file_is_not_a_valid_key() {
+        let directory = test_directory("signing-key-empty");
+        let path = directory.join("ticket-signing-key");
+        std::fs::write(&path, "").expect("write");
+        let error = load_or_create(&path).expect_err("an empty file is never a key");
+        assert!(
+            matches!(error, SigningKeyError::InvalidFormat { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file"),
+            "",
+            "the file is untouched"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn concurrent_creations_all_see_one_complete_key() {
+        let directory = test_directory("signing-key-race");
+        let path = directory.join("ticket-signing-key");
+        let keys: Vec<[u8; KEY_LEN]> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        load_or_create(&path)
+                            .expect("every creator or reader gets a key")
+                            .to_bytes()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+        assert!(
+            keys.iter().all(|key| *key == keys[0]),
+            "racing processes must agree on one key"
+        );
+        let contents = std::fs::read_to_string(&path).expect("key file");
+        assert_eq!(
+            contents.len(),
+            KEY_LEN * 2 + 1,
+            "only a complete hex key plus a newline is ever published: {contents:?}"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&directory)
+            .expect("directory")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ticket-signing-key".to_owned()],
+            "no temporary file is left behind"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_key_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = test_directory("signing-key-mode");
+        let path = directory.join("ticket-signing-key");
+        let created = encode_hex(&load_or_create(&path).expect("create").to_bytes());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let reloaded = encode_hex(&load_or_create(&path).expect("reload").to_bytes());
+        assert_eq!(reloaded, created, "the key itself is unchanged");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "a group/world readable key is tightened"
         );
         std::fs::remove_dir_all(&directory).ok();
     }
