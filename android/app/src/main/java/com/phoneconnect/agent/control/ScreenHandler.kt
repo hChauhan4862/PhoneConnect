@@ -26,8 +26,14 @@ interface ScreenCapture {
     /** True while a projection the user granted is held. */
     fun available(): Boolean
 
-    /** Installs a grant the user just made; a non-`RESULT_OK` result installs nothing. */
-    fun accept(resultCode: Int, data: Intent?)
+    /**
+     * Installs a grant the user just made; a non-`RESULT_OK` result installs nothing.
+     *
+     * [onEnded] runs when the projection ends without the app asking (the user stopped
+     * sharing, the screen was locked, or the system ended the session), so the owner can stop
+     * showing capture as enabled.
+     */
+    fun accept(resultCode: Int, data: Intent?, onEnded: () -> Unit)
 
     /**
      * One frame, PNG-encoded to at most [maxEncodedBytes] of base64, within [timeoutMs].

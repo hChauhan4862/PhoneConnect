@@ -79,6 +79,17 @@ open class SetupActivity : Activity() {
                 }
             }
         }
+        // A projection can end while this screen is open (the user stops sharing from the
+        // system UI, or a rotation retires the grant), so the control follows the service's
+        // state instead of a value read once.
+        scope.launch {
+            ConnectionService.captureState().collectLatest { enabled ->
+                if (enabled != captureOn) {
+                    captureOn = enabled
+                    showCaptureState()
+                }
+            }
+        }
     }
 
     /**
@@ -126,6 +137,9 @@ open class SetupActivity : Activity() {
             captureStatusView.text = getString(R.string.setup_capture_not_granted)
             return
         }
+        // Record the user's grant before onResume runs: the service accepts the intent
+        // asynchronously, and the screen must not claim capture is off in that window.
+        ConnectionService.captureGranted()
         captureOn = true
         showCaptureState()
     }
@@ -136,6 +150,18 @@ open class SetupActivity : Activity() {
         )
         enableCaptureButton.isEnabled = !captureOn
         disableCaptureButton.isEnabled = captureOn
+    }
+
+    public override fun onResume() {
+        super.onResume()
+        // A projection can end from the system UI ("Stop sharing"), which this screen cannot
+        // observe directly; the service's mirror is the shared truth. The grant path records
+        // itself first, so this refresh cannot race the service's start.
+        val enabled = ConnectionService.screenCaptureEnabled()
+        if (enabled != captureOn) {
+            captureOn = enabled
+            showCaptureState()
+        }
     }
 
     override fun onDestroy() {

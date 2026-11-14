@@ -36,6 +36,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -107,7 +109,7 @@ open class ConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             screenCapture.release()
-            captureEnabled = false
+            captureEnded()
             stopConnection()
             stopSelf()
             return START_NOT_STICKY
@@ -124,14 +126,27 @@ open class ConnectionService : Service() {
 
         if (intent?.action == ACTION_REVOKE_CAPTURE) {
             screenCapture.release()
-            captureEnabled = false
+            captureEnded()
             enterForeground(runner, projection = false)
         }
         if (grant != null) {
-            screenCapture.accept(grant.resultCode, grant.data)
-            captureEnabled = screenCapture.available()
-            // A refused token means the type must not claim a projection we do not hold.
-            if (!captureEnabled) {
+            // The system can end the projection at any time ("Stop sharing", a lock screen);
+            // the screen must stop claiming capture is on when it does.
+            screenCapture.accept(grant.resultCode, grant.data) {
+                captureEnded()
+                // The mediaProjection type must not outlive the projection. The callback can
+                // arrive on the capture worker or the main looper; the service scope keeps the
+                // foreground update on the main thread, and a detached (stopping) service is
+                // never made foreground again.
+                serviceScope.launch {
+                    if (!detachedStatus) enterForeground(runner, projection = false)
+                }
+            }
+            if (screenCapture.available()) {
+                captureGranted()
+            } else {
+                // A refused token means the type must not claim a projection we do not hold.
+                captureEnded()
                 enterForeground(runner, projection = false)
             }
         }
@@ -151,7 +166,7 @@ open class ConnectionService : Service() {
         // A projection is a session, not a preference: it must not outlive the service that
         // declared the type it runs under.
         screenCapture.release()
-        captureEnabled = false
+        captureEnded()
         serviceScope.cancel()
         // A terminal status is deliberately left visible after the service stops.
         if (!detachedStatus) {
@@ -417,14 +432,26 @@ open class ConnectionService : Service() {
 
         /**
          * Whether this process currently holds a projection. A UI mirror only: the service
-         * updates it when a grant is accepted, revoked, or the service stops. Android cannot
-         * persist the grant, so after a restart this is false and a snapshot is
-         * `consent_required` again.
+         * updates it when a grant is accepted, revoked, the screen size changes, or the system
+         * ends the session. Android cannot persist the grant, so after a restart this is false
+         * and a snapshot is `consent_required` again.
          */
-        @Volatile
-        private var captureEnabled = false
+        private val captureEnabled = MutableStateFlow(false)
 
-        fun screenCaptureEnabled(): Boolean = captureEnabled
+        fun screenCaptureEnabled(): Boolean = captureEnabled.value
+
+        /** The setup screen observes this while it is visible; it never drives a command. */
+        fun captureState(): StateFlow<Boolean> = captureEnabled
+
+        /** The user granted capture; the service confirms or clears this when it installs it. */
+        internal fun captureGranted() {
+            captureEnabled.value = true
+        }
+
+        /** No projection is held any more: every path that ends one clears the mirror here. */
+        internal fun captureEnded() {
+            captureEnabled.value = false
+        }
 
         /**
          * Asks for the one service and reports a refusal instead of crashing. Android 12+

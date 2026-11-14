@@ -4,20 +4,12 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.PixelFormat
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
-import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Handler
-import android.os.HandlerThread
-import android.os.Looper
 import android.os.SystemClock
-import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 /** The display a projection mirrors: the surface size and density it must be created with. */
 data class ScreenMetrics(val widthPixels: Int, val heightPixels: Int, val densityDpi: Int) {
@@ -69,107 +61,73 @@ internal fun encodeWithinLimit(
 }
 
 /**
- * `screen.snapshot`'s platform half: one frame through `MediaProjection` + `VirtualDisplay` +
- * `ImageReader`, PNG-encoded and downscaled to fit the result budget.
+ * `screen.snapshot`'s platform half: one frame through `MediaProjection` + a mirrored surface,
+ * PNG-encoded and downscaled to fit the result budget.
  *
  * The projection is acquired only from a grant the user made on the setup screen. It is held
  * for the service lifetime: Android cannot persist a projection token across process death, and
  * a new grant would need another user action.
  *
- * One `VirtualDisplay` + `ImageReader` pair serves the whole grant. That is a platform
- * requirement, not a shortcut: from Android 14 a token may create one virtual display, and
- * calling `createVirtualDisplay` again after the display was released logs `Reusing token:
- * Throw exception due to invalid projection` and stops the projection, so a per-frame release
- * would make every capture after the first fail. The reader's listener keeps the newest frame,
- * so a capture of an unchanged screen does not wait for a change that will never come. The
- * display, the reader, the cached frame, and the projection are all released when the user
- * stops capture, the service ends, or the system ends the session — nothing outlives the grant.
+ * One mirror serves the whole grant. That is a platform requirement, not a shortcut: from
+ * Android 14 a token may create one virtual display, and calling `createVirtualDisplay` again
+ * after the display was released logs `Reusing token: Throw exception due to invalid
+ * projection` and stops the projection. A size change (rotation, fold, resolution change) ends
+ * the grant instead of reusing a mirror at the wrong size or cropping a frame to fit: the
+ * command answers `consent_required` with a message saying the screen size changed, and the user
+ * enables capture again. Everything is released on every stop path — user stop, service stop,
+ * system stop — on a teardown worker, never on the caller's thread.
  */
-class MediaProjectionScreenCapture(
+internal class MediaProjectionScreenCapture(
     private val context: Context,
     private val metrics: () -> ScreenMetrics = { ScreenMetrics.from(context) },
     private val clock: () -> Long = System::currentTimeMillis,
+    private val teardown: Executor = defaultTeardown(),
+    private val openSource: ((resultCode: Int, data: Intent, onEnded: () -> Unit) -> MirrorSource?)? = null,
 ) : ScreenCapture {
     private val lock = Any()
 
-    /** Serializes captures: one frame at a time, so the display and reader cannot be raced. */
+    /** Serializes captures: one frame at a time, so a mirror cannot be raced. */
     private val captureLock = Any()
 
-    private var projection: MediaProjection? = null
-    private var callback: MediaProjection.Callback? = null
-    private var display: VirtualDisplay? = null
-    private var reader: ImageReader? = null
-    private var frameThread: HandlerThread? = null
+    private var source: MirrorSource? = null
+    private var mirror: ScreenMirror? = null
+    private var endedCallback: (() -> Unit)? = null
 
-    /** The most recent frame the mirror produced, and when it was produced. */
-    private var latest: Image? = null
-    private var latestAtMs: Long = 0L
+    override fun available(): Boolean = synchronized(lock) { source != null }
 
-    override fun available(): Boolean = synchronized(lock) { projection != null }
-
-    override fun accept(resultCode: Int, data: Intent?) {
+    override fun accept(resultCode: Int, data: Intent?, onEnded: () -> Unit) {
         if (resultCode != Activity.RESULT_OK || data == null) return
-        val manager = context.getSystemService(MediaProjectionManager::class.java) ?: return
-        val acquired = try {
-            manager.getMediaProjection(resultCode, data)
+        val opened = try {
+            (openSource ?: ::openProductionSource)(resultCode, data, ::handleEnded)
         } catch (_: RuntimeException) {
             // A refused or already-consumed token installs nothing; the command says so.
             null
         } ?: return
-        val registered = object : MediaProjection.Callback() {
-            override fun onStop() {
-                // The user or the system ended the session. Forget the grant so the next
-                // command answers consent_required instead of reusing a dead projection.
-                synchronized(lock) {
-                    if (projection !== acquired) return
-                    projection = null
-                    callback = null
-                }
-                // Cleanup waits for an in-flight capture, which is itself bounded by the
-                // command budget, so nothing is left holding a dead projection.
-                releaseTransient()
-            }
-        }
-        try {
-            acquired.registerCallback(registered, Handler(Looper.getMainLooper()))
-        } catch (_: RuntimeException) {
-            // Older platforms do not require a callback; a capture still works without it.
-        }
+        // A new grant replaces the old one completely: its mirror and cached frame must not
+        // survive, or the new grant would return frozen frames.
         val previous = synchronized(lock) {
-            val old = projection
-            projection = acquired
-            callback = registered
-            old
+            val held = source to mirror
+            source = opened
+            mirror = null
+            endedCallback = onEnded
+            held
         }
-        stopQuietly(previous)
+        releaseLater(previous.first, previous.second)
     }
 
     override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame =
         synchronized(captureLock) {
-            val active = synchronized(lock) { projection }
+            val active = synchronized(lock) { source }
                 ?: throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             val screen = metrics()
             if (screen.widthPixels <= 0 || screen.heightPixels <= 0 || screen.densityDpi <= 0) {
                 throw CommandFailure("capture_failed", "the display size is not available")
             }
-            framesFor(active, screen)
-            awaitFirstFrame(timeoutMs)
-
+            val frames = mirrorFor(active, screen)
+            val frame = awaitFrame(frames, timeoutMs)
             try {
-                // Copy under the lock so the listener cannot close the image mid-copy;
-                // encoding (the expensive part) happens outside it.
-                val (bitmap, capturedAtMs) = synchronized(lock) {
-                    val image = latest ?: throw CommandFailure(
-                        "capture_timeout",
-                        "no frame arrived within ${timeoutMs.coerceAtLeast(1)} ms",
-                    )
-                    image.toBitmap(screen.widthPixels, screen.heightPixels) to latestAtMs
-                }
-                val encoded = encodeWithinLimit(
-                    screen.widthPixels,
-                    screen.heightPixels,
-                    maxEncodedBytes,
-                ) { width, height ->
+                val bitmap = frame.bitmap
+                val encoded = encodeWithinLimit(bitmap.width, bitmap.height, maxEncodedBytes) { width, height ->
                     val scaled = if (width == bitmap.width && height == bitmap.height) {
                         bitmap
                     } else {
@@ -177,7 +135,7 @@ class MediaProjectionScreenCapture(
                     }
                     scaled.toPng()
                 }
-                CapturedFrame(encoded.png, encoded.width, encoded.height, capturedAtMs)
+                CapturedFrame(encoded.png, encoded.width, encoded.height, frame.capturedAtMs)
             } catch (failure: CommandFailure) {
                 throw failure
             } catch (_: RuntimeException) {
@@ -186,102 +144,65 @@ class MediaProjectionScreenCapture(
         }
 
     override fun release() {
-        releaseTransient()
-        val held = synchronized(lock) {
-            val held = projection to callback
-            projection = null
-            callback = null
-            held
-        }
-        val (projection, callback) = held
-        if (callback != null && projection != null) {
-            try {
-                projection.unregisterCallback(callback)
-            } catch (_: RuntimeException) {
-                // Already unregistered.
-            }
-        }
-        stopQuietly(projection)
+        // An explicit release is not a system stop: every caller already reports the new state
+        // (`ConnectionService` clears the mirror on stop, revoke, and destroy), so only the
+        // resources are released here.
+        val (previousSource, previousMirror, _) = detach()
+        releaseLater(previousSource, previousMirror)
     }
 
     /**
-     * The one `VirtualDisplay` and `ImageReader` this grant may create, made on the first
-     * capture and reused afterwards (Android 14 refuses a second display for the same token).
-     * The listener keeps the newest frame so a later capture has one to return.
+     * The mirror for this grant, created once. A display cannot be resized and a token cannot
+     * create a second one, so a size change ends the grant rather than returning a frame at the
+     * wrong size.
      */
-    private fun framesFor(active: MediaProjection, screen: ScreenMetrics): ImageReader {
-        reader?.let { return it }
-        val frames = ImageReader.newInstance(
-            screen.widthPixels,
-            screen.heightPixels,
-            PixelFormat.RGBA_8888,
-            2,
-        )
-        val thread = HandlerThread(FRAME_THREAD_NAME).also { it.start() }
-        frames.setOnImageAvailableListener(frameListener, Handler(thread.looper))
-        val created = try {
-            active.createVirtualDisplay(
-                VIRTUAL_DISPLAY_NAME,
-                screen.widthPixels,
-                screen.heightPixels,
-                screen.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                frames.surface,
-                null,
-                null,
-            )
-        } catch (_: SecurityException) {
-            discard(frames, thread)
-            // The grant ended between the command and the display: say so, do not pretend.
-            synchronized(lock) {
-                projection = null
-                callback = null
+    private fun mirrorFor(active: MirrorSource, screen: ScreenMetrics): ScreenMirror {
+        val existing = synchronized(lock) { mirror }
+        if (existing != null) {
+            if (!existing.open) {
+                // The mirror was closed under us: the projection is over, not a size problem.
+                discardGrant()
+                throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             }
+            if (existing.width == screen.widthPixels && existing.height == screen.heightPixels) {
+                return existing
+            }
+            discardGrant()
+            throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, SIZE_CHANGED_MESSAGE)
+        }
+        val created = try {
+            active.open(screen)
+        } catch (_: SecurityException) {
+            discardGrant()
             throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
         } catch (_: RuntimeException) {
-            discard(frames, thread)
             throw CommandFailure("capture_failed", "the platform refused a virtual display")
         }
-        if (created == null) {
-            discard(frames, thread)
-            throw CommandFailure("capture_failed", "the platform refused a virtual display")
-        }
-        reader = frames
-        display = created
-        frameThread = thread
-        return frames
-    }
-
-    private val frameListener = ImageReader.OnImageAvailableListener { frames ->
-        val next = try {
-            frames.acquireLatestImage()
-        } catch (_: RuntimeException) {
-            null
-        } ?: return@OnImageAvailableListener
-        var previous: Image? = null
-        val stale = synchronized(lock) {
-            if (reader !== frames) {
-                true
+        val raced = synchronized(lock) {
+            // `handleEnded` may have cleared the source while the display was being created.
+            if (source === active) {
+                mirror = created
+                null
             } else {
-                previous = latest
-                latest = next
-                latestAtMs = clock()
-                false
+                created
             }
         }
-        if (stale) {
-            next.close()
-        } else {
-            previous?.close()
+        if (raced != null) {
+            raced.close()
+            throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
         }
+        return created
     }
 
-    /** Waits, bounded by [timeoutMs], for the mirror's first frame. */
-    private fun awaitFirstFrame(timeoutMs: Long) {
+    /** Waits, bounded by [timeoutMs], for a frame; a closed mirror stops the wait immediately. */
+    private fun awaitFrame(frames: ScreenMirror, timeoutMs: Long): MirrorFrame {
         val bounded = timeoutMs.coerceAtLeast(1)
         val deadline = SystemClock.elapsedRealtime() + bounded
         while (true) {
-            if (synchronized(lock) { latest != null }) return
+            frames.newestFrame()?.let { return it }
+            if (!frames.open) {
+                throw CommandFailure("capture_failed", "the projection ended before a frame arrived")
+            }
             if (SystemClock.elapsedRealtime() >= deadline) {
                 throw CommandFailure("capture_timeout", "no frame arrived within $bounded ms")
             }
@@ -289,77 +210,62 @@ class MediaProjectionScreenCapture(
         }
     }
 
-    /** Releases the display, reader, frame thread, and cached frame; safe when nothing is held. */
-    private fun releaseTransient() {
-        val frames = synchronized(captureLock) {
-            val held = reader
-            reader = null
-            held
+    /** The projection ended without the app asking: forget the grant and tell the owner. */
+    private fun handleEnded() {
+        val (held, ended) = synchronized(lock) {
+            val held = mirror
+            val ended = endedCallback
+            source = null
+            mirror = null
+            endedCallback = null
+            held to ended
         }
-        frames?.setOnImageAvailableListener(null, null)
-        val cached = synchronized(lock) {
-            val held = latest
-            latest = null
-            held
-        }
-        cached?.close()
-        val surface = synchronized(captureLock) {
-            val held = display
-            display = null
-            held
-        }
-        if (surface != null) {
-            try {
-                surface.release()
-            } catch (_: RuntimeException) {
-                // Already released.
-            }
-        }
-        if (frames != null) {
-            try {
-                frames.close()
-            } catch (_: RuntimeException) {
-                // Already closed.
-            }
-        }
-        val thread = synchronized(captureLock) {
-            val held = frameThread
-            frameThread = null
-            held
-        }
-        thread?.quitSafely()
+        // Not the caller's thread: `onStop` arrives on the main looper, and closing a mirror can
+        // wait on a capture that is already running.
+        releaseLater(null, held)
+        ended?.invoke()
     }
 
-    private fun discard(frames: ImageReader, thread: HandlerThread) {
-        frames.setOnImageAvailableListener(null, null)
-        try {
-            frames.close()
+    /** Drops the current grant because its mirror can no longer answer for this screen. */
+    private fun discardGrant() {
+        val (previousSource, previousMirror, ended) = detach()
+        releaseLater(previousSource, previousMirror)
+        ended?.invoke()
+    }
+
+    private fun detach(): Triple<MirrorSource?, ScreenMirror?, (() -> Unit)?> =
+        synchronized(lock) {
+            val held = Triple(source, mirror, endedCallback)
+            source = null
+            mirror = null
+            endedCallback = null
+            held
+        }
+
+    private fun releaseLater(source: MirrorSource?, mirror: ScreenMirror?) {
+        if (source == null && mirror == null) return
+        teardown.execute {
+            mirror?.close()
+            source?.stop()
+        }
+    }
+
+    private fun openProductionSource(
+        resultCode: Int,
+        data: Intent,
+        onEnded: () -> Unit,
+    ): MirrorSource? {
+        val manager = context.getSystemService(MediaProjectionManager::class.java) ?: return null
+        val projection = try {
+            manager.getMediaProjection(resultCode, data)
         } catch (_: RuntimeException) {
-            // Already closed.
-        }
-        thread.quitSafely()
-    }
-
-    private fun stopQuietly(target: MediaProjection?) {
-        if (target == null) return
-        try {
-            target.stop()
-        } catch (_: RuntimeException) {
-            // Already stopped.
-        }
-    }
-
-    private fun Image.toBitmap(width: Int, height: Int): Bitmap {
-        val plane = planes[0]
-        val rowPadding = plane.rowStride - plane.pixelStride * width
-        val paddedWidth = width + rowPadding / plane.pixelStride
-        val padded = createBitmap(paddedWidth, height)
-        // The cached image is read more than once, so its buffer is rewound first; a second
-        // copy from a consumed buffer fails with "Buffer not large enough for pixels".
-        val buffer = plane.buffer
-        buffer.rewind()
-        padded.copyPixelsFromBuffer(buffer)
-        return if (paddedWidth == width) padded else Bitmap.createBitmap(padded, 0, 0, width, height)
+            null
+        } ?: return null
+        return MediaProjectionMirrorSource(
+            projection = projection,
+            clock = clock,
+            onEnded = onEnded,
+        )
     }
 
     private fun Bitmap.toPng(): ByteArray {
@@ -372,10 +278,19 @@ class MediaProjectionScreenCapture(
         }
     }
 
-    private companion object {
-        const val VIRTUAL_DISPLAY_NAME = "PhoneConnect screen snapshot"
-        const val FRAME_THREAD_NAME = "pc-screen-frames"
-        const val FRAME_POLL_MS = 20L
+    companion object {
+        /** A screen size change cannot reuse the grant's one virtual display. */
+        const val SIZE_CHANGED_MESSAGE =
+            "the screen size changed since capture was enabled, so the projection cannot mirror " +
+                "it; enable screen capture again on the device"
+
+        /** How long a capture waits between checks for the first frame. */
+        const val FRAME_POLL_MS: Long = 20
+
+        private fun defaultTeardown(): Executor =
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "pc-screen-teardown").apply { isDaemon = true }
+            }
     }
 }
 

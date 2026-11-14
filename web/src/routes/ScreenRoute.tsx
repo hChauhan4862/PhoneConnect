@@ -80,6 +80,11 @@ export function ScreenRoute({ api, deviceId, userId, pollIntervalMs }: ScreenRou
         screen. Opening this page never prompts the device: without consent the answer is
         <code> consent_required</code>.
       </p>
+      <p className="muted">
+        The device returns its newest buffered frame, so a screen that has not changed can
+        return a frame older than this request; the capture time shown is the time that frame
+        was produced.
+      </p>
 
       <section className="panel" aria-labelledby="screen-heading">
         <h2 id="screen-heading">Screen snapshot</h2>

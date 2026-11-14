@@ -41,7 +41,7 @@ class ScreenHandlerTest {
 
         override fun available(): Boolean = granted
 
-        override fun accept(resultCode: Int, data: Intent?) = Unit
+        override fun accept(resultCode: Int, data: Intent?, onEnded: () -> Unit) = Unit
 
         override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame {
             captures += 1

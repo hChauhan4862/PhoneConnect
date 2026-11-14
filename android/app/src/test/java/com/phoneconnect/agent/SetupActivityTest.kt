@@ -20,6 +20,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -51,11 +52,13 @@ class SetupActivityTest {
         store = KeystoreEnrollmentStore(context, FakeCipher())
         context.getSharedPreferences(AgentSettings.PREFERENCES_NAME, Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences(AgentDiagnostics.PREFERENCES_NAME, Context.MODE_PRIVATE).edit().clear().commit()
+        ConnectionService.captureEnded()
     }
 
     @After
     fun tearDown() {
         Dispatchers.resetMain()
+        ConnectionService.captureEnded()
         runCatching { server.shutdown() }
     }
 
@@ -162,6 +165,49 @@ class SetupActivityTest {
         val status = activity.findViewById<TextView>(R.id.capture_status).text.toString()
         assertTrue("the screen must say capture is on, was '$status'", status.contains("enabled", ignoreCase = true))
         assertTrue("the screen must offer a way to stop it", activity.findViewById<Button>(R.id.disable_capture).isEnabled)
+        assertTrue(
+            "the grant must be visible to a later setup screen before the service confirms it",
+            ConnectionService.screenCaptureEnabled(),
+        )
+    }
+
+    @Test
+    fun `a projection that ends while the screen is open updates the control`() {
+        ConnectionService.captureGranted()
+        val activity = setupActivity()
+        assertFalse(activity.findViewById<Button>(R.id.enable_capture).isEnabled)
+
+        // The system ends sharing; nothing tells the activity directly, but the service's
+        // state does, so the only path back to consent reappears without a resume.
+        ConnectionService.captureEnded()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(
+            "the control must follow the service's state while the screen is open",
+            activity.findViewById<Button>(R.id.enable_capture).isEnabled,
+        )
+    }
+
+    @Test
+    fun `a system-ended projection offers Enable screen capture again`() {
+        ConnectionService.captureGranted()
+        val activity = setupActivity()
+        assertFalse(
+            "an enabled projection must not offer Enable",
+            activity.findViewById<Button>(R.id.enable_capture).isEnabled,
+        )
+
+        // The user ends sharing in the system UI; the service clears the mirror.
+        ConnectionService.captureEnded()
+        activity.onResume()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(
+            "the only path back to consent must be offered",
+            activity.findViewById<Button>(R.id.enable_capture).isEnabled,
+        )
+        val status = activity.findViewById<TextView>(R.id.capture_status).text.toString()
+        assertTrue("the screen must say capture is off, was '$status'", status.contains("off", ignoreCase = true))
     }
 
     @Test

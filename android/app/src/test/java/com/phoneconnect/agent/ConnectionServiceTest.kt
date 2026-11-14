@@ -54,6 +54,7 @@ class ConnectionServiceTest {
     fun tearDown() {
         Dispatchers.resetMain()
         TestConnectionService.clear()
+        ConnectionService.captureEnded()
         context.getSharedPreferences(AgentDiagnostics.PREFERENCES_NAME, Context.MODE_PRIVATE)
             .edit().clear().commit()
     }
@@ -331,7 +332,38 @@ class ConnectionServiceTest {
             types and ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION != 0 &&
                 types and ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE != 0,
         )
+        assertTrue(
+            "the setup screen must see the grant",
+            ConnectionService.screenCaptureEnabled(),
+        )
         assertEquals("a grant must not add a notification", 1, shadowOf(manager).size())
+    }
+
+    @Test
+    fun `a system-stopped projection clears the state the setup screen shows`() {
+        val capture = RecordingScreenCapture()
+        TestConnectionService.screenCapture = capture
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(ConnectionService.screenCaptureEnabled())
+
+        // "Stop sharing" in the system UI: the projection ends without an app intent.
+        capture.systemStop()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "a system stop must clear the state the setup screen reads",
+            false,
+            ConnectionService.screenCaptureEnabled(),
+        )
+        assertEquals(
+            "the media projection type must not outlive the projection",
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            controller.get().foregroundServiceType,
+        )
+        assertEquals("a system stop must not add a notification", 1, shadowOf(manager).size())
     }
 
     @Test
@@ -497,14 +529,23 @@ class ConnectionServiceTest {
         var released = false
             private set
         var onAccept: () -> Unit = {}
+        private var ended: (() -> Unit)? = null
 
         override fun available(): Boolean = granted
 
-        override fun accept(resultCode: Int, data: Intent?) {
+        override fun accept(resultCode: Int, data: Intent?, onEnded: () -> Unit) {
             if (resultCode != android.app.Activity.RESULT_OK || data == null) return
             accepted = true
             granted = true
+            ended = onEnded
             onAccept()
+        }
+
+        /** The system ended the projection ("Stop sharing", a lock screen). */
+        fun systemStop() {
+            if (!granted) return
+            granted = false
+            ended?.invoke()
         }
 
         override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame =

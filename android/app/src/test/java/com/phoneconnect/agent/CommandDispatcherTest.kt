@@ -195,7 +195,7 @@ class CommandDispatcherTest {
         val capture = object : ScreenCapture {
             override fun available() = true
 
-            override fun accept(resultCode: Int, data: android.content.Intent?) = Unit
+            override fun accept(resultCode: Int, data: android.content.Intent?, onEnded: () -> Unit) = Unit
 
             override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame {
                 seenTimeout = timeoutMs

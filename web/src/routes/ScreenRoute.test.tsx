@@ -71,6 +71,8 @@ describe("the screen route", () => {
     expect(screen.getByText(new RegExp(String(NOW)))).toBeInTheDocument();
     expect(screen.getByText(/1080 × 1920/)).toBeInTheDocument();
     expect(api.captureScreen).toHaveBeenCalledWith("dev_1", "owner-1");
+    // The page says the frame may be older than the request, so the timestamp is honest.
+    expect(screen.getByText(/newest buffered frame/i)).toBeInTheDocument();
   });
 
   it("renders consent_required as an alert with its code, never as an image", async () => {
