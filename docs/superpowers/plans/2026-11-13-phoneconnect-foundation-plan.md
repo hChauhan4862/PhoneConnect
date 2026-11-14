@@ -149,8 +149,8 @@
 - [ ] **Step 2: Run `./gradlew :app:testDebugUnitTest`** and confirm failure.
 - [ ] **Step 3: Implement the foreground service** with one persistent notification, boot/network recovery hooks, cancellation-safe coroutine scopes, and bounded reconnect.
 - [ ] **Step 4: Implement enrollment persistence** using Android Keystore-backed encryption and clear revocation/unenrollment behavior.
-- [ ] **Step 5: Implement the Android transport adapter** against the shared envelope contract; map server revocation to immediate stream closure.
-- [ ] **Step 6: Run unit tests and an emulator instrumentation smoke test**; expect one notification channel/ID and recovery after force-stop/start, with OEM-kill limitations reported rather than hidden.
+- [ ] **Step 5: Implement the Android transport and enrollment path** — port the sealed channel (X25519 + HKDF + ChaCha20-Poly1305, per-direction counters, replay window) from `crates/transport`, add the relay WebSocket client, a `SessionRunner` that establishes a live session, an enrollment HTTP client, and a minimal setup activity that enrolls the device and requests `POST_NOTIFICATIONS`. The service must be able to reach `Connected`, not only `ActionRequired`; map server revocation to immediate stream closure.
+- [ ] **Step 6: Run unit tests, build the APK, and run the emulator instrumentation smoke test where an emulator exists**; expect one notification channel/ID and recovery after force-stop/start, with OEM-kill limitations reported rather than hidden. If no emulator/device is available, record the step as unverified with the reason instead of omitting it.
 - [ ] **Step 7: Commit** with `git add android && git commit -m "feat: add resilient Android connection service"`.
 
 ### Task 5: Control leases, telemetry, and shared web UI host adapter
@@ -169,6 +169,8 @@
 - Create: `PhoneConnect/web/src/App.tsx`
 - Create: `PhoneConnect/web/src/App.test.tsx`
 - Create: `PhoneConnect/web/src/host/HostAdapter.test.ts`
+- Create: `PhoneConnect/server/src/web.rs`
+- Create: `PhoneConnect/server/tests/web.rs`
 
 **Interfaces:**
 - `LeaseStore.acquire(device_id, user_id, expires_at) -> ControlLease` succeeds only
@@ -198,8 +200,9 @@
 - [ ] **Step 5: Implement telemetry aggregation** without persisting raw high-rate samples or files/media.
 - [ ] **Step 6: Implement `HostAdapter` and its two implementations**; tests must prove a screen renders and works with `browserHost`, degrades native-only controls to in-page equivalents, and calls `openView(..., {detached:true})` exactly once under `nativeHost`.
 - [ ] **Step 7: Implement the minimal status UI** and test that it renders direct/relay state, active lease, stale telemetry, and errors without success-shaped fallbacks; the same component tree must pass under both adapters.
-- [ ] **Step 8: Run server and web tests** and confirm all pass.
-- [ ] **Step 9: Commit** with `git add server web && git commit -m "feat: add leases telemetry and shared web UI host adapter"`.
+- [ ] **Step 8: Serve the built web UI from the server** at `/` with SPA fallback and a strict CSP, so the browser and the native shell load the identical URL; tests must prove a deep route returns the SPA document, an unknown API path returns 404 (not the SPA), and assets are served with the right content type. A native shell must be able to load `<server>/` unchanged.
+- [ ] **Step 9: Run server and web tests** and confirm all pass.
+- [ ] **Step 10: Commit** with `git add server web && git commit -m "feat: add leases telemetry and shared web UI host adapter"`.
 
 ### Task 6: Native shell embedding the shared web UI and localhost proxy
 
