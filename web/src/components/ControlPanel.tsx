@@ -75,7 +75,7 @@ export interface ControlPanelProps {
 
 export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlPanelProps) {
   const [readings, setReadings] = useState<ControlReadingsOutput | null>(null);
-  const [readFailure, setReadFailure] = useState<Failure | null>(null);
+  const [readFailure, setReadFailure] = useState<FailureOutcome | null>(null);
   const [loading, setLoading] = useState(true);
   const [reloadNonce, setReloadNonce] = useState(0);
 
@@ -97,10 +97,25 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
 
   /// Reads `control.get`. A non-`ok` answer or a malformed map is a failure with no readings:
   /// the panel never keeps an older map looking current or invents one.
+  ///
+  /// The read crosses the same acceptance boundary as a change, so it applies the same rule: a
+  /// refusal of the POST is an ordinary "did not read that", while a code that arrives after the
+  /// 202 — or a map the panel cannot read — may describe a device that answered after the answer
+  /// was lost, and must not be reported as a refusal.
   const read = useCallback(
     async (isActive: () => boolean): Promise<ControlReadingsOutput | null> => {
+      let accepted: CommandAccepted;
       try {
-        const accepted = await api.controlReadings(deviceId, userId);
+        accepted = await api.controlReadings(deviceId, userId);
+      } catch (error) {
+        // Nothing was dispatched, so this is the ordinary refusal it looks like.
+        if (isActive()) {
+          setReadings(null);
+          setReadFailure(outcomeOf(failureOfError(error), false));
+        }
+        return null;
+      }
+      try {
         const command = await pollCommand(api, userId, accepted.command_id, {
           pollIntervalMs,
           isActive,
@@ -110,25 +125,29 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
           // A failed read leaves no map at all: the previous one is not the device's current
           // answer, so it must not keep looking current.
           setReadings(null);
-          setReadFailure(failureOfCommand(command));
+          setReadFailure(outcomeOf(failureOfCommand(command), true));
           return null;
         }
         const parsed = readReadings(command.output);
         if (!parsed) {
+          // The device answered `ok`, so it read something; its answer just cannot be read here.
           setReadings(null);
-          setReadFailure({
-            code: "invalid_result",
-            message: "the device's answer is not a control reading map",
-          });
+          setReadFailure(
+            unknownOutcome({
+              code: "invalid_result",
+              message: "the device's answer is not a control reading map",
+            }),
+          );
           return null;
         }
         setReadings(parsed);
         setReadFailure(null);
         return parsed;
       } catch (error) {
+        // Accepted, then the poll failed: the answer was lost, never refused.
         if (isActive()) {
           setReadings(null);
-          setReadFailure(failureOfError(error));
+          setReadFailure(unknownOutcome(failureOfError(error)));
         }
         return null;
       }
@@ -240,7 +259,9 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         </button>
       </div>
 
-      {readFailure ? <FailureNotice failure={readFailure} /> : null}
+      {readFailure ? (
+        <FailureNotice failure={readFailure.failure} lead={readFailure.lead} />
+      ) : null}
       {loading && !readFailure ? <p>Loading device control…</p> : null}
       {!readFailure && readings ? (
         <ul className="control-readings" aria-label="Control readings">

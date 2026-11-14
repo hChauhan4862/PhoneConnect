@@ -494,6 +494,36 @@ describe("the control panel", () => {
     expect(alert).toHaveTextContent("invalid_result");
   });
 
+  it("treats an accepted control.get that ends in device_offline as unknown", async () => {
+    const api = fakeApi([
+      command({ status: "error", output: null, error: "device_offline", message: null }),
+    ]);
+    renderPanel(api);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The read was accepted, so the channel dropped after dispatch: the panel may have been
+    // answered, and must not claim the device refused to read.
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    expect(screen.queryByRole("list", { name: /control readings/i })).not.toBeInTheDocument();
+  });
+
+  it("keeps the refusal lead when the control.get POST itself was refused", async () => {
+    const api = fakeApi([]);
+    api.controlReadings = vi.fn(async () => {
+      throw new ApiError(409, "device_offline");
+    });
+    renderPanel(api);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // Nothing was dispatched, so this really is "did not do that".
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+    expect(api.command, "nothing was dispatched, so nothing is polled").not.toHaveBeenCalled();
+  });
+
   it("reports a failed read with the machine code and never a fabricated map", async () => {
     const api = fakeApi([
       command({ status: "error", output: null, error: "not_permitted", message: "nope" }),
