@@ -110,6 +110,18 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
       reason: "revoked" as const,
       invalidated_sessions: [],
     })),
+    dispatchCommand: vi.fn(async () => ({ command_id: "cmd_1" })),
+    command: vi.fn(async () => ({
+      command_id: "cmd_1",
+      device_id: "dev_1",
+      name: "device.info",
+      status: "pending" as const,
+      output: null,
+      error: null,
+      message: null,
+      created_at_ms: NOW,
+      completed_at_ms: null,
+    })),
   };
 }
 
@@ -516,6 +528,24 @@ describe("the lease surface", () => {
     await waitFor(() => expect(api.revokeLease).toHaveBeenCalledTimes(1));
     expect(api.revokeLease).toHaveBeenCalledWith("lease_1", "owner-1");
     expect(await screen.findByText("No active controller")).toBeInTheDocument();
+  });
+});
+
+describe("the command console route", () => {
+  it("renders the command panel at the device's commands path", async () => {
+    installHost("browser");
+    const api = createFakeApi(statusFixture());
+    renderApp(api, "/devices/dev_1/commands");
+
+    expect(
+      await screen.findByRole("heading", { name: /^commands$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /run command/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /back to status/i }),
+    ).toHaveAttribute("href", "/devices/dev_1");
   });
 });
 

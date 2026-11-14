@@ -7,6 +7,7 @@ import { LeasePanel } from "../components/LeasePanel";
 import { RouteLink } from "../components/RouteLink";
 import { SessionPanel } from "../components/SessionPanel";
 import { TelemetryPanel } from "../components/TelemetryPanel";
+import { commandsPath } from "../routing";
 
 export function DeviceStatusRoute({
   api,
@@ -60,6 +61,11 @@ export function DeviceStatusRoute({
         onChanged={resource.reload}
       />
       <TelemetryPanel telemetry={status.telemetry} />
+      <p>
+        <RouteLink to={commandsPath(status.device.device_id)}>
+          Open the command console
+        </RouteLink>
+      </p>
       <HostActions deviceId={status.device.device_id} />
     </>
   );

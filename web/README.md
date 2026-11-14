@@ -6,7 +6,8 @@ loads that same URL in a webview; screens are never forked per host.
 **The UI is not live.** There is no server-to-client push channel yet: a screen renders the
 snapshot it last read, so another user's handoff, a lease revocation, a new session, or a
 fresh telemetry report appears only after a refresh. The status and telemetry screens say
-this next to their refresh controls, and no screen claims otherwise.
+this next to their refresh controls, and no screen claims otherwise. The command console
+polls the dispatched command until the device answers; it never infers a result.
 
 **Leases are not yet an authentication boundary.** Access uses the admin bearer token and an
 asserted user id; the lease rules constrain what an accepted user may do, but they do not
@@ -26,17 +27,21 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/App.tsx` — the shell: selects one host adapter, holds the session, and renders the
   current route. It contains no screen logic.
 - `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
-  `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry). The
-  server's SPA fallback serves the same document for each, so a reload or deep link works.
+  `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry), and
+  `/devices/:id/commands` (the command console). The server's SPA fallback serves the same
+  document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
   fallback and no second domain model. The client is same-origin, so the native shell's
   embedded page makes exactly the calls a browser makes.
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
-  `DeviceStatusRoute`, `TelemetryRoute`, `NotFoundRoute`.
-- `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface) and
-  `TelemetryPanel` (bounded aggregates and explicit freshness). `LeasePanel` offers revoke and
+  `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `NotFoundRoute`.
+- `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
+  `TelemetryPanel` (bounded aggregates and explicit freshness), and `CommandPanel` (dispatch
+  and poll). `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
+  `ok` shows output, and a refused dispatch (`device_offline`, `device_revoked`,
+  `lease_read_only`) is an alert, never a pending row that looks like it is working. `LeasePanel` offers revoke and
   handoff to the owner *or* the holder, because the server lets the owner revoke a lease they
   do not hold; "Read-only access" is reserved for a user who is neither. `SessionPanel` also
   shows the server's `control_refusals` count, so a refused control attempt on a read-only

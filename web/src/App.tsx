@@ -7,6 +7,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { createHttpApi, type ApiClient } from "./api";
 import { AccessGateRoute } from "./routes/AccessGateRoute";
+import { CommandsRoute } from "./routes/CommandsRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
 import { DeviceStatusRoute } from "./routes/DeviceStatusRoute";
 import { TelemetryRoute } from "./routes/TelemetryRoute";
@@ -98,6 +99,13 @@ function AuthenticatedShell({
       ) : null}
       {route.name === "telemetry" ? (
         <TelemetryRoute
+          api={api}
+          deviceId={route.deviceId}
+          userId={session.userId}
+        />
+      ) : null}
+      {route.name === "commands" ? (
+        <CommandsRoute
           api={api}
           deviceId={route.deviceId}
           userId={session.userId}

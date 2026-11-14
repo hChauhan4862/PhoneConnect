@@ -104,6 +104,26 @@ export interface DeviceStatus {
   telemetry: TelemetryView;
 }
 
+/// One dispatched command. `pending` is the only non-terminal state, and only `ok` carries
+/// output: a failed or timed-out command never looks like a success.
+export type CommandStatus = "pending" | "ok" | "error" | "timeout";
+
+export interface CommandView {
+  command_id: string;
+  device_id: string;
+  name: string;
+  status: CommandStatus;
+  output: unknown;
+  error: string | null;
+  message: string | null;
+  created_at_ms: number;
+  completed_at_ms: number | null;
+}
+
+export interface CommandAccepted {
+  command_id: string;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -128,6 +148,16 @@ export interface ApiClient {
     toUserId: string,
   ): Promise<LeaseHandoff>;
   revokeLease(leaseId: string, actorId: string): Promise<RevocationEvent>;
+  /// Dispatches one management command. The actor is the server's `user_id`: the admin
+  /// token carries no identity of its own.
+  dispatchCommand(
+    deviceId: string,
+    userId: string,
+    name: string,
+    args?: unknown,
+    timeoutMs?: number | null,
+  ): Promise<CommandAccepted>;
+  command(commandId: string, userId: string): Promise<CommandView>;
 }
 
 /// A refusal that names the status and stable machine code the server returned. A transport
@@ -202,6 +232,17 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
         "POST",
         `/api/leases/${encodeURIComponent(leaseId)}/revoke`,
         { actor_id: actorId },
+      ),
+    dispatchCommand: (deviceId, userId, name, args, timeoutMs) =>
+      request<CommandAccepted>(
+        "POST",
+        `/api/devices/${encodeURIComponent(deviceId)}/commands?user_id=${encodeURIComponent(userId)}`,
+        { name, args: args ?? null, timeout_ms: timeoutMs ?? null },
+      ),
+    command: (commandId, userId) =>
+      request<CommandView>(
+        "GET",
+        `/api/commands/${encodeURIComponent(commandId)}?user_id=${encodeURIComponent(userId)}`,
       ),
   };
 }
