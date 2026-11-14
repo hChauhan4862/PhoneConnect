@@ -313,9 +313,11 @@ and one channel; the extra type changes nothing the user sees.
 - **The capability matrix matches the code.** `CapabilityMatrixTest` compares
   `CommandDispatcher.COMMANDS`, the command constants in `CommandDispatcher.kt`, and the table
   in `../docs/capabilities.md`, and fails when they disagree in either direction — a command
-  the code registers but the document omits, or a row the code does not implement. It also
-  fails when a token in `CommandReasons.tokens` is not named in the table, so a new refusal
-  reason cannot reach a caller without a place to look it up.
+  the code registers but the document omits, or a row the code does not implement. On the
+  token side it checks the table against `CommandReasons.tokens`, checks that list against the
+  constants `CommandReasons.kt` declares (a constant omitted from the list fails), and scans
+  `src/main/java` for a `CommandFailure("…")` literal outside the list — so a new refusal
+  cannot reach a caller without a place to look it up.
 
 ## Best-effort persistence
 
@@ -341,8 +343,9 @@ still stop the agent. The notification and setup screen say so and show recovery
   music volume, and the Do Not Disturb filter with policy access) and refuses the rest; Wi-Fi,
   Bluetooth, mobile data, night mode, and the rotation lock stay with the system UI. File
   transfers stay inside the app's own external files directory: shared storage at large needs
-  a scoped-storage design of its own and is not offered. CPU percentage is reported as `null`:
-  Android does not expose per-app CPU counters to an ordinary app.
+  a scoped-storage design of its own and is not offered. CPU percentage is omitted from the
+  sample — `cpu_percent` is never present — because Android does not expose per-app CPU counters
+  to an ordinary app.
 - **Screen capture is one frame, not a stream.** There is no mirroring, no continuous encoder,
   and no input injection. A capture needs the grant the user made from the setup screen; the
   grant does not survive a process restart, and the setup screen says so.

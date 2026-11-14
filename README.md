@@ -113,8 +113,10 @@ emulator, by a unit test only, or not at all.
   leases, retention, the audit surface and its 30-day deletion, and the sealed-frame
   compatibility vectors. Direct hole-punched paths are
   implemented and tested in the Rust transport.
-- **Web UI.** Routes, panels, and API errors are covered by Vitest. The control, file, app,
-  screen, and console screens were driven against the emulator in a browser. The audit screen
+- **Web UI.** Routes, panels, and API errors are covered by Vitest. The control panel was
+  driven against the emulator in a real desktop browser. The file, app, screen, and console
+  screens have component tests and the served SPA answers their routes, but no run has driven
+  them against a live device in a real desktop browser. The audit screen
   (newest-first rows, a server-side device filter, and explicit empty and error states) is
   covered by Vitest only; it was not driven against a live server in a browser. There is no
   server-to-client push, so every screen renders the snapshot it last read.
@@ -126,7 +128,9 @@ dispatch.
 
 ## Not implemented
 
-None of this exists in code. It is not a roadmap promise; it is what a reader must not assume.
+None of the capabilities below exists in code. The last bullet is the exception: it names a
+verification gap, not a missing feature. This is not a roadmap promise; it is what a reader must
+not assume.
 
 - **Mirroring and input.** No continuous screen stream, no video encode, and no touch or key
   injection. `screen.snapshot` is one frame per command.
@@ -142,13 +146,19 @@ None of this exists in code. It is not a roadmap promise; it is what a reader mu
 - **Direct hole-punched paths on Android.** The Rust transport implements and tests them; the
   Android agent always uses the relay, and it does not verify ticket signatures (TLS to the hub
   is its trust anchor).
-- **CI publishing.** There is no CI pipeline and there are no signed release artifacts: no
-  container image, APK, or native installer is published.
+- **Signed release publishing.** CI exists: `.github/workflows/ci.yml` runs Rust clippy and
+  tests, the web typecheck, lint, tests, and build, the Android unit tests, lint, and debug
+  APK, and a Docker image build on every push to `main` and every pull request. Nothing is
+  *published*: there is no signed release artifact, no APK or native installer release, and
+  no GHCR image push.
 - **Windows and Linux native builds.** Only macOS has been built here.
 - **Device control of Wi-Fi, Bluetooth, mobile data, rotation, night mode, or reboot.** These are
   refusals, not features: an ordinary installed app cannot hold the signature-level permissions
   or the system-UI role they need. ADB is not implemented, exposed, or tunnelled either; the
   agent is not a shell.
+- **The file, app, screen, and console screens in a real desktop browser.** They are covered by
+  component tests and the served SPA answers their routes, but no run has driven them against a
+  live device in a real desktop browser; only the control panel has been.
 
 ## License
 

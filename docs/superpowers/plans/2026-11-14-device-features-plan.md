@@ -210,7 +210,9 @@ run all suites, commit.
 3. Calls/SMS/notifications records and device history + CSV.
 4. Accounts: local login, MFA, device assignments, per-user visibility; replaces the admin token.
 5. Agent OTA with signed manifests and a release channel.
-6. CI (Rust + Android + web + Docker) and signed release publishing (GHCR image, APK, native installers).
+6. Signed release publishing (GHCR image push, signed APK, native installers). CI itself exists
+   (`.github/workflows/ci.yml`: Rust clippy and tests, web typecheck/lint/tests/build, Android
+   unit tests/lint/APK artifact, Docker build); only the publishing half is future work.
 7. Direct hole-punched paths on Android and the Android TCP proxy bridge.
 
 ## Verification gate

@@ -78,7 +78,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/console/shell?user_id=` | admin | Forwards `shell.exec`; the body must be an object or `null`. The device always answers `not_permitted`: a shell needs the ADB/root UID. |
 | `POST` | `/api/devices/{id}/console/logcat?user_id=` | admin | Forwards `logcat.tail`; the body must be an object or `null`. The device always answers `not_permitted`: `READ_LOGS` is signature-level. |
 | `POST` | `/api/devices/{id}/control/get?user_id=` | admin | Forwards `control.get` with no arguments; the body must be an object or `null`. The device reports each reading or `null` plus its constant reason in `unavailable`, and names every key it refuses to change. |
-| `POST` | `/api/devices/{id}/control/set?user_id=` | admin | Forwards `control.set`; body is `{key, value}` where `value` is an integer or a boolean (at most 32 bytes of key; no NUL). The device owns the ranges and answers `invalid_args`, `not_permitted` with a machine reason, or `not_applied`; a `not_permitted` message is the reason token, kept verbatim. |
+| `POST` | `/api/devices/{id}/control/set?user_id=` | admin | Forwards `control.set`; body is `{key, value}` where `value` is an integer or a boolean (at most 32 bytes of key; no NUL). The device owns the ranges and answers `invalid_args`, `not_permitted` with a machine reason, `not_applied`, or `unconfirmed`, with `platform_read_failed` when it cannot read the stream max; every reason token or message arrives verbatim. |
 | `POST` | `/api/devices/{id}/control/reboot?user_id=` | admin | Forwards `control.reboot`; the body must be an object or `null`. The device always answers `not_permitted` / `reboot_requires_privilege`: `REBOOT` is signature-level. |
 
 The file routes are commands with a typed front door: the same authorization, capacity,
@@ -122,8 +122,9 @@ The control routes follow the same pattern and keep the same honesty:
   NUL-containing, or over-32-byte key, or a value that is neither an integer nor a boolean
   (`400 invalid_request`) — and forwards `{key, value}` verbatim. The device decides the range
   (`invalid_args`), whether a grant is missing (`not_permitted` with `write_settings_required`
-  or `policy_access_required`), and whether a write stuck (`not_applied`). Every code and
-  reason message arrives verbatim.
+  or `policy_access_required`), whether a write stuck (`not_applied`), and whether the device
+  could confirm it (`unconfirmed`); a volume stream whose max it cannot read is
+  `platform_read_failed`. Every code and reason message arrives verbatim.
 - `control/reboot` is forwarded so the device's constant `not_permitted` /
   `reboot_requires_privilege` reaches the caller instead of `unknown_command`. The server has no
   reboot path of its own.

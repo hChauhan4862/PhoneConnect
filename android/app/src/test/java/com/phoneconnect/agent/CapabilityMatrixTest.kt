@@ -43,10 +43,11 @@ import java.io.File
  * refusal token the handlers can answer with but the document never names is a refusal a reader
  * cannot look up.
  *
- * The inputs are the registered command list, the command constants in the dispatcher, the
- * token list the handlers draw from, and the document itself. The document is read relative to
- * this module (`android/app`), which is the Gradle test working directory, so the same path
- * resolves locally and in CI.
+ * The inputs are the registered command list, the command constants in the dispatcher, the token
+ * constants `CommandReasons.kt` declares, the failure-code literals anywhere in the main
+ * sources, and the document itself. The document is read relative to this module
+ * (`android/app`), which is the Gradle test working directory, so the same path resolves
+ * locally and in CI.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -57,6 +58,9 @@ class CapabilityMatrixTest {
     private val document = File("../..", "docs/capabilities.md")
     private val dispatcherSource =
         File("src/main/java/com/phoneconnect/agent/control/CommandDispatcher.kt")
+    private val reasonsSource =
+        File("src/main/java/com/phoneconnect/agent/control/CommandReasons.kt")
+    private val mainSources = File("src/main/java")
 
     /** The first cell of a table row that names one command, e.g. ``| `device.info` | … |``. */
     private val commandRow = Regex("""^\|\s*`([a-z][a-z_]*\.[a-z][a-z_]*)`\s*\|""")
@@ -64,7 +68,13 @@ class CapabilityMatrixTest {
     /** Any backticked machine token, e.g. `` `write_settings_required` ``. */
     private val backtickedToken = Regex("""`([a-z][a-z0-9_]*)`""")
 
-    private val constant = Regex("""const val [A-Z_]+ = "([^"]+)"""")
+    private val commandConstant = Regex("""const val [A-Z_0-9]+ = "([^"]+)"""")
+
+    /** A token constant in `CommandReasons.kt`, whatever its value. */
+    private val reasonConstant = Regex("""const val [A-Z_0-9]+ = "([a-z0-9_]+)"""")
+
+    /** A failure code written as a literal instead of read from `CommandReasons`. */
+    private val failureLiteral = Regex("""CommandFailure\(\s*"([a-z0-9_]+)"""")
 
     @Test
     fun `the capability document lists exactly the commands this build registers`() {
@@ -111,8 +121,40 @@ class CapabilityMatrixTest {
     }
 
     @Test
+    fun `the token list is exactly the constants CommandReasons declares`() {
+        val declared = reasonConstant.findAll(reasonsSource.readText())
+            .map { match -> match.groupValues[1] }
+            .toSet()
+
+        assertEquals(
+            "a constant missing from CommandReasons.tokens would escape the matrix",
+            declared.sorted(),
+            CommandReasons.tokens.sorted(),
+        )
+    }
+
+    @Test
+    fun `no handler builds a failure code from a literal outside the token list`() {
+        val literals = mainSources.walkTopDown()
+            .filter { file -> file.isFile && file.extension == "kt" }
+            .flatMap { file ->
+                failureLiteral.findAll(file.readText())
+                    .map { match -> "${file.name}: ${match.groupValues[1]}" }
+            }
+            .toList()
+        val outside = literals.filter { entry ->
+            entry.substringAfter(": ") !in CommandReasons.tokens
+        }
+
+        assertTrue(
+            "CommandFailure(\"…\") literals must come from CommandReasons.tokens; outside: $outside",
+            outside.isEmpty(),
+        )
+    }
+
+    @Test
     fun `every command constant is on the registered list`() {
-        val declared = constant.findAll(dispatcherSource.readText())
+        val declared = commandConstant.findAll(dispatcherSource.readText())
             .map { match -> match.groupValues[1] }
             .toSet()
 
