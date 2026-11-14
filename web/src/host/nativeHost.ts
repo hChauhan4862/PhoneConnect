@@ -3,16 +3,41 @@
 /// provides none still gets a working page.
 
 import { navigate } from "../routing";
-import type { HostAdapter } from "./HostAdapter";
+import type {
+  CloseEndpointResult,
+  EndpointCapability,
+  HostAdapter,
+  OpenEndpointResult,
+} from "./HostAdapter";
 import {
   readHostBridge,
   type LocalEndpoint,
+  type NativeHostBridge,
   type NativeHostContext,
+  type ProxyEndpointRequest,
 } from "./hostContext";
+
+const ENDPOINTS_UNAVAILABLE =
+  "This native shell does not expose loopback endpoints.";
+
+/// A native host can expose endpoints only when the shell installed all three commands.
+function endpointCapability(
+  bridge: NativeHostBridge | undefined,
+): EndpointCapability {
+  return bridge?.identityKey && bridge.openEndpoint && bridge.closeEndpoint
+    ? { available: true }
+    : { available: false, reason: ENDPOINTS_UNAVAILABLE };
+}
 
 export function createNativeHost(context: NativeHostContext): HostAdapter {
   return {
     kind: "native",
+
+    // Read at call time like every other bridge capability, so a shell that installs the
+    // bridge late is still honored.
+    get endpoints(): EndpointCapability {
+      return endpointCapability(readHostBridge());
+    },
 
     // A detached view is a separate OS window; an attached one is the embedded webview.
     // Without a bridge this degrades to in-page navigation, never to a dead control.
@@ -39,6 +64,33 @@ export function createNativeHost(context: NativeHostContext): HostAdapter {
 
     async notify(input): Promise<void> {
       await readHostBridge()?.notify?.(input);
+    },
+
+    async identityKey(): Promise<string> {
+      const bridge = readHostBridge();
+      if (!bridge?.identityKey) {
+        throw new Error(ENDPOINTS_UNAVAILABLE);
+      }
+      return bridge.identityKey();
+    },
+
+    async openEndpoint(request: ProxyEndpointRequest): Promise<OpenEndpointResult> {
+      const bridge = readHostBridge();
+      if (!bridge?.openEndpoint) {
+        return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+      }
+      return { status: "opened", endpoint: await bridge.openEndpoint(request) };
+    },
+
+    async closeEndpoint(
+      deviceId: string,
+      stream: string,
+    ): Promise<CloseEndpointResult> {
+      const bridge = readHostBridge();
+      if (!bridge?.closeEndpoint) {
+        return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+      }
+      return { status: "closed", closed: await bridge.closeEndpoint(deviceId, stream) };
     },
   };
 }

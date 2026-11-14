@@ -12,14 +12,77 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phoneconnect_native::endpoints::{
-    EndpointError, EndpointManager, OpenEndpointRequest, SessionAccess,
+    EndpointError, EndpointManager, EndpointPolicy, OpenEndpointRequest, SessionAccess,
 };
 use phoneconnect_native::proxy::ProxyLimits;
 use phoneconnect_transport::IdentityKey;
-use phoneconnect_transport::Ticket;
+use phoneconnect_transport::candidates::WireCandidate;
+use phoneconnect_transport::{CandidateKind, RendezvousCandidates};
 use support::{DEVICE, EchoMode, addr_of, relay_session, session_id, spawn_echo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+const SERVER: &str = "http://127.0.0.1:8080";
+
+fn manager() -> EndpointManager {
+    EndpointManager::new(
+        IdentityKey::generate().expect("identity"),
+        ProxyLimits::default(),
+        EndpointPolicy::new(url::Url::parse(SERVER).expect("server URL")),
+    )
+}
+
+fn rendezvous(
+    ticket: phoneconnect_transport::Ticket,
+    candidates: RendezvousCandidates,
+) -> OpenEndpointRequest {
+    OpenEndpointRequest {
+        device_id: DEVICE.to_owned(),
+        stream: "adb".to_owned(),
+        ttl_seconds: 30,
+        session: SessionAccess::Rendezvous {
+            capability: "capability".to_owned(),
+            ticket: Box::new(ticket),
+            candidates: Box::new(candidates),
+        },
+    }
+}
+
+fn ticket(device_id: &str, session: &str) -> phoneconnect_transport::Ticket {
+    phoneconnect_transport::Ticket {
+        session_id: session.to_owned(),
+        device_id: device_id.to_owned(),
+        role: phoneconnect_transport::TicketRole::Client,
+        nonce: "nonce".to_owned(),
+        probe_key: "probe".to_owned(),
+        own_identity_key: "own".to_owned(),
+        peer_identity_key: "peer".to_owned(),
+        expires_at: i64::MAX,
+        signature: "signature".to_owned(),
+    }
+}
+
+fn candidates(relay: &str, verification_key: &str, direct: Option<&str>) -> RendezvousCandidates {
+    let mut entries = vec![WireCandidate {
+        kind: CandidateKind::Relay,
+        endpoint: relay.to_owned(),
+        priority: 100,
+    }];
+    if let Some(endpoint) = direct {
+        entries.push(WireCandidate {
+            kind: CandidateKind::ServerObserved,
+            endpoint: endpoint.to_owned(),
+            priority: 150,
+        });
+    }
+    RendezvousCandidates {
+        session_id: "sess_rendezvous".to_owned(),
+        expires_at: i64::MAX,
+        verification_key: verification_key.to_owned(),
+        peer_nonce: Some("peer-nonce".to_owned()),
+        candidates: entries,
+    }
+}
 
 fn request(stream: &str, ttl_seconds: u64, session: &str) -> OpenEndpointRequest {
     OpenEndpointRequest {
@@ -36,10 +99,7 @@ fn request(stream: &str, ttl_seconds: u64, session: &str) -> OpenEndpointRequest
 async fn an_opened_endpoint_is_reachable_and_carries_bytes() {
     let session = relay_session("endpoint_open");
     let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::Plain);
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let session_key = session_id("endpoint_open");
     manager
         .adopt(DEVICE, session.client)
@@ -88,10 +148,7 @@ async fn an_opened_endpoint_is_reachable_and_carries_bytes() {
 async fn one_session_serves_two_endpoints_at_once() {
     let session = relay_session("endpoint_two");
     let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::Plain);
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let session_key = session_id("endpoint_two");
     manager
         .adopt(DEVICE, session.client)
@@ -131,10 +188,7 @@ async fn one_session_serves_two_endpoints_at_once() {
 #[tokio::test]
 async fn an_expired_endpoint_disappears_from_the_list() {
     let session = relay_session("endpoint_expiry");
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let session_key = session_id("endpoint_expiry");
     manager
         .adopt(DEVICE, session.client)
@@ -164,10 +218,7 @@ async fn an_expired_endpoint_disappears_from_the_list() {
 
 #[tokio::test]
 async fn a_request_without_an_adopted_session_is_refused() {
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let error = manager
         .open(request("adb", 30, "sess_never_adopted"))
         .await
@@ -183,33 +234,11 @@ async fn a_request_without_an_adopted_session_is_refused() {
 
 #[tokio::test]
 async fn a_request_for_another_device_is_refused_before_any_network_work() {
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
+    let manager = manager();
+    let request = rendezvous(
+        ticket("dev_someone_else", "sess_other_device"),
+        candidates("http://127.0.0.1:8080/api/sessions", "key", None),
     );
-    let ticket = Ticket {
-        session_id: "sess_other_device".to_owned(),
-        device_id: "dev_someone_else".to_owned(),
-        role: phoneconnect_transport::TicketRole::Client,
-        nonce: "nonce".to_owned(),
-        probe_key: "probe".to_owned(),
-        own_identity_key: "own".to_owned(),
-        peer_identity_key: "peer".to_owned(),
-        expires_at: i64::MAX,
-        signature: "signature".to_owned(),
-    };
-    let mut request = request("adb", 30, "sess_other_device");
-    request.session = SessionAccess::Rendezvous {
-        capability: "capability".to_owned(),
-        ticket: Box::new(ticket),
-        candidates: Box::new(phoneconnect_transport::RendezvousCandidates {
-            session_id: "sess_other_device".to_owned(),
-            expires_at: i64::MAX,
-            verification_key: String::new(),
-            peer_nonce: Some("peer-nonce".to_owned()),
-            candidates: Vec::new(),
-        }),
-    };
     let error = manager
         .open(request)
         .await
@@ -224,10 +253,7 @@ async fn a_request_for_another_device_is_refused_before_any_network_work() {
 async fn an_endpoint_on_a_closed_session_is_refused() {
     let session = relay_session("endpoint_closed");
     session.client.shutdown().await.expect("shut the path down");
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let session_key = session_id("endpoint_closed");
     manager
         .adopt(DEVICE, session.client)
@@ -249,20 +275,14 @@ async fn an_endpoint_on_a_closed_session_is_refused() {
 
 #[tokio::test]
 async fn closing_an_unknown_endpoint_is_false() {
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     assert!(!manager.close(DEVICE, "adb").await);
 }
 
 #[tokio::test]
 async fn an_invalid_stream_or_zero_ttl_is_refused() {
     let session = relay_session("endpoint_invalid");
-    let manager = EndpointManager::new(
-        IdentityKey::generate().expect("identity"),
-        ProxyLimits::default(),
-    );
+    let manager = manager();
     let session_key = session_id("endpoint_invalid");
     manager
         .adopt(DEVICE, session.client)
@@ -292,4 +312,116 @@ async fn an_invalid_stream_or_zero_ttl_is_refused() {
         ),
         "{error:?}"
     );
+}
+
+async fn wait_until_no_endpoints(manager: &EndpointManager) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if manager.endpoints().await.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the endpoint did not disappear"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_persistent_endpoint_serves_a_second_connection() {
+    let session = relay_session("endpoint_reconnect");
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::StaleAfterReconnect);
+    let manager = manager();
+    let session_key = session_id("endpoint_reconnect");
+    manager
+        .adopt(DEVICE, session.client)
+        .await
+        .expect("adopt the session");
+    let endpoint = manager
+        .open(request("adb", 30, session_key.as_str()))
+        .await
+        .expect("open");
+
+    let mut first = TcpStream::connect(addr_of(&endpoint))
+        .await
+        .expect("first connection");
+    first.write_all(b"first connection").await.expect("write");
+    let mut first_echo = vec![0u8; b"first connection".len()];
+    tokio::time::timeout(Duration::from_secs(5), first.read_exact(&mut first_echo))
+        .await
+        .expect("first echo arrives")
+        .expect("read the first echo");
+    assert_eq!(first_echo, b"first connection");
+    drop(first);
+
+    // The port stays open. The device emits a frame for the closed connection's request id
+    // before answering this one; it must not enter this tunnel.
+    let mut second = TcpStream::connect(addr_of(&endpoint))
+        .await
+        .expect("second connection");
+    second.write_all(b"second connection").await.expect("write");
+    let mut second_echo = vec![0u8; b"second connection".len()];
+    tokio::time::timeout(Duration::from_secs(5), second.read_exact(&mut second_echo))
+        .await
+        .expect("second echo arrives")
+        .expect("read the second echo");
+    assert_eq!(
+        second_echo, b"second connection",
+        "a stale frame for the closed connection must not be delivered"
+    );
+
+    assert!(manager.close(DEVICE, "adb").await);
+    echo.abort();
+}
+
+#[tokio::test]
+async fn a_dead_session_is_not_reused_for_a_new_endpoint() {
+    let session = relay_session("endpoint_dead");
+    let manager = manager();
+    let session_key = session_id("endpoint_dead");
+    manager
+        .adopt(DEVICE, session.client)
+        .await
+        .expect("adopt the session");
+    let endpoint = manager
+        .open(request("adb", 30, session_key.as_str()))
+        .await
+        .expect("open");
+    assert_eq!(manager.endpoints().await, vec![endpoint.clone()]);
+
+    // Kill the transport from the device side: the hub reader sees the relay close.
+    drop(session.device);
+    wait_until_no_endpoints(&manager).await;
+
+    let error = manager
+        .open(request("adb", 30, session_key.as_str()))
+        .await
+        .expect_err("a dead session must not hand back a bound port");
+    assert!(
+        matches!(error, EndpointError::SessionClosed { .. }),
+        "{error:?}"
+    );
+    assert!(
+        manager.endpoints().await.is_empty(),
+        "no bound-but-dead endpoint is left"
+    );
+}
+
+#[tokio::test]
+async fn a_relay_outside_the_configured_origin_is_refused_through_open() {
+    let manager = manager();
+    let request = rendezvous(
+        ticket(DEVICE, "sess_rendezvous"),
+        candidates("http://evil.example/api/sessions", "key", None),
+    );
+    let error = manager
+        .open(request)
+        .await
+        .expect_err("the shell must not dial another origin");
+    assert!(
+        matches!(error, EndpointError::RelayOriginOutsideServer { .. }),
+        "{error:?}"
+    );
+    assert!(manager.endpoints().await.is_empty());
 }

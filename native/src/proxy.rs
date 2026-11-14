@@ -45,6 +45,9 @@ pub const MAX_PROXY_CHUNK_BYTES: usize = 32 * 1024;
 /// Frames one stream may have queued for its local client before that stream is failed.
 /// A slow local reader fails its own tunnel instead of stalling the shared path.
 pub const STREAM_QUEUE_CHUNKS: usize = 8;
+/// Longest stream name. The request id adds a per-connection counter, and a protocol
+/// identifier is at most 128 bytes.
+pub const MAX_STREAM_NAME_LEN: usize = 64;
 /// Default silence allowed on a proxied connection.
 ///
 /// A byte tunnel is not a request/response protocol: `adb shell sleep 60` moves nothing for
@@ -75,7 +78,7 @@ impl ProxyCapability {
     /// stream identifier, so it must be a valid protocol identifier.
     pub fn new(stream: impl Into<String>, expires_at: Instant) -> Result<Self, ProxyError> {
         let stream = stream.into();
-        request_id_for(&stream)?;
+        validate_stream(&stream)?;
         Ok(Self { stream, expires_at })
     }
 }
@@ -290,6 +293,10 @@ pub(crate) struct ProxyHub {
 struct HubInner {
     path: Arc<ConnectedPath>,
     state: std::sync::Mutex<HubState>,
+    /// Flips once when the path fails. Persisted so a waiter cannot miss the signal.
+    closed: tokio::sync::watch::Sender<bool>,
+    /// Next per-connection request id. A connection never reuses another's sequence space.
+    connection: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -298,6 +305,10 @@ struct HubState {
     routes: HashMap<String, mpsc::Sender<HubEvent>>,
     /// Why a route was force-closed. Read by the pump once its channel ends.
     failures: HashMap<String, StreamFailure>,
+    /// Live streams by stream name, mapped to the request id of their current connection.
+    /// A new local connection gets a new request id, so it owns a fresh sequence space and a
+    /// frame for the previous connection routes nowhere.
+    streams: HashMap<String, String>,
     /// Set when the path itself fails; no new stream may start on it.
     closed: Option<String>,
     reader_running: bool,
@@ -339,6 +350,8 @@ impl ProxyHub {
             inner: Arc::new(HubInner {
                 path,
                 state: std::sync::Mutex::new(HubState::default()),
+                closed: tokio::sync::watch::channel(false).0,
+                connection: AtomicU64::new(1),
             }),
         }
     }
@@ -352,7 +365,9 @@ impl ProxyHub {
         limits: ProxyLimits,
     ) -> Result<ProxySession, ProxyError> {
         limits.validate()?;
-        let request_id = request_id_for(stream)?;
+        validate_stream(stream)?;
+        let sequence = self.inner.connection.fetch_add(1, Ordering::SeqCst);
+        let request_id = request_id_for(stream, sequence)?;
         let (sender, receiver) = mpsc::channel(STREAM_QUEUE_CHUNKS);
         {
             let mut state = self.lock();
@@ -361,11 +376,12 @@ impl ProxyHub {
                     reason: reason.clone(),
                 });
             }
-            if state.routes.contains_key(&request_id) {
+            if state.streams.contains_key(stream) {
                 return Err(ProxyError::StreamInUse {
                     stream: stream.to_owned(),
                 });
             }
+            state.streams.insert(stream.to_owned(), request_id.clone());
             state.routes.insert(request_id.clone(), sender);
             if !state.reader_running {
                 state.reader_running = true;
@@ -385,8 +401,27 @@ impl ProxyHub {
             route: RouteGuard {
                 inner: Arc::clone(&self.inner),
                 request_id,
+                stream: stream.to_owned(),
             },
         })
+    }
+
+    /// True once the path has failed. No further stream can start on it.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lock().closed.is_some()
+    }
+
+    /// Resolves when the path fails. A closed hub resolves immediately.
+    pub(crate) async fn wait_closed(&self) {
+        let mut closed = self.inner.closed.subscribe();
+        if *closed.borrow() {
+            return;
+        }
+        while closed.changed().await.is_ok() {
+            if *closed.borrow() {
+                return;
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HubState> {
@@ -463,6 +498,8 @@ impl HubInner {
                         _ => "the session path closed".to_owned(),
                     });
                     state.reader_running = false;
+                    drop(state);
+                    self.closed.send_replace(true);
                     return;
                 }
             }
@@ -493,6 +530,7 @@ impl HubState {
 struct RouteGuard {
     inner: Arc<HubInner>,
     request_id: String,
+    stream: String,
 }
 
 impl Drop for RouteGuard {
@@ -504,6 +542,9 @@ impl Drop for RouteGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.routes.remove(&self.request_id);
         state.failures.remove(&self.request_id);
+        if state.streams.get(&self.stream) == Some(&self.request_id) {
+            state.streams.remove(&self.stream);
+        }
     }
 }
 
@@ -746,8 +787,25 @@ fn uplink_request_id(value: &str) -> RequestId {
     RequestId::new(value).expect("the request id was validated when the stream opened")
 }
 
-fn request_id_for(stream: &str) -> Result<String, ProxyError> {
-    let request_id = format!("proxy-{stream}");
+fn validate_stream(stream: &str) -> Result<(), ProxyError> {
+    RequestId::new(stream).map_err(|error| ProxyError::InvalidStream {
+        stream: stream.to_owned(),
+        reason: error.to_string(),
+    })?;
+    if stream.len() > MAX_STREAM_NAME_LEN {
+        return Err(ProxyError::InvalidStream {
+            stream: stream.to_owned(),
+            reason: format!("must be at most {MAX_STREAM_NAME_LEN} bytes"),
+        });
+    }
+    Ok(())
+}
+
+/// One connection's request id. The counter makes it unique per local connection, so the
+/// device's per-request-id sequence starts fresh and a late frame for the previous connection
+/// finds no route instead of entering the new client's tunnel.
+fn request_id_for(stream: &str, connection: u64) -> Result<String, ProxyError> {
+    let request_id = format!("proxy-{stream}-{connection}");
     RequestId::new(request_id.clone()).map_err(|error| ProxyError::InvalidStream {
         stream: stream.to_owned(),
         reason: error.to_string(),

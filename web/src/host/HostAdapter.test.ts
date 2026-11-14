@@ -95,6 +95,30 @@ describe("browserHost", () => {
     ).resolves.toBeUndefined();
     await expect(host.localEndpoints()).resolves.toEqual([]);
   });
+
+  it("reports loopback endpoints as unavailable instead of a dead control", async () => {
+    const host = createHostAdapter();
+    expect(host.endpoints.available).toBe(false);
+    if (host.endpoints.available) throw new Error("a browser must not expose endpoints");
+    expect(host.endpoints.reason).toMatch(/native shell/);
+
+    await expect(host.identityKey()).rejects.toThrow(/native shell/);
+    await expect(
+      host.openEndpoint({
+        deviceId: "dev_1",
+        stream: "adb",
+        ttlSeconds: 30,
+        session: { kind: "established", sessionId: "sess_1" },
+      }),
+    ).resolves.toEqual({
+      status: "unavailable",
+      reason: expect.stringMatching(/native shell/),
+    });
+    await expect(host.closeEndpoint("dev_1", "adb")).resolves.toEqual({
+      status: "unavailable",
+      reason: expect.stringMatching(/native shell/),
+    });
+  });
 });
 
 describe("nativeHost", () => {
@@ -152,5 +176,58 @@ describe("nativeHost", () => {
     await expect(host.localEndpoints()).resolves.toEqual(
       nativeContext.proxyCapabilities,
     );
+  });
+
+  it("opens and closes an endpoint through the shell commands", async () => {
+    const identityKey = vi.fn(async () => "shell-public-key");
+    const openEndpoint = vi.fn(async () => ({
+      deviceId: "dev_1",
+      stream: "adb",
+      url: "http://127.0.0.1:49152",
+    }));
+    const closeEndpoint = vi.fn(async () => true);
+    installBridge({ identityKey, openEndpoint, closeEndpoint });
+    const host = createHostAdapter(nativeContext);
+
+    expect(host.endpoints.available).toBe(true);
+    await expect(host.identityKey()).resolves.toBe("shell-public-key");
+
+    const request = {
+      deviceId: "dev_1",
+      stream: "adb",
+      ttlSeconds: 30,
+      session: { kind: "established", sessionId: "sess_1" },
+    } as const;
+    await expect(host.openEndpoint(request)).resolves.toEqual({
+      status: "opened",
+      endpoint: {
+        deviceId: "dev_1",
+        stream: "adb",
+        url: "http://127.0.0.1:49152",
+      },
+    });
+    expect(openEndpoint).toHaveBeenCalledWith(request);
+    await expect(host.closeEndpoint("dev_1", "adb")).resolves.toEqual({
+      status: "closed",
+      closed: true,
+    });
+    expect(closeEndpoint).toHaveBeenCalledWith("dev_1", "adb");
+  });
+
+  it("reports endpoint capability as unavailable when the shell lacks it", async () => {
+    const host = createHostAdapter(nativeContext);
+    expect(host.endpoints.available).toBe(false);
+    await expect(
+      host.openEndpoint({
+        deviceId: "dev_1",
+        stream: "adb",
+        ttlSeconds: 30,
+        session: { kind: "established", sessionId: "sess_1" },
+      }),
+    ).resolves.toEqual({
+      status: "unavailable",
+      reason: expect.stringMatching(/native shell/),
+    });
+    await expect(host.identityKey()).rejects.toThrow(/native shell/);
   });
 });

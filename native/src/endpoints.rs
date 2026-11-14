@@ -22,6 +22,7 @@ use phoneconnect_transport::{
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use url::Url;
 
 use crate::proxy::{LocalEndpoint, ProxyAllocator, ProxyCapability, ProxyError, ProxyLimits};
 use crate::session_client::{SessionClient, SessionClientError, SessionPath};
@@ -29,6 +30,35 @@ use crate::session_client::{SessionClient, SessionClientError, SessionPath};
 /// Longest lifetime the shell grants one endpoint. A capability is short-lived; an endpoint
 /// that outlives it would keep a local port pointing at a dead stream.
 pub const MAX_ENDPOINT_TTL_SECONDS: u64 = 3_600;
+
+/// What the shell accepts from the page.
+///
+/// The page cannot choose the transport's trust anchors: the relay must be on the configured
+/// server's origin, page-supplied direct candidates are refused (relay-only for this
+/// milestone), and, once the shell pins a ticket verification key, the page-supplied key must
+/// match it. Without these, a page at the trusted origin could make the shell dial arbitrary
+/// hosts and hole-punch arbitrary UDP endpoints.
+#[derive(Debug, Clone)]
+pub struct EndpointPolicy {
+    /// The origin the webview loaded. Everything the page asks the shell to dial must be on it.
+    pub server_url: Url,
+    /// Ed25519 key tickets must verify against, once the shell obtains it out of band.
+    pub verification_key: Option<String>,
+}
+
+impl EndpointPolicy {
+    pub fn new(server_url: Url) -> Self {
+        Self {
+            server_url,
+            verification_key: None,
+        }
+    }
+
+    pub fn with_verification_key(mut self, verification_key: impl Into<String>) -> Self {
+        self.verification_key = Some(verification_key.into());
+        self
+    }
+}
 
 /// What the page (or a test) asks the shell to open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +103,7 @@ struct ServingEndpoint {
 pub struct EndpointManager {
     identity: IdentityKey,
     limits: ProxyLimits,
+    policy: EndpointPolicy,
     allocator: Arc<ProxyAllocator>,
     sessions: Mutex<HashMap<String, Arc<SessionPath>>>,
     serving: Mutex<HashMap<String, ServingEndpoint>>,
@@ -96,6 +127,12 @@ pub enum EndpointError {
     DeviceMismatch { requested: String, ticket: String },
     #[error("the rendezvous view carries no relay and no direct path was probed")]
     NoRelay,
+    #[error("relay {endpoint} is not on the configured server origin {server}")]
+    RelayOriginOutsideServer { endpoint: String, server: String },
+    #[error("page-supplied direct candidates are refused; this milestone is relay-only")]
+    DirectCandidatesRefused,
+    #[error("ticket verification key {found} is not the pinned {expected}")]
+    VerificationKeyMismatch { expected: String, found: String },
     #[error("the ticket's session has no peer nonce yet; register candidates and retry")]
     PeerNonceMissing,
     #[error(transparent)]
@@ -115,10 +152,11 @@ pub enum EndpointError {
 }
 
 impl EndpointManager {
-    pub fn new(identity: IdentityKey, limits: ProxyLimits) -> Self {
+    pub fn new(identity: IdentityKey, limits: ProxyLimits, policy: EndpointPolicy) -> Self {
         Self {
             identity,
             limits,
+            policy,
             allocator: Arc::new(ProxyAllocator::new()),
             sessions: Mutex::new(HashMap::new()),
             serving: Mutex::new(HashMap::new()),
@@ -284,7 +322,7 @@ impl EndpointManager {
                         found: session.session_id().to_owned(),
                     });
                 }
-                if session.is_closed().await {
+                if !session.is_usable().await {
                     return Err(EndpointError::SessionClosed {
                         session_id: session_id.clone(),
                     });
@@ -299,7 +337,7 @@ impl EndpointManager {
                 {
                     let sessions = self.sessions.lock().await;
                     if let Some(session) = sessions.get(&request.device_id) {
-                        if session.session_id() == ticket.session_id && !session.is_closed().await {
+                        if session.session_id() == ticket.session_id && session.is_usable().await {
                             return Ok(Arc::clone(session));
                         }
                     }
@@ -325,6 +363,7 @@ impl EndpointManager {
             return Err(EndpointError::PeerNonceMissing);
         }
         let candidates = CandidateSet::discover(candidates.clone(), Vec::new())?;
+        self.validate_candidates(&candidates)?;
         let relay_base = candidates.relay().ok_or(EndpointError::NoRelay)?;
         let url = relay_url(&relay_base, &ticket.session_id);
         let relay = WebSocketRelay::connect(&url, capability, STREAM_FRAME_LIMIT as usize).await?;
@@ -340,6 +379,36 @@ impl EndpointManager {
         Ok(SessionClient::new()
             .connect(ticket.clone(), candidates, setup)
             .await?)
+    }
+
+    fn validate_candidates(&self, candidates: &CandidateSet) -> Result<(), EndpointError> {
+        if candidates
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.kind.is_direct())
+        {
+            return Err(EndpointError::DirectCandidatesRefused);
+        }
+        let relay = candidates.relay().ok_or(EndpointError::NoRelay)?;
+        let parsed = Url::parse(&relay).map_err(|_| EndpointError::RelayOriginOutsideServer {
+            endpoint: relay.clone(),
+            server: self.policy.server_url.as_str().to_owned(),
+        })?;
+        if parsed.origin() != self.policy.server_url.origin() {
+            return Err(EndpointError::RelayOriginOutsideServer {
+                endpoint: relay,
+                server: self.policy.server_url.as_str().to_owned(),
+            });
+        }
+        if let Some(pinned) = &self.policy.verification_key
+            && candidates.verification_key() != pinned
+        {
+            return Err(EndpointError::VerificationKeyMismatch {
+                expected: pinned.clone(),
+                found: candidates.verification_key().to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn device_id(&self, device_id: &str) -> Result<DeviceId, EndpointError> {
@@ -372,16 +441,23 @@ async fn serve_endpoint(
             }
             Err(_) => break,
         };
-        match allocator.serve(&endpoint, proxy).await {
-            Ok(_) => {}
-            Err(
+        let outcome = tokio::select! {
+            result = allocator.serve(&endpoint, proxy) => Some(result),
+            // The path failed while this endpoint waited for a connection. Stop instead of
+            // handing the next client a tunnel that can never carry a byte.
+            _ = session.wait_closed() => None,
+        };
+        match outcome {
+            None => break,
+            Some(Ok(_)) => {}
+            Some(Err(
                 ProxyError::UnknownEndpoint { .. }
                 | ProxyError::CapabilityExpired { .. }
                 | ProxyError::StreamMismatch { .. },
-            ) => break,
+            )) => break,
             // The endpoint is still live: a transport fault ended one connection, not the
             // port. The next local connection gets a fresh stream.
-            Err(_) => {}
+            Some(Err(_)) => {}
         }
     }
     allocator.close(&endpoint.device_id, &endpoint.stream).await;
@@ -401,4 +477,117 @@ fn unix_ms() -> i64 {
 fn instant_at_ms(deadline_ms: i64, now: Instant) -> Instant {
     let remaining = deadline_ms.saturating_sub(unix_ms()).max(0) as u64;
     now + Duration::from_millis(remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoneconnect_transport::CandidateKind;
+    use phoneconnect_transport::candidates::WireCandidate;
+
+    fn manager(server: &str, pin: Option<&str>) -> EndpointManager {
+        let mut policy = EndpointPolicy::new(Url::parse(server).expect("server URL"));
+        if let Some(pin) = pin {
+            policy = policy.with_verification_key(pin);
+        }
+        EndpointManager::new(
+            IdentityKey::generate().expect("identity"),
+            ProxyLimits::default(),
+            policy,
+        )
+    }
+
+    fn candidates(relay: &str, key: &str, direct: Option<&str>) -> CandidateSet {
+        let mut candidates = vec![WireCandidate {
+            kind: CandidateKind::Relay,
+            endpoint: relay.to_owned(),
+            priority: 100,
+        }];
+        if let Some(endpoint) = direct {
+            candidates.push(WireCandidate {
+                kind: CandidateKind::ServerObserved,
+                endpoint: endpoint.to_owned(),
+                priority: 150,
+            });
+        }
+        CandidateSet::discover(
+            RendezvousCandidates {
+                session_id: "sess_policy".to_owned(),
+                expires_at: i64::MAX,
+                verification_key: key.to_owned(),
+                peer_nonce: Some("peer-nonce".to_owned()),
+                candidates,
+            },
+            Vec::new(),
+        )
+        .expect("candidate set")
+    }
+
+    #[test]
+    fn a_relay_on_the_configured_origin_is_accepted() {
+        let manager = manager("http://127.0.0.1:8080", None);
+        manager
+            .validate_candidates(&candidates(
+                "http://127.0.0.1:8080/api/sessions",
+                "key",
+                None,
+            ))
+            .expect("the configured origin is allowed");
+    }
+
+    #[test]
+    fn a_relay_on_another_origin_is_refused() {
+        let manager = manager("https://phoneconnect.example", None);
+        let error = manager
+            .validate_candidates(&candidates(
+                "https://evil.example/api/sessions",
+                "key",
+                None,
+            ))
+            .expect_err("another origin is not dialed");
+        assert!(
+            matches!(error, EndpointError::RelayOriginOutsideServer { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn page_supplied_direct_candidates_are_refused() {
+        let manager = manager("http://127.0.0.1:8080", None);
+        let error = manager
+            .validate_candidates(&candidates(
+                "http://127.0.0.1:8080/api/sessions",
+                "key",
+                Some("203.0.113.9:9"),
+            ))
+            .expect_err("this milestone is relay-only");
+        assert!(
+            matches!(error, EndpointError::DirectCandidatesRefused),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_verification_key_cannot_be_replaced_by_the_page() {
+        let manager = manager("http://127.0.0.1:8080", Some("the-pinned-key"));
+        let error = manager
+            .validate_candidates(&candidates(
+                "http://127.0.0.1:8080/api/sessions",
+                "page-chosen-key",
+                None,
+            ))
+            .expect_err("the page cannot choose the trust anchor");
+        assert!(
+            matches!(error, EndpointError::VerificationKeyMismatch { .. }),
+            "{error:?}"
+        );
+
+        manager
+            .validate_candidates(&candidates(
+                "http://127.0.0.1:8080/api/sessions",
+                "the-pinned-key",
+                None,
+            ))
+            .expect("the pinned key is accepted");
+    }
 }

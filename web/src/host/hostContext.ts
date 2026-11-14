@@ -44,6 +44,32 @@ export interface NativeHostContext {
   proxyCapabilities: LocalEndpoint[];
 }
 
+/// A session the page created on the server for this shell's identity key. The shell
+/// validates the ticket, the relay origin, and the verification key; the page only passes
+/// the server's response through.
+export interface RendezvousSession {
+  kind: "rendezvous";
+  capability: string;
+  ticket: Record<string, unknown>;
+  candidates: Record<string, unknown>;
+}
+
+/// A session a native shell already negotiated. Not produced by the create-session flow;
+/// it exists so host-aware callers and tests can refer to an established session.
+export interface EstablishedSession {
+  kind: "established";
+  sessionId: string;
+}
+
+/// One loopback endpoint the page asks the shell to open.
+export interface ProxyEndpointRequest {
+  deviceId: string;
+  stream: string;
+  /// Lifetime the endpoint may use; the shell bounds it by the ticket and its own maximum.
+  ttlSeconds: number;
+  session: RendezvousSession | EstablishedSession;
+}
+
 /// Optional capabilities the native shell registers. Any absent method falls back to the
 /// browser behavior for that one operation.
 export interface NativeHostBridge {
@@ -51,6 +77,12 @@ export interface NativeHostBridge {
   setTrayStatus?(status: TrayStatus): Promise<void> | void;
   localEndpoints?(): Promise<LocalEndpoint[]> | LocalEndpoint[];
   notify?(input: NotificationInput): Promise<void> | void;
+  /// The shell's X25519 public key, which the page pins in `POST /api/sessions`.
+  identityKey?(): Promise<string> | string;
+  openEndpoint?(
+    request: ProxyEndpointRequest,
+  ): Promise<LocalEndpoint> | LocalEndpoint;
+  closeEndpoint?(deviceId: string, stream: string): Promise<boolean> | boolean;
 }
 
 function globals(source: Window): Record<string, unknown> {

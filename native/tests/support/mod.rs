@@ -249,6 +249,9 @@ pub enum EchoMode {
     WithForeignFrame,
     /// Skip a sequence so the client can detect a hole.
     WithSequenceGap,
+    /// After the first connection's request id is known, answer the next connection with a
+    /// stale frame for the old id before echoing. A correct hub has no route for it.
+    StaleAfterReconnect,
 }
 
 /// The device-side stub: echoes proxy frames, keeping a per-stream sequence.
@@ -260,6 +263,7 @@ pub fn spawn_echo(
     let recorded = Arc::clone(&seen);
     let handle = tokio::spawn(async move {
         let mut sequences: HashMap<String, u32> = HashMap::new();
+        let mut first_request: Option<String> = None;
         let mut echoes = 0u32;
         loop {
             let envelope = match device.recv_frame().await {
@@ -275,6 +279,22 @@ pub fn spawn_echo(
             let device_id = DeviceId::new(envelope.device_id.clone()).expect("device id");
             let session_id = SessionId::new(envelope.session_id.clone()).expect("session id");
 
+            if mode == EchoMode::StaleAfterReconnect {
+                match &first_request {
+                    None => first_request = Some(envelope.request_id.clone()),
+                    Some(first) if first != &envelope.request_id => {
+                        let stale = RequestId::new(first.clone()).expect("request id");
+                        let mut frame =
+                            Envelope::new(StreamKind::Proxy, &device_id, &session_id, &stale);
+                        frame.sequence = 99;
+                        frame.payload = b"stale bytes from a closed connection".to_vec();
+                        if device.send_frame(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if mode == EchoMode::WithEvents {
                 let request = RequestId::new("event-heartbeat").expect("request id");
                 let mut event =

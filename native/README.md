@@ -63,7 +63,10 @@ moment, and the page refreshes through `localEndpoints()`.
 Field names and JSON shape match `web/src/host/hostContext.ts` exactly; a page that cannot
 read the context stays a browser, and each missing bridge method falls back to the page's
 in-page behavior. Strings are escaped as JavaScript literals, so a page-supplied value cannot
-break out of the injected script.
+break out of the injected script. The page reaches the last three through
+`HostAdapter.openEndpoint` / `closeEndpoint` / `identityKey`; `endpoints` reports whether the
+host can do it, and a browser answers `available: false` with a reason instead of a silent
+no-op.
 
 `openWindow` accepts only a single-slash absolute path and re-resolves it against the
 configured origin; a protocol-relative path, a full URL, or a path that lands on another
@@ -81,10 +84,15 @@ duplicated.
    `session.kind = "rendezvous"`.
 3. `EndpointManager` verifies everything through the shared transport
    (`SessionClient::connect`: signed ticket, authenticated direct probe against the relay,
-   shortest validated path), reusing the session for the next endpoint on that device.
+   shortest validated path), reusing the session for the next endpoint on that device. The
+   page cannot choose where the shell dials: the relay must be on the configured server
+   origin, page-supplied direct candidates are refused (relay-only for this milestone), and a
+   pinned ticket verification key, once the shell has one, cannot be replaced by the page.
 4. It binds `127.0.0.1:0`, registers the endpoint with its capability deadline, and starts a
    serving task that accepts one local connection at a time until closed, expired, or the
-   session path fails.
+   session path fails. Each local connection gets its own request id
+   (`proxy-<stream>-<n>`), so it owns a fresh sequence space and a late frame for the previous
+   connection routes nowhere instead of entering the new tunnel.
 
 The shell's identity private half never leaves the process and no server credential is
 embedded in the page: the ticket is single-use and short-lived, and the capability is the one
@@ -92,8 +100,10 @@ the signed-in user already holds. `EndpointManager` is plain Rust, so this whole
 is covered by `native/tests/endpoints.rs`; the Tauri command is three lines of glue.
 
 An endpoint disappears from `localEndpoints()` when it is closed, when its capability
-expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when its serving task ends
-because the session path failed.
+expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when the path fails: the
+serving task watches the hub, so a dead transport closes the port without waiting for the next
+connection. A stored session whose hub has died is never reused; `open_endpoint` refuses it
+with `SessionClosed` instead of returning a bound port that can never carry a byte.
 
 ### Tauri IPC scope
 
@@ -140,8 +150,10 @@ title 200, body 2,000.
   not open belong to another consumer and are ignored. One tunnel therefore cannot tear down
   another, and several streams share the session concurrently (`adb`, `screen`, …).
 - `ProxyAllocator::serve(endpoint, session)` accepts one local TCP connection and pumps it as
-  `StreamKind::Proxy` envelopes. The request id is derived from the stream
-  (`proxy-<stream>`), and each stream keeps its own pump and its own inbound queue.
+  `StreamKind::Proxy` envelopes. The request id is unique per local connection
+  (`proxy-<stream>-<n>`), so a persistent port can serve connection after connection, each
+  owning a fresh sequence space; a late frame for a closed connection finds no route and is
+  ignored rather than delivered to the next client.
 - Every frame carries `deadline_unix_ms` and a per-stream `sequence`. The receiver requires
   contiguous sequences: a jump, or a `FramesLost` report (the path already discarded frames),
   closes that tunnel with `SequenceGap` / `FramesLost` instead of writing a hole into a TCP
@@ -169,9 +181,11 @@ local capability into an unauthenticated remote one; the allocator cannot do tha
 ### What is not implemented yet
 
 There is **no Android-side TCP bridge**, so nothing here claims ADB proxying works end to end.
-The Task 5 page also does not call `openEndpoint` yet; it reads `localEndpoints()`, so the
-endpoint API is complete, tested, and reachable from the bridge, but no shipped screen opens
-one.
+The web app now exposes the seam — `HostAdapter.openEndpoint`, `closeEndpoint`, `identityKey`
+and `endpoints` — and a browser reports the capability as unavailable with a reason rather
+than rendering a dead control, but no screen creates a session yet: that needs the server's
+user login/MFA, which is a later plan. The next task is the create-session UI plus the Android
+TCP bridge.
 What is proven is the native half:
 
 - `native/tests/proxy.rs` binds real loopback ports and drives a real `ConnectedPath` over an
@@ -183,7 +197,10 @@ What is proven is the native half:
 - `native/tests/endpoints.rs` exercises the command path through `EndpointManager`: an
   endpoint opened through it is reachable on `127.0.0.1`, carries bytes to the stub, two
   endpoints share one session, and it disappears from `endpoints()` after close or expiry. A
-  closed session and a ticket for another device are refused before any port opens.
+  persistent endpoint serves a second connection while a stale frame for the first is ignored;
+  a dead session is refused rather than reused; a relay outside the configured origin, a
+  page-supplied direct candidate, and a replaced verification key are rejected before any port
+  opens; a closed session and a ticket for another device are refused too.
 - Unit tests in `native/src/proxy.rs` prove a `FramesLost` report ends every live stream with
   that error and that a full queue fails only its own stream.
 - The same tests would run unchanged against the Android agent once it answers proxy frames;

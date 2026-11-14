@@ -13,7 +13,7 @@
 mod shell {
     use std::sync::Arc;
 
-    use phoneconnect_native::endpoints::{EndpointManager, OpenEndpointRequest};
+    use phoneconnect_native::endpoints::{EndpointManager, EndpointPolicy, OpenEndpointRequest};
     use phoneconnect_native::proxy::{LocalEndpoint, ProxyLimits};
     use phoneconnect_native::web_shell::{
         self, NotificationInput, TrayStatus, bridge_script, capability_origins, host_context,
@@ -151,7 +151,11 @@ mod shell {
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let server_url = web_shell::configured_server_url()?;
         let identity = IdentityKey::generate()?;
-        let endpoints = Arc::new(EndpointManager::new(identity, ProxyLimits::default()));
+        let endpoints = Arc::new(EndpointManager::new(
+            identity,
+            ProxyLimits::default(),
+            EndpointPolicy::new(server_url.clone()),
+        ));
         let setup_endpoints = Arc::clone(&endpoints);
         let setup_server = server_url.clone();
         let window_url = server_url.clone();

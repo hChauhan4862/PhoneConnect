@@ -12,10 +12,32 @@ import type {
   LocalEndpoint,
   NativeHostContext,
   NotificationInput,
+  ProxyEndpointRequest,
   TrayStatus,
 } from "./hostContext";
 
-export type { LocalEndpoint, NotificationInput, TrayStatus };
+export type {
+  LocalEndpoint,
+  NotificationInput,
+  ProxyEndpointRequest,
+  TrayStatus,
+};
+
+/// Whether this host can expose loopback endpoints at all. A browser says no with a reason,
+/// so a screen can explain the absence instead of rendering a control that cannot work.
+export type EndpointCapability =
+  | { available: true }
+  | { available: false; reason: string };
+
+/// The result of asking for an endpoint. "unavailable" is explicit; a browser never reports
+/// a silent success.
+export type OpenEndpointResult =
+  | { status: "opened"; endpoint: LocalEndpoint }
+  | { status: "unavailable"; reason: string };
+
+export type CloseEndpointResult =
+  | { status: "closed"; closed: boolean }
+  | { status: "unavailable"; reason: string };
 
 export interface OpenViewOptions {
   /// A detached view becomes a separate OS window under a native host.
@@ -28,6 +50,12 @@ export interface HostAdapter {
   setTrayStatus(status: TrayStatus): Promise<void>;
   localEndpoints(): Promise<LocalEndpoint[]>;
   notify(input: NotificationInput): Promise<void>;
+  /// Whether this host can open a loopback endpoint. A browser reports `available: false`.
+  readonly endpoints: EndpointCapability;
+  /// The shell's public identity key. A browser has none and rejects, never fabricates one.
+  identityKey(): Promise<string>;
+  openEndpoint(request: ProxyEndpointRequest): Promise<OpenEndpointResult>;
+  closeEndpoint(deviceId: string, stream: string): Promise<CloseEndpointResult>;
 }
 
 export function createHostAdapter(context?: NativeHostContext): HostAdapter {

@@ -161,9 +161,17 @@ impl SessionPath {
             .await
     }
 
-    /// True once the path has been shut down.
-    pub async fn is_closed(&self) -> bool {
-        self.path.is_closed().await
+    /// True when the session can still carry frames: the path was not shut down and the
+    /// hub's reader has not failed. A caller that keeps a session across endpoints checks
+    /// this before reusing it.
+    pub async fn is_usable(&self) -> bool {
+        !self.path.is_closed().await && !self.hub.is_closed()
+    }
+
+    /// Resolves when the hub's reader fails, so a serving endpoint can stop instead of
+    /// waiting for a connection it could never carry.
+    pub async fn wait_closed(&self) {
+        self.hub.wait_closed().await;
     }
 
     /// Tears the path down. The relay keepalive stops and the direct socket closes.
