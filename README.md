@@ -110,10 +110,13 @@ emulator, by a unit test only, or not at all.
   it refuses Wi-Fi, Bluetooth, mobile data, night mode, and rotation with a machine reason.
   `control.reboot` always refuses: `REBOOT` is signature-level.
 - **Server, protocol, and transport.** Covered by the Rust tests, including the relay limits,
-  leases, retention, and the sealed-frame compatibility vectors. Direct hole-punched paths are
+  leases, retention, the audit surface and its 30-day deletion, and the sealed-frame
+  compatibility vectors. Direct hole-punched paths are
   implemented and tested in the Rust transport.
 - **Web UI.** Routes, panels, and API errors are covered by Vitest. The control, file, app,
-  screen, and console screens were driven against the emulator in a browser. There is no
+  screen, and console screens were driven against the emulator in a browser. The audit screen
+  (newest-first rows, a server-side device filter, and explicit empty and error states) is
+  covered by Vitest only; it was not driven against a live server in a browser. There is no
   server-to-client push, so every screen renders the snapshot it last read.
 - **Native shell.** Builds on macOS and runs its headless `--print-context` path. The GUI path
   was not exercised here.
