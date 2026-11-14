@@ -364,6 +364,44 @@ describe("the control panel", () => {
     expect(within(list).queryByText("7")).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["timeout", command({ status: "timeout" as const, output: null, error: null })],
+    [
+      "device_offline",
+      command({ status: "error" as const, output: null, error: "device_offline" }),
+    ],
+  ])(
+    "treats a server-side %s as an unknown outcome and re-reads any key",
+    async (label, terminal) => {
+      const user = userEvent.setup();
+      const api = fakeApi([
+        command(),
+        terminal,
+        // The volume may have moved before the answer was lost.
+        command({ output: { ...READINGS, volume_music: 2 } }),
+      ]);
+      renderPanel(api);
+      await screen.findByRole("list", { name: /control readings/i });
+
+      const field = screen.getByLabelText(/music volume/i);
+      await user.clear(field);
+      await user.type(field, "2");
+      await user.click(screen.getByRole("button", { name: /set music volume/i }));
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(label);
+      // Neither code is the device's answer, so neither may claim it refused.
+      expect(alert).toHaveTextContent(/may not have completed that/i);
+      expect(alert).not.toHaveTextContent(/did not do that/i);
+      await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+      const list = screen.getByRole("list", { name: /control readings/i });
+      const volumeRow = within(list)
+        .getAllByRole("listitem")
+        .find((row) => row.textContent?.startsWith("Music volume2") === true);
+      expect(volumeRow).toBeDefined();
+    },
+  );
+
   it("keeps the refusal lead when the command was never accepted", async () => {
     const user = userEvent.setup();
     const api = fakeApi([command()]);

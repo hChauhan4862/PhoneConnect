@@ -86,8 +86,11 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   that", while an `ok` whose output is not a confirmation, or a poll that fails after the
   command was accepted, says "The device may not have completed that" — and an `unconfirmed`
   answer says "The device could not confirm that", because no lead may deny a change the device
-  may have made. Every unknown outcome re-reads the readings for any key, so no stale value (or
-  a stale `brightness_mode`) can sit under an alert that says the outcome is unknown.
+  may have made. Two terminal codes are the server's rather than the device's — `timeout` (the
+  server's deadline expired) and `device_offline` (the channel dropped with the command still
+  pending) — so they are unknown outcomes too, not refusals. Every unknown outcome re-reads the
+  readings for any key, so no stale value (or a stale `brightness_mode`) can sit under an alert
+  that says the outcome is unknown.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

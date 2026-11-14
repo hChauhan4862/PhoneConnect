@@ -176,11 +176,18 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         if (!mounted.current) return;
         if (command.status !== "ok") {
           const failure = actionFailureOf(command);
-          setActionFailure({ failure, lead: failureLead(failure) });
+          // Not every terminal code is the device's answer: the server's deadline can expire or
+          // the channel can drop after dispatch, and either way the device may have acted.
+          const unknown = UNKNOWN_OUTCOME_CODES.has(failure.code);
+          setActionFailure({
+            failure,
+            lead: unknown ? UNKNOWN_OUTCOME_LEAD : failureLead(failure),
+          });
           // Anything that may have reached the device must not leave the previous map looking
-          // current: `unconfirmed` means the value may have moved either way, and a brightness
-          // change turns automatic mode off before it can fail.
-          if (failure.code === "unconfirmed" || key === "brightness") {
+          // current: an unknown outcome may have moved the value either way, `unconfirmed`
+          // says the same from the device's side, and a brightness change turns automatic mode
+          // off before it can fail.
+          if (unknown || failure.code === "unconfirmed" || key === "brightness") {
             await read(() => mounted.current);
           }
           return;
@@ -440,6 +447,11 @@ function actionFailureOf(command: CommandView): Failure {
 /// What an alert says when the command was accepted and the answer never came back, or came
 /// back `ok` in a shape the panel cannot read. The device may well have done it.
 const UNKNOWN_OUTCOME_LEAD = "The device may not have completed that";
+
+/// Terminal command codes that are not the device's answer: the server stopped waiting
+/// (`timeout`) or lost the channel and failed the still-pending command (`device_offline`).
+/// Both happen after dispatch, so the device may have acted before the answer was lost.
+const UNKNOWN_OUTCOME_CODES = new Set(["timeout", "device_offline"]);
 
 /// The lead a terminal answer earns: the device said it could not confirm the change, so the
 /// default "did not do that" would contradict the note below it. Every other refusal keeps the
