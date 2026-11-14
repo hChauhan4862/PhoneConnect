@@ -316,11 +316,12 @@ and one channel; the extra type changes nothing the user sees.
   the code registers but the document omits, or a row the code does not implement. On the
   token side it checks the table against `CommandReasons.tokens`, checks that list against
   every constant `CommandReasons.kt` declares in any shape this package uses (untyped,
-  `: String`, or the value on the next line), scans `src/main/java` for a token-shaped literal
-  in a `CommandFailure(...)`, `Reading.unavailable(...)`, or `unavailable.put(...)` position
-  outside the list, and checks every token-shaped constant under `control/` against it, with an
-  explicit allowlist for control keys and answer field names — so a new refusal cannot reach a
-  caller without a place to look it up.
+  `: String`, or the value on the next line), and checks two broader sets against it: every
+  token-shaped `const val` anywhere under `com/phoneconnect/agent`, and every token-shaped
+  string literal under `control/` wherever it appears — a failure code, a factory's message, a
+  `when` branch, or a `Reading` reason. Non-token strings (answer field names, control keys,
+  operation labels, persistence keys) are one explicit allowlist, checked to be disjoint from
+  the token set — so a new refusal cannot reach a caller without a place to look it up.
 
 ## Best-effort persistence
 

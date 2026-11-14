@@ -45,10 +45,12 @@ import java.io.File
  * cannot look up.
  *
  * The inputs are the registered command list, the command constants in the dispatcher, the token
- * constants `CommandReasons.kt` declares, the token literals written in a failure, reason, or
- * `unavailable` position anywhere in the main sources, and the document itself. The document is
- * read relative to this module (`android/app`), which is the Gradle test working directory, so
- * the same path resolves locally and in CI.
+ * constants `CommandReasons.kt` declares, every token-shaped constant in the agent sources, every
+ * token-shaped literal under the control package, and the document itself. A literal is matched
+ * wherever it appears — a failure code, a factory's message, a helper's `when` branch, a `Reading`
+ * reason — so a new shape does not need a new pattern. The document is read relative to this
+ * module (`android/app`), which is the Gradle test working directory, so the same path resolves
+ * locally and in CI.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -61,15 +63,26 @@ class CapabilityMatrixTest {
         File("src/main/java/com/phoneconnect/agent/control/CommandDispatcher.kt")
     private val reasonsSource =
         File("src/main/java/com/phoneconnect/agent/control/CommandReasons.kt")
-    private val mainSources = File("src/main/java")
+    private val agentSources = File("src/main/java/com/phoneconnect/agent")
     private val controlSources = File("src/main/java/com/phoneconnect/agent/control")
 
     /**
-     * `const val`s under `control/` that are control keys or answer field names, not tokens.
-     * A new key or field name must be added here, which is the point: it cannot slip in as a
-     * token that the document does not name.
+     * Strings that look like a token but are not one: answer field names, control keys, file
+     * operation labels, the envelope type, a file mode, and the keys the agent persists.
+     *
+     * Everything else that looks like a token must be in [CommandReasons.tokens]. This list is
+     * checked against the token set too, because an entry that collided with a real token would
+     * be skipped by the literal scan instead of failing it.
      */
-    private val controlFieldNames = setOf(
+    private val nonTokenStrings = setOf(
+        // Answer field names: device.info, telemetry, files, apps, screen, properties, control.
+        "at_ms", "pong", "model", "manufacturer", "android_version", "sdk", "release",
+        "build_id", "security_patch", "selected", "keys", "entries", "name", "path", "is_dir",
+        "size_bytes", "modified_ms", "data_base64", "truncated", "offset", "length", "append",
+        "bytes_written", "apps", "package", "label", "version_name", "version_code", "system",
+        "enabled", "updated_ms", "launched", "kill_requested", "png_base64", "width", "height",
+        "captured_at_ms", "key", "value", "applied", "mode_changed", "unavailable",
+        // Control keys: the readings control.get reports and the changes control.set names.
         ControlKey.BRIGHTNESS,
         ControlKey.BRIGHTNESS_MODE,
         ControlKey.VOLUME_MUSIC,
@@ -86,8 +99,15 @@ class CapabilityMatrixTest {
         ControlKey.BLUETOOTH,
         ControlKey.MOBILE_DATA,
         ControlKey.REBOOT,
-        ControlHandler.MODE_CHANGED,
-        ControlHandler.UNAVAILABLE,
+        // File operation labels used in an io_error message, and the mode a file is opened in.
+        "read", "write", "list", "mkdir", "delete", "rename", "from", "to", "get", "r",
+        // The envelope type the management channel recognises.
+        "type", "hello",
+        // Persistence keys and the refusal labels the agent stores for the setup screen.
+        "hub_url", "record", "last_clear_reason", "version", "device_id", "state",
+        "enrolled_at_ms", "credential", "identity_private_key", "identity_public_key",
+        "last_start_refusal", "connection", "foreground_service_timeout",
+        "foreground_service_start_not_allowed", "foreground_service_start_refused",
     )
 
     /** The first cell of a table row that names one command, e.g. ``| `device.info` | … |``. */
@@ -105,12 +125,6 @@ class CapabilityMatrixTest {
      */
     private val tokenConstant =
         Regex("""const val [A-Za-z_0-9]+\s*(?::\s*String\s*)?=\s*"([a-z][a-z0-9_]*)"""")
-
-    /**
-     * A call the vocabulary says carries a stable token: a failure's code or message, a
-     * `Reading.unavailable` reason, or a reason placed in the `unavailable` map.
-     */
-    private val tokenCall = Regex("""\b(?:unavailable\.put|CommandFailure|unavailable)\(""")
 
     /** A string literal a token can be written as: lowercase, underscores, no spaces. */
     private val tokenShapedLiteral = Regex("\"([a-z][a-z0-9_]*)\"")
@@ -173,70 +187,85 @@ class CapabilityMatrixTest {
     }
 
     @Test
-    fun `no control constant declares a token outside the list`() {
+    fun `the token list and the non-token allowlist are disjoint`() {
+        val collisions = CommandReasons.tokens.filter { token -> token in nonTokenStrings }
+
         assertTrue(
-            "the control source root must exist at ${controlSources.absolutePath}",
-            controlSources.isDirectory,
+            "a string cannot be both a device token and an allowlisted non-token: $collisions",
+            collisions.isEmpty(),
         )
-        val declared = controlSources.walkTopDown()
+    }
+
+    @Test
+    fun `no constant outside CommandReasons declares a token outside the list`() {
+        assertTrue(
+            "the agent source root must exist at ${agentSources.absolutePath}",
+            agentSources.isDirectory,
+        )
+        val files = agentSources.walkTopDown()
             .filter { file ->
                 file.isFile && file.extension == "kt" && file.name != "CommandReasons.kt"
             }
-            .flatMap { file ->
-                tokenConstant.findAll(file.readText())
-                    .map { match -> "${file.name}: ${match.groupValues[1]}" }
-                    .toList()
-            }
-            .filter { entry -> entry.substringAfter(": ") !in controlFieldNames }
             .toList()
+        assertTrue("no Kotlin sources under ${agentSources.absolutePath}", files.isNotEmpty())
 
-        val outside = declared.filter { entry ->
-            entry.substringAfter(": ") !in CommandReasons.tokens
+        var declarations = 0
+        val outside = files.flatMap { file ->
+            tokenConstant.findAll(file.readText()).mapNotNull { match ->
+                declarations++
+                entryOutsideAllowlist(file, match.groupValues[1])
+            }.toList()
         }
+        assertTrue(
+            "no token-shaped constant found under ${agentSources.absolutePath}: the scan would " +
+                "pass vacuously",
+            declarations > 0,
+        )
 
         assertTrue(
-            "a token constant outside CommandReasons (and outside the field-name allowlist) " +
-                "would escape the matrix; outside: $outside",
+            "a token-shaped constant must be in CommandReasons.tokens (and in " +
+                "docs/capabilities.md) or an allowlisted non-token; outside: $outside",
             outside.isEmpty(),
         )
     }
 
     @Test
-    fun `no handler writes a token literal outside the token list`() {
+    fun `no token-shaped literal under control escapes the token list`() {
         assertTrue(
-            "the main source root must exist at ${mainSources.absolutePath}",
-            mainSources.isDirectory,
+            "the control source root must exist at ${controlSources.absolutePath}",
+            controlSources.isDirectory,
         )
-        val files = mainSources.walkTopDown()
-            .filter { file -> file.isFile && file.extension == "kt" }
-            .toList()
-        assertTrue("no Kotlin sources under ${mainSources.absolutePath}", files.isNotEmpty())
-
-        var calls = 0
-        val literals = files.flatMap { file ->
-            val text = file.readText()
-            tokenCall.findAll(text).flatMap { match ->
-                calls++
-                tokenShapedLiteral.findAll(callArguments(text, match.range.last))
-                    .map { literal -> "${file.name}: ${literal.groupValues[1]}" }
-                    .toList()
+        val files = controlSources.walkTopDown()
+            .filter { file ->
+                file.isFile && file.extension == "kt" && file.name != "CommandReasons.kt"
             }
+            .toList()
+        assertTrue("no Kotlin sources under ${controlSources.absolutePath}", files.isNotEmpty())
+
+        var literals = 0
+        val outside = files.flatMap { file ->
+            tokenShapedLiteral.findAll(file.readText()).mapNotNull { match ->
+                literals++
+                entryOutsideAllowlist(file, match.groupValues[1])
+            }.toList()
         }
         assertTrue(
-            "no token-carrying call found under ${mainSources.absolutePath}: the scan would pass " +
-                "vacuously",
-            calls > 0,
+            "no token-shaped literal found under ${controlSources.absolutePath}: the scan would " +
+                "pass vacuously",
+            literals > 0,
         )
 
-        val outside = literals.filter { entry ->
-            entry.substringAfter(": ") !in CommandReasons.tokens
-        }
-
         assertTrue(
-            "a token literal in a failure, reason, or unavailable position must come from " +
-                "CommandReasons.tokens (and be named in docs/capabilities.md); outside: $outside",
+            "a token-shaped literal must be in CommandReasons.tokens (and in " +
+                "docs/capabilities.md) or an allowlisted non-token; outside: $outside",
             outside.isEmpty(),
         )
+    }
+
+    /** `null` when [value] is a token or an allowlisted non-token; otherwise the offending entry. */
+    private fun entryOutsideAllowlist(file: File, value: String): String? = when {
+        value in CommandReasons.tokens || value in nonTokenStrings -> null
+        else -> "${file.name}: $value"
     }
 
     @Test
@@ -271,40 +300,6 @@ class CapabilityMatrixTest {
         .lineSequence()
         .mapNotNull { line -> commandRow.find(line)?.groupValues?.get(1) }
         .toList()
-
-    /**
-     * The arguments of the call whose `(` is at [openParen], up to its matching `)`.
-     *
-     * Parens inside string literals are not counted, and a raw string is skipped whole, so a
-     * message such as `"(limit 2 000 apps)"` cannot cut the call short.
-     */
-    private fun callArguments(text: String, openParen: Int): String {
-        var depth = 0
-        var index = openParen
-        while (index < text.length) {
-            val char = text[index]
-            if (char == '"') {
-                if (text.startsWith("\"\"\"", index)) {
-                    val end = text.indexOf("\"\"\"", index + 3)
-                    if (end < 0) return text.substring(openParen + 1)
-                    index = end + 3
-                    continue
-                }
-                index++
-                while (index < text.length && text[index] != '"') {
-                    if (text[index] == '\\') index++
-                    index++
-                }
-            } else if (char == '(') {
-                depth++
-            } else if (char == ')') {
-                depth--
-                if (depth == 0) return text.substring(openParen + 1, index)
-            }
-            index++
-        }
-        return text.substring(openParen + 1)
-    }
 
     /**
      * A dispatcher with every handler configured, so a registered name cannot answer
