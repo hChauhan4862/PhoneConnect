@@ -12,6 +12,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod console;
+pub mod controls;
 pub mod enrollment;
 pub mod files;
 pub mod leases;
@@ -271,6 +272,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/devices/{device_id}/console/logcat",
             post(console::tail_logcat),
+        )
+        // Device control: the readings the device can produce, the three changes it can make,
+        // and the constant refusals for everything Android removed or made signature-level.
+        .route(
+            "/api/devices/{device_id}/control/get",
+            post(controls::read_controls),
+        )
+        .route(
+            "/api/devices/{device_id}/control/set",
+            post(controls::set_control),
+        )
+        .route(
+            "/api/devices/{device_id}/control/reboot",
+            post(controls::reboot_device),
         )
         .route(
             "/api/devices/{device_id}/lease",
