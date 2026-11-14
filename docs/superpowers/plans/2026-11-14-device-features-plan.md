@@ -116,13 +116,30 @@ Steps: mirror Task 2's cycle (tests → implement Android → server → web →
 - Create: `web/src/routes/ScreenRoute.tsx`, `ConsoleRoute.tsx` + tests
 - Modify: `CommandDispatcher.kt`, `server/src/lib.rs`, `web/src/api.ts`, `web/src/routing.ts`
 
+**Ruling — implement only what an ordinary app can actually do.**
+A normal installed app cannot run `adb shell`, cannot read logcat (`READ_LOGS` is
+signature-level), and cannot capture the screen without `MediaProjection` consent. Shipping
+those as commands that always fail would be a dead control; shipping them as pretend
+successes would be worse. So this task implements the one real capability and reports the
+others as explicit, documented refusals.
+
 **Interfaces:**
-- `screen.snapshot {}` → `{png_base64,width,height,captured_at_ms}` produced by `AccessibilityService`-free `MediaProjection` only if consent already granted; without consent return `error: consent_required` and never prompt from a command. Cap at 4 MiB.
-- `shell.exec {command,timeout_ms}` → `{stdout,stderr,exit_code}` — runs only an allowlisted set of read-only commands (`getprop`, `dumpsys` subsets, `logcat -d`), documented; anything else is `not_permitted`.
-- `logcat.stream {lines}` → bounded tail (`<=500` lines, `<=256 KiB`), one-shot.
+- `screen.snapshot {}` → `{png_base64,width,height,captured_at_ms}` from `MediaProjection`.
+  Consent is requested only from the setup screen (a user action), stored for the service
+  lifetime; without consent the command returns `error: consent_required` and never prompts.
+  PNG is downscaled as needed so the encoded result stays under 2 MiB.
+- `system.props {}` → `{selected map}` read through `android.os.SystemProperties`
+  reflection for a documented allowlist (sdk, release, model, manufacturer, build id,
+  security patch); anything else is `not_permitted`. This replaces `shell.exec` for the
+  read-only properties that are actually reachable.
+- `shell.exec` and `logcat.tail` → always `error: not_permitted` with a constant message
+  naming the platform restriction, documented in `android/README.md` and rendered in the UI
+  as unavailable-with-reason. They exist so callers get a machine code instead of
+  `unknown_command`.
 - The server forwards these as normal commands; no streaming endpoint in this task.
 
-Steps: tests first (consent-required path, allowlist refusal, bounded logcat), then Android, server, web, verify, commit.
+Steps: tests first (consent-required path, property allowlist, the two documented refusals,
+size cap), then Android (including the setup-screen consent action), server, web, verify, commit.
 
 ### Task 5: Toggles and device control
 
