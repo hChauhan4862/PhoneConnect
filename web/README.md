@@ -81,11 +81,13 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   secondary viewer gets a short "requires control access" line instead of the panel, because
   `control.get` would answer `lease_read_only` — a refusal the viewer can do nothing about.
   A failed change renders the device's reason token as the sentence the operator needs (an
-  unknown token is shown verbatim). An `unconfirmed` answer opens with "The device could not
-  confirm that" rather than the default "did not do that", and the panel re-reads the readings
-  after an `unconfirmed` answer or any brightness outcome it cannot pin down (a refusal, an
-  `ok` whose output is not a confirmation, or a poll that fails after the command was
-  accepted), because any of those can leave the device different from the map on screen.
+  unknown token is shown verbatim). Acceptance is what decides the alert's lead: a failure
+  *before* the command is accepted (a dispatch refusal, a bad body) says "The device did not do
+  that", while an `ok` whose output is not a confirmation, or a poll that fails after the
+  command was accepted, says "The device may not have completed that" — and an `unconfirmed`
+  answer says "The device could not confirm that", because no lead may deny a change the device
+  may have made. Every unknown outcome re-reads the readings for any key, so no stale value (or
+  a stale `brightness_mode`) can sit under an alert that says the outcome is unknown.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

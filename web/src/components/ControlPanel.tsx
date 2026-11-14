@@ -12,6 +12,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   ApiClient,
+  CommandAccepted,
   CommandView,
   ControlReadingsOutput,
   ControlSetOutput,
@@ -57,6 +58,12 @@ const DND_OPTIONS = [
   { value: "4", label: "Alarms only" },
 ];
 
+/// A rendered failure: the device's answer, plus the lead sentence this screen knows is true.
+interface ActionFailure {
+  failure: Failure;
+  lead?: string;
+}
+
 export interface ControlPanelProps {
   api: ApiClient;
   deviceId: string;
@@ -72,7 +79,7 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
   const [reloadNonce, setReloadNonce] = useState(0);
 
   const [busy, setBusy] = useState(false);
-  const [actionFailure, setActionFailure] = useState<Failure | null>(null);
+  const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const [brightness, setBrightness] = useState("");
@@ -143,47 +150,63 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
 
   /// Sends one change and waits for the device's own answer. Only `ok` may put a confirmation
   /// on the screen; then the whole map is re-read rather than patched with the value sent.
+  ///
+  /// Acceptance and the answer are separate facts: a failure before the command is accepted is
+  /// a refusal ("the device did not do that"), while a failure after it — or an `ok` whose
+  /// output cannot be read — is an unknown outcome, and neither the alert nor the map may
+  /// pretend otherwise.
   async function apply(key: string, value: ControlValue, label: string): Promise<void> {
     setBusy(true);
     setActionFailure(null);
     setNotice(null);
     try {
-      const accepted = await api.setControl(deviceId, userId, key, value);
-      const command = await pollCommand(api, userId, accepted.command_id, {
-        pollIntervalMs,
-        isActive: () => mounted.current,
-      });
-      if (!mounted.current) return;
-      if (command.status !== "ok") {
-        const failure = actionFailureOf(command);
-        setActionFailure(failure);
-        // Anything that may have reached the device must not leave the previous map looking
-        // current: `unconfirmed` means the value may have moved either way, and a brightness
-        // change turns automatic mode off before it can fail.
-        if (failure.code === "unconfirmed" || key === "brightness") {
+      let accepted: CommandAccepted;
+      try {
+        accepted = await api.setControl(deviceId, userId, key, value);
+      } catch (error) {
+        // Nothing was dispatched, so this is the ordinary refusal it looks like.
+        if (mounted.current) setActionFailure({ failure: failureOfError(error) });
+        return;
+      }
+      try {
+        const command = await pollCommand(api, userId, accepted.command_id, {
+          pollIntervalMs,
+          isActive: () => mounted.current,
+        });
+        if (!mounted.current) return;
+        if (command.status !== "ok") {
+          const failure = actionFailureOf(command);
+          setActionFailure({ failure, lead: failureLead(failure) });
+          // Anything that may have reached the device must not leave the previous map looking
+          // current: `unconfirmed` means the value may have moved either way, and a brightness
+          // change turns automatic mode off before it can fail.
+          if (failure.code === "unconfirmed" || key === "brightness") {
+            await read(() => mounted.current);
+          }
+          return;
+        }
+        const result = readApplied(command.output);
+        if (!result) {
+          // The device answered `ok`: it acted, but its answer does not say what happened.
+          setActionFailure({
+            failure: {
+              code: "invalid_result",
+              message: "the device's answer does not confirm the change",
+            },
+            lead: UNKNOWN_OUTCOME_LEAD,
+          });
+          await read(() => mounted.current);
+          return;
+        }
+        setNotice(noticeFor(label, key, result));
+        await read(() => mounted.current);
+      } catch (error) {
+        // The command was accepted, so it may have reached the device: the poll's failure is
+        // not evidence that nothing happened.
+        if (mounted.current) {
+          setActionFailure({ failure: failureOfError(error), lead: UNKNOWN_OUTCOME_LEAD });
           await read(() => mounted.current);
         }
-        return;
-      }
-      const result = readApplied(command.output);
-      if (!result) {
-        setActionFailure({
-          code: "invalid_result",
-          message: "the device's answer does not confirm the change",
-        });
-        // The device answered `ok` but said nothing about the value: for brightness that can
-        // mean the mode changed, so the map is read again instead of kept.
-        if (key === "brightness") await read(() => mounted.current);
-        return;
-      }
-      setNotice(noticeFor(label, key, result));
-      await read(() => mounted.current);
-    } catch (error) {
-      if (mounted.current) {
-        setActionFailure(failureOfError(error));
-        // The poll can fail after the command reached the device, so a brightness failure here
-        // is an unknown outcome too: the old map may already be wrong.
-        if (key === "brightness") await read(() => mounted.current);
       }
     } finally {
       if (mounted.current) setBusy(false);
@@ -230,9 +253,9 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
 
       {actionFailure ? (
         <FailureNotice
-          failure={actionFailure}
-          lead={failureLead(actionFailure)}
-          note={failureNote(actionFailure)}
+          failure={actionFailure.failure}
+          lead={actionFailure.lead}
+          note={failureNote(actionFailure.failure)}
         />
       ) : null}
       {notice ? (
@@ -414,20 +437,21 @@ function actionFailureOf(command: CommandView): Failure {
   };
 }
 
-/// The one code whose meaning needs a lead of its own: the device may well have done it, so the
-/// default "The device did not do that" would contradict the note below it.
-const FAILURE_LEADS: Record<string, string> = {
-  unconfirmed: "The device could not confirm that",
-};
+/// What an alert says when the command was accepted and the answer never came back, or came
+/// back `ok` in a shape the panel cannot read. The device may well have done it.
+const UNKNOWN_OUTCOME_LEAD = "The device may not have completed that";
+
+/// The lead a terminal answer earns: the device said it could not confirm the change, so the
+/// default "did not do that" would contradict the note below it. Every other refusal keeps the
+/// default.
+function failureLead(failure: Failure): string | undefined {
+  return failure.code === "unconfirmed" ? "The device could not confirm that" : undefined;
+}
 
 /// The one code whose meaning needs a sentence of its own: the change was accepted but nothing
 /// confirmed it.
 const UNCONFIRMED_NOTE =
   "the device accepted the change but could not read the value back, so the panel does not treat it as applied";
-
-function failureLead(failure: Failure): string | undefined {
-  return FAILURE_LEADS[failure.code];
-}
 
 function failureNote(failure: Failure): string | undefined {
   return failure.code === "unconfirmed" ? UNCONFIRMED_NOTE : undefined;

@@ -292,6 +292,9 @@ describe("the control panel", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("invalid_result");
+    // The device answered ok, so the alert must not deny the change.
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
     await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
   });
 
@@ -323,8 +326,63 @@ describe("the control panel", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("network_unavailable");
+    // The command was accepted, so the alert must not deny it.
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
     // The command may have reached the device, so the old map must not survive the error.
     await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+  });
+
+  it("re-reads a non-brightness key when the poll fails after acceptance", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi([]);
+    let polls = 0;
+    api.command = vi.fn(async () => {
+      polls += 1;
+      if (polls === 1) return command();
+      if (polls === 2) throw new ApiError(0, "network_unavailable");
+      return command({ output: { ...READINGS, volume_music: 2 } });
+    });
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/music volume/i);
+    await user.clear(field);
+    await user.type(field, "2");
+    await user.click(screen.getByRole("button", { name: /set music volume/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    // The volume may have moved: the map is re-read rather than left stale.
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+    const list = screen.getByRole("list", { name: /control readings/i });
+    const volumeRow = within(list)
+      .getAllByRole("listitem")
+      .find((row) => row.textContent?.startsWith("Music volume2") === true);
+    expect(volumeRow).toBeDefined();
+    expect(volumeRow).toHaveTextContent("Music volume2");
+    expect(within(list).queryByText("7")).not.toBeInTheDocument();
+  });
+
+  it("keeps the refusal lead when the command was never accepted", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi([command()]);
+    api.setControl = vi.fn(async () => {
+      throw new ApiError(409, "device_offline");
+    });
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/music volume/i);
+    await user.clear(field);
+    await user.type(field, "4");
+    await user.click(screen.getByRole("button", { name: /set music volume/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // Nothing was dispatched, so this really is "did not do that" — and no re-read is needed.
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(api.controlReadings).toHaveBeenCalledTimes(1);
   });
 
   it("renders the mode-left-manual brightness reason as a sentence, not a token", async () => {
