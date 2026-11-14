@@ -7,6 +7,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { createHttpApi, type ApiClient } from "./api";
 import { AccessGateRoute } from "./routes/AccessGateRoute";
+import { AppsRoute } from "./routes/AppsRoute";
 import { CommandsRoute } from "./routes/CommandsRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
 import { DeviceStatusRoute } from "./routes/DeviceStatusRoute";
@@ -114,6 +115,9 @@ function AuthenticatedShell({
       ) : null}
       {route.name === "files" ? (
         <FilesRoute api={api} deviceId={route.deviceId} userId={session.userId} />
+      ) : null}
+      {route.name === "apps" ? (
+        <AppsRoute api={api} deviceId={route.deviceId} userId={session.userId} />
       ) : null}
       {route.name === "devices" ? (
         <DeviceListRoute api={api} userId={session.userId} />

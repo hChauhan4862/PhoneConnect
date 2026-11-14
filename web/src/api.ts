@@ -151,6 +151,36 @@ export interface FileWriteOutput {
   bytes_written: number;
 }
 
+/// One installed app, exactly as the device reported it. A label the platform could not
+/// resolve is the package name, never an invented one; [version_name] is absent on packages
+/// that do not set it.
+export interface AppEntryView {
+  package: string;
+  label: string;
+  version_name: string | null;
+  version_code: number;
+  system: boolean;
+  enabled: boolean;
+  updated_ms: number;
+}
+
+/// `apps.list` output: the apps visible to the device's own UID.
+export interface AppListOutput {
+  apps: AppEntryView[];
+}
+
+/// `apps.launch` output: the platform accepted the start unless the command failed.
+export interface AppLaunchOutput {
+  package: string;
+  launched: boolean;
+}
+
+/// `apps.stop` output: a kill Android was asked for, not a stop it confirmed.
+export interface AppKillOutput {
+  package: string;
+  kill_requested: boolean;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -212,6 +242,31 @@ export interface ApiClient {
     userId: string,
     from: string,
     to: string,
+  ): Promise<CommandAccepted>;
+  /// The app commands. Each returns the accepted command id, which is polled like any other
+  /// command: the device's own answer — including `launch_blocked` or `not_permitted` — is the
+  /// only result.
+  listApps(deviceId: string, userId: string): Promise<CommandAccepted>;
+  launchApp(
+    deviceId: string,
+    userId: string,
+    packageName: string,
+  ): Promise<CommandAccepted>;
+  stopApp(
+    deviceId: string,
+    userId: string,
+    packageName: string,
+  ): Promise<CommandAccepted>;
+  clearApp(
+    deviceId: string,
+    userId: string,
+    packageName: string,
+  ): Promise<CommandAccepted>;
+  setAppEnabled(
+    deviceId: string,
+    userId: string,
+    packageName: string,
+    enabled: boolean,
   ): Promise<CommandAccepted>;
 }
 
@@ -315,6 +370,15 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
       filesRequest(deviceId, userId, "delete", { path }),
     renameEntry: (deviceId, userId, from, to) =>
       filesRequest(deviceId, userId, "rename", { from, to }),
+    listApps: (deviceId, userId) => appsRequest(deviceId, userId, "list", {}),
+    launchApp: (deviceId, userId, packageName) =>
+      appsRequest(deviceId, userId, "launch", { package: packageName }),
+    stopApp: (deviceId, userId, packageName) =>
+      appsRequest(deviceId, userId, "stop", { package: packageName }),
+    clearApp: (deviceId, userId, packageName) =>
+      appsRequest(deviceId, userId, "clear", { package: packageName }),
+    setAppEnabled: (deviceId, userId, packageName, enabled) =>
+      appsRequest(deviceId, userId, "set_enabled", { package: packageName, enabled }),
   };
 
   function filesRequest(
@@ -326,6 +390,19 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
     return request<CommandAccepted>(
       "POST",
       `/api/devices/${encodeURIComponent(deviceId)}/files/${operation}?user_id=${encodeURIComponent(userId)}`,
+      body,
+    );
+  }
+
+  function appsRequest(
+    deviceId: string,
+    userId: string,
+    operation: string,
+    body: unknown,
+  ): Promise<CommandAccepted> {
+    return request<CommandAccepted>(
+      "POST",
+      `/api/devices/${encodeURIComponent(deviceId)}/apps/${operation}?user_id=${encodeURIComponent(userId)}`,
       body,
     );
   }

@@ -117,6 +117,11 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
     createDirectory: vi.fn(async () => ({ command_id: "cmd_1" })),
     deleteEntry: vi.fn(async () => ({ command_id: "cmd_1" })),
     renameEntry: vi.fn(async () => ({ command_id: "cmd_1" })),
+    listApps: vi.fn(async () => ({ command_id: "cmd_1" })),
+    launchApp: vi.fn(async () => ({ command_id: "cmd_1" })),
+    stopApp: vi.fn(async () => ({ command_id: "cmd_1" })),
+    clearApp: vi.fn(async () => ({ command_id: "cmd_1" })),
+    setAppEnabled: vi.fn(async () => ({ command_id: "cmd_1" })),
     command: vi.fn(async () => ({
       command_id: "cmd_1",
       device_id: "dev_1",
@@ -562,6 +567,21 @@ describe("the file browser route", () => {
 
     expect(
       await screen.findByRole("heading", { name: /^files$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /back to status/i }),
+    ).toHaveAttribute("href", "/devices/dev_1");
+  });
+});
+
+describe("the apps screen route", () => {
+  it("renders the apps screen at the device's apps path", async () => {
+    installHost("browser");
+    const api = createFakeApi(statusFixture());
+    renderApp(api, "/devices/dev_1/apps");
+
+    expect(
+      await screen.findByRole("heading", { name: /^apps$/i }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /back to status/i }),

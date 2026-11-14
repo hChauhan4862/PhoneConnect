@@ -137,6 +137,21 @@ form {
   border-bottom: 1px solid var(--border);
 }
 
+.app-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.app-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
 .muted {
   color: var(--muted);
 }

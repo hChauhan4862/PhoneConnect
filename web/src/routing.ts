@@ -9,6 +9,7 @@ export type Route =
   | { name: "telemetry"; deviceId: string }
   | { name: "commands"; deviceId: string }
   | { name: "files"; deviceId: string }
+  | { name: "apps"; deviceId: string }
   | { name: "unknown"; path: string };
 
 export function devicePath(deviceId: string): string {
@@ -25,6 +26,10 @@ export function commandsPath(deviceId: string): string {
 
 export function filesPath(deviceId: string): string {
   return `${devicePath(deviceId)}/files`;
+}
+
+export function appsPath(deviceId: string): string {
+  return `${devicePath(deviceId)}/apps`;
 }
 
 function decodeSegment(segment: string): string | null {
@@ -52,6 +57,9 @@ export function matchRoute(pathname: string): Route {
   }
   if (segments.length === 3 && segments[2] === "files") {
     return { name: "files", deviceId };
+  }
+  if (segments.length === 3 && segments[2] === "apps") {
+    return { name: "apps", deviceId };
   }
   return { name: "unknown", path: pathname };
 }

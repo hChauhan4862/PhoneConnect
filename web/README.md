@@ -28,7 +28,8 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   current route. It contains no screen logic.
 - `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
   `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry),
-  `/devices/:id/commands` (the command console), and `/devices/:id/files` (the file browser).
+  `/devices/:id/commands` (the command console), `/devices/:id/files` (the file browser), and
+  `/devices/:id/apps` (the app inventory).
   The server's SPA fallback serves the same document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
@@ -36,13 +37,19 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   embedded page makes exactly the calls a browser makes.
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
-  `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `NotFoundRoute`.
+  `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `AppsRoute`,
+  `NotFoundRoute`.
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
   `TelemetryPanel` (bounded aggregates and explicit freshness), `CommandPanel` (dispatch
   and poll), and `FileList` (one directory's entries). `FileList` is presentational: `FilesRoute`
   owns navigation and every operation, clears the listing the moment the path changes, refuses
   a success whose output is not a listing, and requires a second confirmation before a write or
-  a delete. `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
+  a delete. `AppList` is presentational in the same way: `AppsRoute` owns the commands, clears
+  the listing on every reload, drops a late answer for an abandoned query, shows a launch
+  refusal (`launch_blocked`) as an alert with its machine code, says only that Android was
+  *asked* to kill a package, and renders `apps.clear`/`apps.set_enabled` as disabled controls
+  with the signature-permission reason and the ADB path — never as buttons that fail
+  silently. `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
   `ok` shows output, and a refused dispatch (`device_offline`, `device_revoked`,
   `lease_read_only`) is an alert, never a pending row that looks like it is working. `LeasePanel` offers revoke and
   handoff to the owner *or* the holder, because the server lets the owner revoke a lease they

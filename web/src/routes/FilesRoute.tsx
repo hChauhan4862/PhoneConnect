@@ -8,22 +8,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-  asApiError,
   type ApiClient,
   type CommandAccepted,
   type CommandView,
   type FileEntryView,
 } from "../api";
+import { FailureNotice } from "../components/FailureNotice";
 import { FileList } from "../components/FileList";
 import { RouteLink } from "../components/RouteLink";
 import { pollCommand } from "../data/commands";
+import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
 import { devicePath } from "../routing";
-
-/// A machine code and, when the device gave one, its explanation. Nothing here is a success.
-interface Failure {
-  code: string;
-  message: string | null;
-}
 
 interface StagedWrite {
   name: string;
@@ -444,33 +439,6 @@ export function FilesRoute({
       ) : null}
     </>
   );
-}
-
-function FailureNotice({ failure }: { failure: Failure }) {
-  return (
-    <div role="alert" className="notice notice-error">
-      <p>
-        <strong>The device did not do that</strong> <code>{failure.code}</code>
-      </p>
-      {failure.message ? <p>{failure.message}</p> : null}
-    </div>
-  );
-}
-
-function failureOfCommand(command: CommandView): Failure {
-  // `timeout` and a poll budget that ended in `pending` are their own codes, never
-  // `device_error`: the screen says exactly which state it saw.
-  return {
-    code: command.error ?? command.status,
-    message:
-      command.message ??
-      (command.status === "pending" ? "the device has not answered yet" : null),
-  };
-}
-
-function failureOfError(error: unknown): Failure {
-  const api = asApiError(error);
-  return { code: api.code, message: null };
 }
 
 function readListing(output: unknown): FileEntryView[] | null {
