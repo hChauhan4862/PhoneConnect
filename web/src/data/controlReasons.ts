@@ -26,6 +26,16 @@ export const REASON_TEXT: Record<string, string> = {
   no_telephony_data: "this device has no mobile-data radio",
   battery_not_reported: "the battery does not report a capacity",
   brightness_not_applied: "the settings provider accepted the write but the value did not stick",
+  brightness_mode_automatic:
+    "automatic brightness governs the display and could not be confirmed off, so a stored value would not hold",
+  brightness_not_applied_mode_left_manual:
+    "the brightness did not stick, and automatic brightness could not be turned back on, so the display is left in manual mode",
+  read_back_unavailable:
+    "the platform accepted the write but would not report the value back, so the change cannot be confirmed",
+  read_back_unavailable_mode_left_manual:
+    "the change could not be confirmed, and automatic brightness could not be turned back on, so the display is left in manual mode",
+  write_settings_required_mode_left_manual:
+    "the system-settings grant was withdrawn mid-change, and automatic brightness could not be turned back on, so the display is left in manual mode",
   volume_not_applied: "the audio service did not apply the volume",
   dnd_not_applied: "the interruption filter did not change",
   volume_max_unreadable: "the device would not report its music volume range",

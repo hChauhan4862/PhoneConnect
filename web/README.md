@@ -75,6 +75,10 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   re-reads `control.get` after a confirmed change instead of assuming the value took. A
   secondary viewer gets a short "requires control access" line instead of the panel, because
   `control.get` would answer `lease_read_only` — a refusal the viewer can do nothing about.
+  A failed change renders the device's reason token as the sentence the operator needs (an
+  unknown token is shown verbatim), words `unconfirmed` as "the device accepted the change but
+  could not confirm it", and re-reads the readings after an `unconfirmed` answer or a failed
+  brightness change, because either can leave the device different from the map on screen.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

@@ -12,12 +12,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   ApiClient,
+  CommandView,
   ControlReadingsOutput,
   ControlSetOutput,
   ControlValue,
 } from "../api";
 import { pollCommand } from "../data/commands";
-import { reasonText } from "../data/controlReasons";
+import { REASON_TEXT, reasonText } from "../data/controlReasons";
 import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
 import { FailureNotice } from "./FailureNotice";
 
@@ -154,7 +155,14 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
       });
       if (!mounted.current) return;
       if (command.status !== "ok") {
-        setActionFailure(failureOfCommand(command));
+        const failure = actionFailureOf(command);
+        setActionFailure(failure);
+        // Anything that may have reached the device must not leave the previous map looking
+        // current: `unconfirmed` means the value may have moved either way, and a brightness
+        // change turns automatic mode off before it can fail.
+        if (failure.code === "unconfirmed" || key === "brightness") {
+          await read(() => mounted.current);
+        }
         return;
       }
       const result = readApplied(command.output);
@@ -212,7 +220,9 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         </ul>
       ) : null}
 
-      {actionFailure ? <FailureNotice failure={actionFailure} /> : null}
+      {actionFailure ? (
+        <FailureNotice failure={actionFailure} note={failureNote(actionFailure)} />
+      ) : null}
       {notice ? (
         <p role="status" className="notice">
           {notice}
@@ -379,6 +389,26 @@ function readApplied(output: unknown): ControlSetOutput | null {
     brightness_mode: mode,
     mode_changed: changed,
   };
+}
+
+/// A machine reason in the device's message is rendered as the sentence the operator needs; the
+/// code stays the machine identity the caller acts on.
+function actionFailureOf(command: CommandView): Failure {
+  const failure = failureOfCommand(command);
+  const message = failure.message;
+  return {
+    code: failure.code,
+    message: message !== null && REASON_TEXT[message] !== undefined ? reasonText(message) : message,
+  };
+}
+
+/// The one code whose meaning needs a sentence of its own: the change was accepted but nothing
+/// confirmed it.
+const UNCONFIRMED_NOTE =
+  "the device accepted the change but could not confirm it, so the panel does not treat it as applied";
+
+function failureNote(failure: Failure): string | undefined {
+  return failure.code === "unconfirmed" ? UNCONFIRMED_NOTE : undefined;
 }
 
 /// The confirmation never claims more than the answer did: a brightness change that turned

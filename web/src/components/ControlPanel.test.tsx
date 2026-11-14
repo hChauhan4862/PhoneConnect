@@ -159,7 +159,8 @@ describe("the control panel", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("not_permitted");
-    expect(alert).toHaveTextContent("policy_access_required");
+    // The device's reason token is rendered as the sentence an operator can act on.
+    expect(alert).toHaveTextContent(/Do Not Disturb access/i);
     expect(screen.queryByText(/device confirmed/i)).not.toBeInTheDocument();
     // No re-read after a refusal: the panel has nothing new to show.
     expect(api.controlReadings).toHaveBeenCalledTimes(1);
@@ -228,6 +229,73 @@ describe("the control panel", () => {
     expect(
       screen.getByText(/turned automatic brightness off so it holds/i),
     ).toBeInTheDocument();
+  });
+
+  it("explains an unconfirmed change and re-reads instead of keeping the old map", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi([
+      command(),
+      command({
+        name: "control.set",
+        status: "error",
+        output: null,
+        error: "unconfirmed",
+        message: "read_back_unavailable",
+      }),
+      command({ output: { ...READINGS, volume_music: 4 } }),
+    ]);
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/music volume/i);
+    await user.clear(field);
+    await user.type(field, "4");
+    await user.click(screen.getByRole("button", { name: /set music volume/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("unconfirmed");
+    expect(alert).toHaveTextContent(/accepted the change but could not confirm/i);
+    // The value may or may not have moved, so the map is read again rather than assumed.
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+    const list = screen.getByRole("list", { name: /control readings/i });
+    expect(within(list).getByText("4")).toBeInTheDocument();
+  });
+
+  it("renders the mode-left-manual brightness reason as a sentence, not a token", async () => {
+    const user = userEvent.setup();
+    const granted: ControlReadingsOutput = {
+      ...READINGS,
+      brightness_mode: 1,
+      unavailable: { ...READINGS.unavailable },
+    };
+    delete granted.unavailable.brightness;
+    delete granted.unavailable.dnd_filter;
+
+    const api = fakeApi([
+      command({ output: granted }),
+      command({
+        name: "control.set",
+        status: "error",
+        output: null,
+        error: "not_applied",
+        message: "brightness_not_applied_mode_left_manual",
+      }),
+      // The failed change left the display manual: the panel must show that, not the old mode.
+      command({ output: { ...granted, brightness_mode: 0 } }),
+    ]);
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/brightness value/i);
+    await user.clear(field);
+    await user.type(field, "120");
+    await user.click(screen.getByRole("button", { name: /set brightness/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("not_applied");
+    expect(alert).toHaveTextContent(/automatic brightness could not be turned back on/i);
+    expect(alert).not.toHaveTextContent("brightness_not_applied_mode_left_manual");
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
   });
 
   it("drops the readings when the re-read after a confirmed change fails", async () => {
