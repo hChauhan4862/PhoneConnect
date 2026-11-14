@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use phoneconnect_server::relay::RelayLimits;
 use phoneconnect_server::store::{Clock, ManualClock, SqliteStore};
@@ -70,6 +70,21 @@ impl TestApp {
         bearer: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let (status, _headers, value) = self
+            .request_with_headers(method, uri, bearer, body)
+            .await;
+        (status, value)
+    }
+
+    /// The same request, with the response headers a caller may have to act on
+    /// (`Retry-After` on a throttled command).
+    pub async fn request_with_headers(
+        &self,
+        method: Method,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, HeaderMap, Value) {
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(token) = bearer {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -88,6 +103,7 @@ impl TestApp {
             .await
             .expect("router responds");
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response
             .into_body()
             .collect()
@@ -99,7 +115,7 @@ impl TestApp {
         } else {
             serde_json::from_slice(&bytes).expect("json response")
         };
-        (status, value)
+        (status, headers, value)
     }
 
     pub async fn issue_token(&self, owner_id: &str) -> String {
@@ -571,6 +587,45 @@ pub mod control {
             .send(Message::Text(value.to_string().into()))
             .await
             .expect("frame sent");
+    }
+
+    /// Sends a frame and reports whether the socket accepted it, so a flood test can stop
+    /// when the server has already closed the channel.
+    pub async fn try_send(socket: &mut Socket, value: Value) -> bool {
+        socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .is_ok()
+    }
+
+    /// Answers a real WebSocket upgrade request on a connection that cannot be upgraded.
+    ///
+    /// The extractor accepts the request, the handler runs and answers `101`, and the upgrade
+    /// future then fails. That is exactly the "failed upgrade" an agent can hit, and it must
+    /// not touch the device's registration.
+    pub async fn failed_upgrade(app: &TestApp, device_id: &str, credential: &str) -> StatusCode {
+        use tower::ServiceExt;
+
+        let mut request = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(path(device_id))
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .header("authorization", format!("Bearer {credential}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        // `on` with no connection upgrade in place yields a future that fails at once; the
+        // extractor removes it, so the handler's upgrade never completes.
+        let not_upgradable = hyper::upgrade::on(&mut request);
+        request.extensions_mut().insert(not_upgradable);
+
+        phoneconnect_server::build_router(app.state.clone())
+            .oneshot(request)
+            .await
+            .expect("router responds")
+            .status()
     }
 
     pub async fn send_text(socket: &mut Socket, text: &str) {

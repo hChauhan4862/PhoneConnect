@@ -3042,6 +3042,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
+ "hyper",
  "phoneconnect-protocol",
  "rusqlite",
  "serde",

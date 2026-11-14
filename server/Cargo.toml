@@ -39,6 +39,9 @@ tokio = { version = "1.54.1", features = [
 ] }
 
 [dev-dependencies]
+# The management tests answer an upgrade on a connection that cannot be upgraded, which needs
+# hyper's own `OnUpgrade` to make the failure deterministic.
+hyper = { version = "1.12.0", features = ["server", "http1"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1.5"
 tokio = { version = "1.54.1", features = ["test-util", "macros", "rt"] }

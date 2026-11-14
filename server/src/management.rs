@@ -12,7 +12,11 @@
 //! - a result may not exceed [`MAX_RESULT_BYTES`], and an oversized one refuses the command
 //!   with `result_too_large` instead of being held;
 //! - commands live in memory only; the audit row written by the HTTP surface is the durable
-//!   trace, so there is no commands table.
+//!   trace, so there is no commands table;
+//! - one device cannot degrade ingest for the others: its inbound frames and bytes are
+//!   rate-limited (see [`limits`]) and an over-budget channel is closed with
+//!   [`CLOSE_RATE_LIMITED`]; command creation is throttled per device and answers
+//!   `429 rate_limited`.
 //!
 //! Frame shapes are fixed by the design:
 //! - device → server `{"type":"hello"|"telemetry"|"result", ...}`,
@@ -69,6 +73,31 @@ const POLICY_CLOSE_CODE: u16 = 1008;
 /// Close reasons the device reads. Each names why the channel ended.
 pub const CLOSE_REPLACED: &str = "replaced";
 pub const CLOSE_MALFORMED_FRAME: &str = "malformed_frame";
+pub const CLOSE_RATE_LIMITED: &str = "rate_limited";
+
+/// The management channel's rate limits, in one place.
+///
+/// The design calls this channel "rate-limited and bounded": size alone is not enough, because
+/// one device could otherwise flood telemetry (every sample takes the single global ingest
+/// mutex) or a `hello` loop, degrading every other device, and one operator could append audit
+/// rows without bound. Every bucket starts full, refills continuously, and is charged per
+/// device, so reconnecting does not reset a limit.
+pub mod limits {
+    /// Inbound frames per second from one device.
+    pub const FRAMES_PER_SECOND: f64 = 20.0;
+    /// Burst of inbound frames, so a reconnecting device can send its hello and first sample
+    /// at once.
+    pub const FRAME_BURST: f64 = 40.0;
+
+    /// Inbound bytes per second from one device. A full 2 MiB result still fits a single
+    /// frame; a stream of them does not.
+    pub const BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
+    pub const BYTE_BURST: f64 = 8.0 * 1024.0 * 1024.0;
+
+    /// Command creations per device per second on the HTTP path.
+    pub const COMMAND_CREATES_PER_SECOND: f64 = 10.0;
+    pub const COMMAND_BURST: f64 = 20.0;
+}
 
 /// The description a device sends in its `hello` frame, before any command is dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +152,8 @@ pub enum DispatchError {
     InvalidTimeout,
     #[error("command name must be 1 to {MAX_COMMAND_NAME_BYTES} bytes")]
     InvalidName,
+    #[error("command creation is throttled; retry in {retry_after_ms}ms")]
+    RateLimited { retry_after_ms: i64 },
     #[error("command state is unavailable")]
     Internal,
 }
@@ -160,12 +191,76 @@ struct Connection {
     hello: Option<DeviceHello>,
 }
 
+/// A continuously refilling token bucket. `take` is the only operation that changes it, and
+/// it reports how long until enough tokens exist so the caller can say `Retry-After`.
+#[derive(Debug, Clone)]
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_ms: f64,
+    last_refill_ms: UnixMs,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, per_second: f64, now_ms: UnixMs) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_ms: per_second / 1_000.0,
+            last_refill_ms: now_ms,
+        }
+    }
+
+    fn refill(&mut self, now_ms: UnixMs) {
+        let elapsed_ms = (now_ms - self.last_refill_ms).max(0) as f64;
+        if elapsed_ms > 0.0 {
+            self.tokens = (self.tokens + elapsed_ms * self.refill_per_ms).min(self.capacity);
+            self.last_refill_ms = now_ms;
+        }
+    }
+
+    /// Charges `cost`. `Err(retry_after_ms)` means the budget is exhausted; a cost larger
+    /// than the whole bucket can never fit and is refused rather than wedging the caller.
+    fn take(&mut self, cost: f64, now_ms: UnixMs) -> Result<(), i64> {
+        self.refill(now_ms);
+        if cost > self.capacity {
+            return Err(1_000);
+        }
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            Ok(())
+        } else {
+            Err((((cost - self.tokens) / self.refill_per_ms).ceil() as i64).max(1))
+        }
+    }
+}
+
+/// One device's inbound budget: a frame rate and a byte rate.
+#[derive(Debug, Clone)]
+struct IngestBudget {
+    frames: TokenBucket,
+    bytes: TokenBucket,
+}
+
+impl IngestBudget {
+    fn new(now_ms: UnixMs) -> Self {
+        Self {
+            frames: TokenBucket::new(limits::FRAME_BURST, limits::FRAMES_PER_SECOND, now_ms),
+            bytes: TokenBucket::new(limits::BYTE_BURST, limits::BYTES_PER_SECOND, now_ms),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RegistryInner {
     next_connection_id: u64,
     connections: HashMap<String, Connection>,
     commands: HashMap<String, CommandRecord>,
     completed: VecDeque<String>,
+    /// Per-device inbound budgets, keyed by device so a reconnect does not reset them.
+    ingest: HashMap<String, IngestBudget>,
+    /// Per-device command-creation budgets, same reasoning.
+    creates: HashMap<String, TokenBucket>,
 }
 
 impl RegistryInner {
@@ -318,6 +413,23 @@ impl DeviceRegistry {
         }
     }
 
+    /// Charges one inbound frame against the device's budget. `None` means it fits;
+    /// `Some(retry_after_ms)` means the channel is over budget and must be closed with
+    /// [`CLOSE_RATE_LIMITED`].
+    pub fn charge_ingest(&self, device_id: &str, frame_bytes: usize) -> Option<i64> {
+        let now = self.now_ms();
+        let mut inner = self.inner();
+        let budget = inner
+            .ingest
+            .entry(device_id.to_owned())
+            .or_insert_with(|| IngestBudget::new(now));
+        budget
+            .frames
+            .take(1.0, now)
+            .and(budget.bytes.take(frame_bytes as f64, now))
+            .err()
+    }
+
     /// Hands one command to the device's channel.
     pub fn dispatch(
         &self,
@@ -337,6 +449,20 @@ impl DeviceRegistry {
         };
         let now = self.now_ms();
         let mut inner = self.inner();
+        // Throttle creation before anything else: a flood of attempts must not append audit
+        // rows or reach the device.
+        inner
+            .creates
+            .entry(device_id.to_owned())
+            .or_insert_with(|| {
+                TokenBucket::new(
+                    limits::COMMAND_BURST,
+                    limits::COMMAND_CREATES_PER_SECOND,
+                    now,
+                )
+            })
+            .take(1.0, now)
+            .map_err(|retry_after_ms| DispatchError::RateLimited { retry_after_ms })?;
         inner.expire(now);
         // Clone the sender out of the map: the guard borrows the whole registry, so one
         // borrow cannot stay alive while the command table is updated.
@@ -365,6 +491,10 @@ impl DeviceRegistry {
             "name": name,
             "args": args.unwrap_or(Value::Null),
             "deadline_ms": deadline_ms,
+            // The absolute server deadline. A device that dequeues the frame after it passed
+            // must refuse to start the command: a duration alone would let a queued command
+            // run long after the server already reported `timeout`.
+            "expires_at_ms": now + deadline_ms,
         });
         // The record exists before the frame can be answered, so an immediate result is never
         // dropped as unknown. A full or closed channel means the writer is gone or cannot keep
@@ -545,17 +675,18 @@ pub async fn control_socket(
     if device.device_id != device_id {
         return Err(ControlError::DeviceScopeMismatch { device_id });
     }
-    let (commands_tx, commands_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_DEVICE);
-    let (close_tx, close_rx) = watch::channel(None);
-    let connection = state
-        .management
-        .connect(&device.device_id, commands_tx, close_tx);
     let device_id = device.device_id;
     Ok(upgrade
         .max_message_size(MAX_CLIENT_MESSAGE_BYTES)
         .max_frame_size(MAX_CLIENT_MESSAGE_BYTES)
-        .on_upgrade(move |socket| {
-            run_channel(socket, state, device_id, connection, commands_rx, close_rx)
+        // Registration happens inside the upgrade future, not before it: an upgrade that
+        // fails after the `101` must not displace the device's live channel or leave a
+        // registration whose receiver no longer exists.
+        .on_upgrade(move |socket| async move {
+            let (commands_tx, commands_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_DEVICE);
+            let (close_tx, close_rx) = watch::channel(None);
+            let connection = state.management.connect(&device_id, commands_tx, close_tx);
+            run_channel(socket, state, device_id, connection, commands_rx, close_rx).await;
         })
         .into_response())
 }
@@ -597,6 +728,16 @@ async fn run_channel(
             },
             inbound = stream.next() => match inbound {
                 Some(Ok(Message::Text(text))) => {
+                    if state
+                        .management
+                        .charge_ingest(&device_id, text.len())
+                        .is_some()
+                    {
+                        let _ = sink
+                            .send(Message::Close(Some(policy_close(CLOSE_RATE_LIMITED))))
+                            .await;
+                        break;
+                    }
                     if handle_frame(&state, &device_id, &connection, text.as_str()).is_err() {
                         let _ = sink
                             .send(Message::Close(Some(policy_close(CLOSE_MALFORMED_FRAME))))

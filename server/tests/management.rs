@@ -137,6 +137,11 @@ async fn a_new_connection_replaces_the_old_one_and_fails_its_pending_command() {
     let command_id = body["command_id"].as_str().expect("command_id").to_owned();
     let outbound = control::next_json(&mut first).await;
     assert_eq!(outbound["type"], "command");
+    assert_eq!(
+        outbound["expires_at_ms"],
+        json!(app.now() + 10_000),
+        "the frame carries the server's absolute deadline, not only a duration"
+    );
 
     // One connection per device: the second attach closes the first explicitly.
     let mut second = control::connect(&base, &device_id, &credential)
@@ -167,6 +172,109 @@ async fn a_new_connection_replaces_the_old_one_and_fails_its_pending_command() {
     assert_eq!(request["name"], "device.info");
 
     second.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_telemetry_flood_closes_the_channel_as_rate_limited() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // The server clock does not advance, so nothing refills: the frame budget must run out.
+    let mut sent = 0usize;
+    while sent < 1_000 {
+        let frame = json!({
+            "type": "telemetry",
+            "sample": { "sampled_at_ms": app.now(), "battery_percent": 50 }
+        });
+        if !control::try_send(&mut socket, frame).await {
+            break;
+        }
+        sent += 1;
+    }
+
+    let (code, reason) = control::next_close(&mut socket).await;
+    assert_eq!(code, 1008);
+    assert_eq!(reason, "rate_limited");
+    control::wait_offline(&app, &device_id).await;
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_normal_telemetry_cadence_is_not_rate_limited() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // The agent's cadence is one sample every 30 s; the limiter must not mistake it for a flood.
+    for _ in 0..4 {
+        app.clock.advance_ms(30_000);
+        control::send(
+            &mut socket,
+            json!({
+                "type": "telemetry",
+                "sample": { "sampled_at_ms": app.now(), "battery_percent": 55 }
+            }),
+        )
+        .await;
+    }
+    let mut received = 0;
+    for _ in 0..200 {
+        if let Some(aggregate) = app.state.telemetry.aggregate(&device_id) {
+            received = aggregate.samples_received;
+            if received == 4 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(received, 4, "every sample in a normal cadence is ingested");
+    assert!(
+        app.state.management.is_online(&device_id),
+        "a normal cadence must leave the channel open"
+    );
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_failed_upgrade_does_not_displace_the_live_channel() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // A second upgrade that fails after the handler answered must not evict the healthy
+    // connection: the registration is only made once a socket actually exists.
+    let status = control::failed_upgrade(&app, &device_id, &credential).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SWITCHING_PROTOCOLS,
+        "the handler answered the upgrade; only the upgrade itself failed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (status, body) = app
+        .dispatch_command(
+            &device_id,
+            "user-a",
+            json!({ "name": "device.ping", "args": null, "timeout_ms": null }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "the device must still be online after a failed upgrade: {body}"
+    );
+    let request = control::next_json(&mut socket).await;
+    assert_eq!(
+        request["type"], "command",
+        "the healthy channel still receives commands, got {request}"
+    );
+
+    socket.close(None).await.expect("channel closed");
     server.abort();
 }
 

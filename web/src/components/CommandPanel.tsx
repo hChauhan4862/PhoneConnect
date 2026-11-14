@@ -32,6 +32,7 @@ const REFUSAL_MESSAGES: Record<string, string> = {
   device_revoked: "This device was revoked, so it cannot be commanded.",
   lease_read_only: "You do not control this device, so the command was refused.",
   command_capacity: "This device already has too many commands in flight. Try again shortly.",
+  rate_limited: "Commands for this device are being sent too quickly. Wait a moment and retry.",
   invalid_timeout: "The requested deadline is outside the allowed range.",
 };
 

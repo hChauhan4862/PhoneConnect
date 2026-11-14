@@ -68,7 +68,16 @@ class DeviceControlChannel(
     private val openSocket: suspend (url: String, bearer: String) -> Result<ControlSocket> =
         { url, bearer -> OkHttpControlSocket.connect(url, bearer) },
     private val pause: suspend (Long) -> Unit = { delay(it) },
+    private val clock: () -> Long = System::currentTimeMillis,
 ) : ManagementChannel {
+    /**
+     * The server's clock minus this device's, taken as the largest implied offset any command
+     * frame has shown. Every sample underestimates the offset by that frame's queue and
+     * transit delay, so the maximum is the closest underestimate: the estimate never runs
+     * ahead of the server, a fresh command is never falsely expired, and a command that
+     * waited out its deadline is still caught once the wait exceeds the least delay seen.
+     */
+    private var serverOffsetMs: Long? = null
     override suspend fun run(
         store: EnrollmentStore,
         onState: suspend (ManagementChannelState) -> Unit,
@@ -162,10 +171,45 @@ class DeviceControlChannel(
         val requestId = command.optString("request_id")
         if (requestId.isEmpty()) return
         val name = command.optString("name")
-        val args = command.optJSONObject("args")
         val deadlineMs = command
             .optLong("deadline_ms", DEFAULT_COMMAND_DEADLINE_MS)
             .coerceIn(1, MAX_COMMAND_DEADLINE_MS)
+
+        // Arguments the handlers cannot use are refused by name, not silently treated as
+        // "no arguments".
+        val rawArgs = command.opt("args")
+        if (rawArgs != null && rawArgs != JSONObject.NULL && rawArgs !is JSONObject) {
+            socket.send(
+                resultFrame(
+                    requestId,
+                    Result.failure(CommandFailure.invalid("args must be a JSON object")),
+                ).toString(),
+            )
+            return
+        }
+        val args = rawArgs as? JSONObject
+
+        // A command that was queued past the server's deadline must not run: the caller has
+        // already been told `timeout`, and executing it now would invite a duplicate.
+        val nowMs = clock()
+        val expiresAtMs = command.optLong("expires_at_ms", 0L)
+        if (expiresAtMs > 0L) {
+            observeServerClock(expiresAtMs - deadlineMs, nowMs)
+        }
+        if (expiredBeforeStart(expiresAtMs, nowMs)) {
+            socket.send(
+                resultFrame(
+                    requestId,
+                    Result.failure(
+                        CommandFailure(
+                            "timeout",
+                            "$name was queued past its deadline and was not executed",
+                        ),
+                    ),
+                ).toString(),
+            )
+            return
+        }
 
         val result = withTimeoutOrNull(deadlineMs) {
             withContext(Dispatchers.Default) { dispatcher.dispatch(name, args) }
@@ -173,6 +217,25 @@ class DeviceControlChannel(
             CommandFailure("timeout", "$name did not finish within ${deadlineMs}ms"),
         )
         socket.send(resultFrame(requestId, result).toString())
+    }
+
+    /**
+     * Refuses to *start* a command whose absolute server deadline has already passed. The
+     * device's own clock is only trusted through the offset learned from the channel, so
+     * ordinary clock skew between the phone and the server cannot expire fresh commands.
+     */
+    private fun expiredBeforeStart(expiresAtMs: Long, nowMs: Long): Boolean {
+        if (expiresAtMs <= 0L) return false
+        val offset = serverOffsetMs ?: return false
+        return nowMs + offset >= expiresAtMs
+    }
+
+    private fun observeServerClock(sentAtMs: Long, nowMs: Long) {
+        val implied = sentAtMs - nowMs
+        val current = serverOffsetMs
+        if (current == null || implied > current) {
+            serverOffsetMs = implied
+        }
     }
 
     private fun resultFrame(requestId: String, result: Result<JSONObject>): JSONObject {

@@ -162,6 +162,11 @@ async fn a_valid_command_round_trips_device_info() {
     assert_eq!(request["name"], "device.info");
     assert_eq!(request["args"], json!(null));
     assert_eq!(request["deadline_ms"], DEFAULT_COMMAND_TIMEOUT_MS);
+    assert_eq!(
+        request["expires_at_ms"],
+        json!(app.now() + DEFAULT_COMMAND_TIMEOUT_MS),
+        "the device needs the server's absolute deadline, not only a duration"
+    );
 
     let (status, body) = app.command(&command_id, "user-a").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -322,6 +327,8 @@ async fn in_flight_commands_per_device_are_capped() {
     let (_socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
 
     for index in 0..MAX_IN_FLIGHT_PER_DEVICE {
+        // Pace the dispatches: this test is about the in-flight cap, not the creation rate.
+        app.clock.advance_ms(100);
         let (status, body) = app
             .dispatch_command(
                 &device_id,
@@ -337,6 +344,101 @@ async fn in_flight_commands_per_device_are_capped() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(body["error"], "command_capacity");
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_lease_holder_may_command_until_the_lease_is_revoked() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // The owner hands control to user-b; user-b is now the actor who may command.
+    let (status, handoff) = app.handoff_lease(&device_id, "user-a", "user-b", 600).await;
+    assert_eq!(status, StatusCode::OK, "{handoff}");
+    let lease_id = handoff["lease"]["lease_id"]
+        .as_str()
+        .expect("lease_id")
+        .to_owned();
+
+    let (status, body) = app.dispatch_command(&device_id, "user-b", info_command()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let request = control::next_json(&mut socket).await;
+    assert_eq!(request["name"], "device.info");
+
+    // Revocation ends the holder's authorization immediately.
+    let (status, body) = app.revoke_lease(&lease_id, "user-a").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app.dispatch_command(&device_id, "user-b", info_command()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "lease_read_only");
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn command_creation_is_throttled_per_device() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    // The bucket starts full and the server clock does not advance, so it must empty.
+    let mut accepted = 0;
+    loop {
+        let (status, _body, _headers) = app
+            .request_with_headers(
+                Method::POST,
+                &format!("/api/devices/{device_id}/commands?user_id=user-a"),
+                Some(common::ADMIN_TOKEN),
+                Some(info_command()),
+            )
+            .await;
+        if status != StatusCode::ACCEPTED {
+            break;
+        }
+        accepted += 1;
+        assert!(accepted <= 128, "the throttle never fired");
+    }
+    assert!(
+        (1..MAX_IN_FLIGHT_PER_DEVICE).contains(&accepted),
+        "the throttle must fire before the in-flight cap, got {accepted}"
+    );
+
+    let (status, headers, body) = app
+        .request_with_headers(
+            Method::POST,
+            &format!("/api/devices/{device_id}/commands?user_id=user-a"),
+            Some(common::ADMIN_TOKEN),
+            Some(info_command()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"], "rate_limited");
+    let retry_after = headers
+        .get("retry-after")
+        .expect("a throttled command says when to retry")
+        .to_str()
+        .expect("ascii")
+        .parse::<u64>()
+        .expect("seconds");
+    assert!((1..=60).contains(&retry_after), "{retry_after}");
+
+    // A throttled attempt is still a traceable attempt.
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows readable");
+    assert_eq!(rows[0].outcome, "refused");
+    assert_eq!(rows[0].error.as_deref(), Some("rate_limited"));
+
+    // The bucket refills with time, so the device is usable again.
+    app.clock.advance_ms(1_000);
+    let (status, body) = app.dispatch_command(&device_id, "user-a", info_command()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "a refilled bucket accepts again: {body}");
+
+    socket.close(None).await.expect("channel closed");
     server.abort();
 }
 

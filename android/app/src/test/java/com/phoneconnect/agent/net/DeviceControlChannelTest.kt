@@ -190,6 +190,142 @@ class DeviceControlChannelTest {
         assertEquals(ManagementChannelState.OFFLINE, states.last())
     }
 
+    @Test
+    fun `a command queued past its server deadline is refused without running`() = runBlocking {
+        val serverBase = 1_760_000_000_000L
+        val deviceNow = java.util.concurrent.atomic.AtomicLong(1_000)
+        val executed = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val results = Channel<JSONObject>(Channel.BUFFERED)
+        val handlers = object : CommandDispatcher(telemetry = telemetry) {
+            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+                executed += name
+                return Result.success(JSONObject().put("pong", true))
+            }
+        }
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        val frame = JSONObject(text)
+                        when (frame.optString("type")) {
+                            "hello" -> webSocket.send(
+                                command("cmd_1", "device.ping", expiresAtMs = serverBase + 10_000),
+                            )
+
+                            "result" -> {
+                                results.trySend(frame)
+                                when (frame.optString("request_id")) {
+                                    "cmd_1" -> {
+                                        // 600 s pass while the channel is busy, then three
+                                        // frames arrive: two that waited out their deadline
+                                        // back to back, and one the server dispatched only now.
+                                        deviceNow.addAndGet(600_000)
+                                        webSocket.send(
+                                            command("cmd_2", "device.info", expiresAtMs = serverBase + 10_000),
+                                        )
+                                        webSocket.send(
+                                            command("cmd_3", "device.info", expiresAtMs = serverBase + 10_000),
+                                        )
+                                        webSocket.send(
+                                            command(
+                                                "cmd_4",
+                                                "device.info",
+                                                expiresAtMs = serverBase + 600_000 + 10_000,
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+
+                            else -> Unit
+                        }
+                    }
+                },
+            ),
+        )
+        val channel = DeviceControlChannel(
+            hub = hub,
+            dispatcher = handlers,
+            telemetry = telemetry,
+            telemetryIntervalMs = 60_000,
+            clock = { deviceNow.get() },
+        )
+        val job = launch(Dispatchers.IO) { channel.run(Store()) { } }
+
+        val first = withTimeout(20_000) { results.receive() }
+        assertEquals("cmd_1", first.getString("request_id"))
+        assertEquals("ok", first.getString("status"))
+
+        // The second stale frame arrives right behind the first: a naive "time since the last
+        // frame" estimate would be contaminated by that, so it must still be refused.
+        for (staleId in listOf("cmd_2", "cmd_3")) {
+            val stale = withTimeout(20_000) { results.receive() }
+            assertEquals(staleId, stale.getString("request_id"))
+            assertEquals("error", stale.getString("status"))
+            assertEquals("timeout", stale.getString("error"))
+        }
+
+        val fresh = withTimeout(20_000) { results.receive() }
+        assertEquals("cmd_4", fresh.getString("request_id"))
+        assertEquals("ok", fresh.getString("status"))
+
+        job.cancel()
+        assertEquals(
+            "a stale command must never reach a handler, and a fresh one must",
+            listOf("device.ping", "device.info"),
+            executed.toList(),
+        )
+    }
+
+    @Test
+    fun `arguments that are not a JSON object are refused as invalid_args`() = runBlocking {
+        val executed = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val result = Channel<JSONObject>(Channel.BUFFERED)
+        val handlers = object : CommandDispatcher(telemetry = telemetry) {
+            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+                executed += name
+                return Result.success(JSONObject())
+            }
+        }
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        val frame = JSONObject(text)
+                        when (frame.optString("type")) {
+                            "hello" -> webSocket.send(
+                                JSONObject()
+                                    .put("type", "command")
+                                    .put("request_id", "cmd_args")
+                                    .put("name", "device.info")
+                                    .put("args", org.json.JSONArray().put("not").put("an object"))
+                                    .put("deadline_ms", 10_000)
+                                    .toString(),
+                            )
+
+                            "result" -> result.trySend(frame)
+                            else -> Unit
+                        }
+                    }
+                },
+            ),
+        )
+        val channel = DeviceControlChannel(
+            hub = hub,
+            dispatcher = handlers,
+            telemetry = telemetry,
+            telemetryIntervalMs = 60_000,
+        )
+        val job = launch(Dispatchers.IO) { channel.run(Store()) { } }
+
+        val answer = withTimeout(20_000) { result.receive() }
+        job.cancel()
+
+        assertEquals("error", answer.getString("status"))
+        assertEquals("invalid_args", answer.getString("error"))
+        assertTrue("the handler must not run for unusable arguments", executed.isEmpty())
+    }
+
     private class Store : EnrollmentStore {
         override suspend fun info(): EnrollmentInfo =
             EnrollmentInfo("dev_1", EnrollmentState.ENROLLED, 1_000)
@@ -212,11 +348,13 @@ class DeviceControlChannelTest {
         requestId: String,
         name: String,
         deadlineMs: Long = 10_000,
+        expiresAtMs: Long = 0,
     ): String = JSONObject()
         .put("type", "command")
         .put("request_id", requestId)
         .put("name", name)
         .put("args", JSONObject.NULL)
         .put("deadline_ms", deadlineMs)
+        .put("expires_at_ms", expiresAtMs)
         .toString()
 }

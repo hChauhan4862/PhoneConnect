@@ -76,6 +76,8 @@ pub enum CommandError {
     InvalidRequest { reason: &'static str },
     #[error("command {command_id} is unknown")]
     CommandUnknown { command_id: String },
+    #[error("command creation is throttled; retry in {retry_after_ms}ms")]
+    RateLimited { retry_after_ms: i64 },
     #[error("the audit trace is unavailable: {0}")]
     StoreFailure(String),
 }
@@ -93,6 +95,7 @@ impl CommandError {
             Self::InvalidName => "invalid_command_name",
             Self::InvalidRequest { .. } => "invalid_request",
             Self::CommandUnknown { .. } => "command_unknown",
+            Self::RateLimited { .. } => "rate_limited",
             Self::StoreFailure(_) => "store_failure",
         }
     }
@@ -103,7 +106,7 @@ impl CommandError {
             Self::Lease(error) => error.status(),
             Self::DeviceUnknown { .. } | Self::CommandUnknown { .. } => StatusCode::NOT_FOUND,
             Self::DeviceRevoked { .. } | Self::DeviceOffline { .. } => StatusCode::CONFLICT,
-            Self::Capacity { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::Capacity { .. } | Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTimeout | Self::InvalidName | Self::InvalidRequest { .. } => {
                 StatusCode::BAD_REQUEST
             }
@@ -114,7 +117,22 @@ impl CommandError {
 
 impl IntoResponse for CommandError {
     fn into_response(self) -> Response {
-        (self.status(), Json(json!({ "error": self.code() }))).into_response()
+        let status = self.status();
+        // A throttled caller is told when the budget refills; every other refusal is the
+        // same `{"error": code}` envelope as the rest of the API.
+        let retry_after_seconds = match &self {
+            Self::RateLimited { retry_after_ms } => Some(((*retry_after_ms + 999) / 1_000).max(1)),
+            _ => None,
+        };
+        let mut response = (status, Json(json!({ "error": self.code() }))).into_response();
+        if let Some(seconds) = retry_after_seconds {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -135,6 +153,7 @@ impl From<DispatchError> for CommandError {
             DispatchError::Capacity { device_id, limit } => Self::Capacity { device_id, limit },
             DispatchError::InvalidTimeout => Self::InvalidTimeout,
             DispatchError::InvalidName => Self::InvalidName,
+            DispatchError::RateLimited { retry_after_ms } => Self::RateLimited { retry_after_ms },
             DispatchError::Internal => {
                 Self::StoreFailure("command id was not generated".to_owned())
             }

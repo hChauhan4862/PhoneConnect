@@ -24,6 +24,10 @@ class CommandFailure(val code: String, message: String? = null) : Exception(mess
  * The vocabulary belongs to the device: the server forwards whatever name it is given, and
  * a name this build does not implement is an explicit `unknown_command`. Adding a feature
  * means adding a branch here plus a handler file — no existing handler changes.
+ *
+ * Handlers are `suspend` so a deadline can stop them cooperatively; a handler that blocks a
+ * thread cannot be interrupted, which is why the channel also refuses to *start* a command
+ * whose absolute server deadline has already passed.
  */
 open class CommandDispatcher(
     private val telemetry: TelemetrySampler,

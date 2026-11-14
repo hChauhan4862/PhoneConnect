@@ -242,8 +242,12 @@ Frames are fixed:
 - device → server `{"type":"hello","model","android_version","sdk"}`,
   `{"type":"telemetry","sample":…}`, and
   `{"type":"result","request_id","status":"ok"|"error","output","error","message"}`;
-- server → device `{"type":"command","request_id","name","args","deadline_ms"}`, where
-  `deadline_ms` is a duration the device may spend, not an absolute timestamp.
+- server → device `{"type":"command","request_id","name","args","deadline_ms","expires_at_ms"}`,
+  where `deadline_ms` is a duration the device may spend and `expires_at_ms` is the same
+  deadline as absolute server time. A device that dequeues a frame after `expires_at_ms` must
+  refuse to start it and answer `timeout`: a duration alone would let a command queued behind
+  a slow handler run after the caller was already told it timed out. `args` is a JSON object or
+  null; any other type is refused `error: invalid_args`.
 
 One connection per device: a second connection replaces the first, which is closed with the
 `replaced` code and whose in-flight commands complete as `error`/`device_offline`. A frame
@@ -252,7 +256,11 @@ that is not valid JSON closes the channel with `malformed_frame`; an invalid tel
 
 Commands live in memory only: at most 64 in flight per device, a 10 s default and 60 s
 maximum deadline, and at most 2 MiB per result (an oversized result refuses the command with
-`result_too_large`). A command whose deadline passes reads as `timeout`; nothing pending is
+`result_too_large`). The channel is rate-limited per device, not just bounded: 20 inbound
+frames/s (burst 40) and 4 MiB/s (burst 8 MiB), with an over-budget channel closed as
+`rate_limited`; command creation is throttled at 10/s per device (burst 20) and answers
+`429 rate_limited` with `Retry-After`. Buckets are keyed by device, so reconnecting does not
+reset them. The numbers live in one `management::limits` block. A command whose deadline passes reads as `timeout`; nothing pending is
 ever left looking successful. The device owns the command vocabulary: the server forwards any
 name, and an unimplemented one comes back as `unknown_command`.
 
