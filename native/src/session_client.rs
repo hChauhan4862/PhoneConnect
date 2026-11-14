@@ -2,7 +2,9 @@
 //!
 //! The native client holds no privileged credentials: a session is authorized by the server
 //! for the signed-in user, the ticket is verified by the shared transport, and this module
-//! only chooses the path and reports which one won. The proxy then rides that path.
+//! only chooses the path and reports which one won. The proxy then rides that path through
+//! one demultiplexing reader ([`crate::proxy::ProxyHub`]), so several streams can share the
+//! session without racing for `recv_frame`.
 
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ use phoneconnect_transport::{
     RelayOnlyPath, Ticket,
 };
 
-use crate::proxy::{MAX_PROXY_CHUNK_BYTES, ProxyError, ProxyLimits, ProxySession, StreamSlot};
+use crate::proxy::{MAX_PROXY_CHUNK_BYTES, ProxyError, ProxyHub, ProxyLimits, ProxySession};
 
 /// The transport seam the native client uses for every device session.
 #[derive(Debug, Clone)]
@@ -79,11 +81,7 @@ impl SessionClient {
         let path =
             PathController::connect(ticket, candidates, setup.with_config(self.config.clone()))
                 .await?;
-        Ok(SessionPath {
-            path: Arc::new(path),
-            device_id,
-            streams: StreamSlot::default(),
-        })
+        Ok(SessionPath::new(path, device_id))
     }
 
     /// The relay fallback, used when direct negotiation already failed or UDP is disabled.
@@ -102,11 +100,7 @@ impl SessionClient {
             epoch: setup.epoch,
             config: self.config.clone(),
         })?;
-        Ok(SessionPath {
-            path: Arc::new(path),
-            device_id,
-            streams: StreamSlot::default(),
-        })
+        Ok(SessionPath::new(path, device_id))
     }
 
     fn device_id(&self, device_id: &str) -> Result<DeviceId, SessionClientError> {
@@ -123,15 +117,25 @@ impl Default for SessionClient {
     }
 }
 
-/// A connected session: one path, and the proxy streams that ride it.
+/// A connected session: one path, one demultiplexing reader, and the streams that ride it.
 #[derive(Debug)]
 pub struct SessionPath {
     path: Arc<ConnectedPath>,
     device_id: DeviceId,
-    streams: StreamSlot,
+    hub: ProxyHub,
 }
 
 impl SessionPath {
+    fn new(path: ConnectedPath, device_id: DeviceId) -> Self {
+        let path = Arc::new(path);
+        let hub = ProxyHub::new(Arc::clone(&path));
+        Self {
+            path,
+            device_id,
+            hub,
+        }
+    }
+
     /// The path path selection actually committed: direct or relay.
     pub fn path_kind(&self) -> PathKind {
         self.path.path_kind()
@@ -145,21 +149,21 @@ impl SessionPath {
         &self.device_id
     }
 
-    /// Builds the proxy pump for `stream`. One pump is active per path at a time; a second
-    /// claim is refused until the first is dropped.
-    pub fn proxy_session(
+    /// Builds the proxy pump for `stream`. One pump is active per stream at a time; different
+    /// streams run concurrently through the session's single reader.
+    pub async fn proxy_session(
         &self,
         stream: &str,
         limits: ProxyLimits,
     ) -> Result<ProxySession, ProxyError> {
-        let guard = self.streams.claim(stream)?;
-        ProxySession::new(
-            Arc::clone(&self.path),
-            self.device_id.clone(),
-            stream,
-            limits,
-            guard,
-        )
+        self.hub
+            .proxy_session(&self.device_id, stream, limits)
+            .await
+    }
+
+    /// True once the path has been shut down.
+    pub async fn is_closed(&self) -> bool {
+        self.path.is_closed().await
     }
 
     /// Tears the path down. The relay keepalive stops and the direct socket closes.

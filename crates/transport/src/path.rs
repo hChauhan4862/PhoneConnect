@@ -895,6 +895,13 @@ impl ConnectedPath {
         &self.session_id
     }
 
+    /// True once [`Self::shutdown`] has run. A caller that keeps a session across short-lived
+    /// operations — a proxy endpoint, for example — checks this to renegotiate instead of
+    /// handing more frames to a dead path.
+    pub async fn is_closed(&self) -> bool {
+        self.state.read().await.closed
+    }
+
     pub fn path_kind(&self) -> PathKind {
         match self.kind.load(Ordering::SeqCst) {
             // A transition path sends and reads both, so the session is already using the

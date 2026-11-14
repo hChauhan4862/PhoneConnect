@@ -65,10 +65,18 @@ ENROLL=$(curl -fsS -X POST "$BASE/api/devices/enroll" \
 DEVICE_ID=$(printf '%s' "$ENROLL" | json 'v["device_id"]')
 CREDENTIAL=$(printf '%s' "$ENROLL" | json 'v["credential"]')
 
+# The relay refuses a client's control frame on a read-only session, and this test proves a
+# control frame crosses processes. Grant the owner control, then create a control session so
+# the stub's CONTROL frames are authorized end to end.
+curl -fsS -X POST "$BASE/api/devices/$DEVICE_ID/lease" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"actor_id":"docker-e2e","expires_in_seconds":900}' >/dev/null
+
 SESSION=$(curl -fsS -X POST "$BASE/api/sessions" \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"device_id\":\"$DEVICE_ID\",\"client_identity_key\":\"$CLIENT_PUBLIC\"}")
+    -d "{\"device_id\":\"$DEVICE_ID\",\"client_identity_key\":\"$CLIENT_PUBLIC\",\"control\":true,\"user_id\":\"docker-e2e\"}")
 SESSION_ID=$(printf '%s' "$SESSION" | json 'v["session_id"]')
 CAPABILITY=$(printf '%s' "$SESSION" | json 'v["capability"]')
 VERIFICATION_KEY=$(printf '%s' "$SESSION" | json 'v["verification_key"]')

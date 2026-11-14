@@ -1,295 +1,52 @@
 //! Loopback proxy contract.
 //!
 //! Every test drives real loopback TCP sockets and a real `ConnectedPath`; the peer is a
-//! device-side stub that echoes `StreamKind::Proxy` envelopes, which is the shape the Android
-//! agent's TCP bridge will implement. Nothing here claims an Android endpoint exists: the
-//! stub is the peer and the relay is in-process, so these tests prove the native half only.
+//! device-side stub that answers `StreamKind::Proxy` envelopes, which is the shape the Android
+//! agent's TCP bridge will implement. Nothing here claims an Android endpoint exists.
+
+mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use phoneconnect::v1::{DeviceId, Envelope, RequestId, SessionId, StreamKind};
 use phoneconnect_native::proxy::{
-    LocalEndpoint, ProxyAllocator, ProxyCapability, ProxyError, ProxyLimits, ProxySummary,
+    LocalEndpoint, ProxyAllocator, ProxyCapability, ProxyError, ProxyLimits,
 };
-use phoneconnect_native::session_client::{SessionClient, SessionPath};
-use phoneconnect_transport::{
-    ConnectedPath, Epoch, HolePunchError, IdentityKey, PathConfig, PathError, PathKind,
-    RelayChannel, RelayError, RelayOnlyPath, TicketRole,
+use phoneconnect_native::session_client::SessionPath;
+use phoneconnect_transport::PathKind;
+use support::{
+    DEVICE, EchoMode, RelaySession, addr_of, limits, port_of, refusing_session, relay_session,
+    spawn_echo, stalled_session,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-const DEVICE: &str = "dev_native";
-const STREAM: &str = "adb";
-const CLIENT_NONCE: &str = "client-nonce";
-const DEVICE_NONCE: &str = "device-nonce";
-
-// --------------------------------------------------------------------------------------
-// In-process relay: two ends, each writing what the other reads.
-// --------------------------------------------------------------------------------------
-
-struct RelayEnd {
-    inbound: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
-    outbound: mpsc::Sender<Vec<u8>>,
+fn capability(stream: &str, ttl: Duration) -> ProxyCapability {
+    ProxyCapability::new(stream, Instant::now() + ttl).expect("valid capability")
 }
 
-impl RelayEnd {
-    fn pair(capacity: usize) -> (Arc<Self>, Arc<Self>) {
-        let (client_to_device, device_inbound) = mpsc::channel(capacity);
-        let (device_to_client, client_inbound) = mpsc::channel(capacity);
-        let client = Arc::new(Self {
-            inbound: tokio::sync::Mutex::new(client_inbound),
-            outbound: client_to_device,
-        });
-        let device = Arc::new(Self {
-            inbound: tokio::sync::Mutex::new(device_inbound),
-            outbound: device_to_client,
-        });
-        (client, device)
-    }
-}
-
-#[async_trait]
-impl RelayChannel for RelayEnd {
-    async fn send_frame(&self, frame: &[u8]) -> Result<(), RelayError> {
-        self.outbound
-            .send(frame.to_vec())
-            .await
-            .map_err(|_| RelayError::Closed {
-                reason: "peer is gone".to_owned(),
-            })
-    }
-
-    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
-        self.inbound
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(RelayError::Closed {
-                reason: "peer is gone".to_owned(),
-            })
-    }
-
-    async fn close(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-
-    fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(5))
-    }
-}
-
-/// A relay that refuses every send, so a failed send must be reported rather than hidden.
-struct RefusingRelay;
-
-#[async_trait]
-impl RelayChannel for RefusingRelay {
-    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
-        Err(RelayError::Closed {
-            reason: "relay closed the transport".to_owned(),
-        })
-    }
-
-    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
-        std::future::pending().await
-    }
-
-    async fn close(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-}
-
-/// A relay that stalls on the first send, counting attempts so the test can see how much the
-/// proxy buffered while the transport was blocked.
-struct StalledRelay {
-    attempts: AtomicUsize,
-}
-
-#[async_trait]
-impl RelayChannel for StalledRelay {
-    async fn send_frame(&self, _frame: &[u8]) -> Result<(), RelayError> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        std::future::pending().await
-    }
-
-    async fn recv_frame(&self) -> Result<Vec<u8>, RelayError> {
-        std::future::pending().await
-    }
-
-    async fn close(&self) -> Result<(), RelayError> {
-        Ok(())
-    }
-}
-
-// --------------------------------------------------------------------------------------
-// Session fixtures.
-// --------------------------------------------------------------------------------------
-
-struct RelaySession {
-    client: SessionPath,
-    device: Arc<ConnectedPath>,
-}
-
-fn session_id(name: &str) -> SessionId {
-    SessionId::new(format!("sess_{name}")).expect("valid session id")
-}
-
-fn epoch() -> Epoch {
-    Epoch::new(CLIENT_NONCE, DEVICE_NONCE).expect("epoch")
-}
-
-fn relay_session(name: &str) -> RelaySession {
-    let client_identity = IdentityKey::generate().expect("client identity");
-    let device_identity = IdentityKey::generate().expect("device identity");
-    let session = session_id(name);
-    let (client_relay, device_relay) = RelayEnd::pair(8);
-
-    let client = SessionClient::new()
-        .connect_relay_only(RelayOnlyPath {
-            relay: client_relay,
-            identity: &client_identity,
-            peer_identity: device_identity.public_key(),
-            session_id: session.as_str(),
-            device_id: DEVICE,
-            role: TicketRole::Client,
-            epoch: &epoch(),
-            config: PathConfig::default(),
-        })
-        .expect("relay session");
-    let device = Arc::new(
-        ConnectedPath::relay_only(RelayOnlyPath {
-            relay: device_relay,
-            identity: &device_identity,
-            peer_identity: client_identity.public_key(),
-            session_id: session.as_str(),
-            device_id: DEVICE,
-            role: TicketRole::Device,
-            epoch: &epoch(),
-            config: PathConfig::default(),
-        })
-        .expect("device stub path"),
-    );
-    RelaySession { client, device }
-}
-
-fn refusing_session(name: &str) -> SessionPath {
-    let identity = IdentityKey::generate().expect("identity");
-    let peer = IdentityKey::generate().expect("peer identity");
-    SessionClient::new()
-        .connect_relay_only(RelayOnlyPath {
-            relay: Arc::new(RefusingRelay),
-            identity: &identity,
-            peer_identity: peer.public_key(),
-            session_id: session_id(name).as_str(),
-            device_id: DEVICE,
-            role: TicketRole::Client,
-            epoch: &epoch(),
-            config: PathConfig::default(),
-        })
-        .expect("refusing session")
-}
-
-fn stalled_session(name: &str) -> (SessionPath, Arc<StalledRelay>) {
-    let identity = IdentityKey::generate().expect("identity");
-    let peer = IdentityKey::generate().expect("peer identity");
-    let relay = Arc::new(StalledRelay {
-        attempts: AtomicUsize::new(0),
-    });
-    let session = SessionClient::new()
-        .connect_relay_only(RelayOnlyPath {
-            relay: Arc::clone(&relay) as Arc<dyn RelayChannel>,
-            identity: &identity,
-            peer_identity: peer.public_key(),
-            session_id: session_id(name).as_str(),
-            device_id: DEVICE,
-            role: TicketRole::Client,
-            epoch: &epoch(),
-            config: PathConfig::default(),
-        })
-        .expect("stalled session");
-    (session, relay)
-}
-
-/// The device-side stub: every proxy envelope is echoed with its request id intact, which is
-/// all an ADB byte bridge has to do once the Android side lands.
-fn spawn_echo(
-    device: Arc<ConnectedPath>,
-) -> (JoinHandle<()>, Arc<std::sync::Mutex<Vec<Envelope>>>) {
-    let seen: Arc<std::sync::Mutex<Vec<Envelope>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&seen);
-    let handle = tokio::spawn(async move {
-        loop {
-            match device.recv_frame().await {
-                Ok(envelope) => {
-                    recorded
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push(envelope.clone());
-                    let request = RequestId::new(envelope.request_id.clone())
-                        .expect("the request id the peer used is valid");
-                    let mut reply = Envelope::new(
-                        StreamKind::Proxy,
-                        &DeviceId::new(envelope.device_id.clone()).expect("device id"),
-                        &SessionId::new(envelope.session_id.clone()).expect("session id"),
-                        &request,
-                    );
-                    reply.deadline_unix_ms = envelope.deadline_unix_ms;
-                    reply.payload = envelope.payload.clone();
-                    if device.send_frame(&reply).await.is_err() {
-                        return;
-                    }
-                }
-                // The relay is silent between requests; that is not a failure.
-                Err(PathError::HolePunch(HolePunchError::ReceiveTimeout))
-                | Err(PathError::FramesLost { .. }) => continue,
-                Err(_) => return,
-            }
-        }
-    });
-    (handle, seen)
-}
-
-fn limits() -> ProxyLimits {
-    ProxyLimits {
-        max_chunk_bytes: 16 * 1024,
-        send_timeout: Duration::from_secs(5),
-        idle_timeout: Duration::from_secs(10),
-        frame_deadline: Duration::from_secs(10),
-    }
-}
-
-fn capability(ttl: Duration) -> ProxyCapability {
-    ProxyCapability::new(STREAM, Instant::now() + ttl).expect("valid capability")
-}
-
-fn port_of(endpoint: &LocalEndpoint) -> u16 {
-    endpoint
-        .url
-        .rsplit(':')
-        .next()
-        .expect("endpoint URL has a port")
-        .parse()
-        .expect("endpoint URL port is numeric")
+async fn bind(allocator: &ProxyAllocator, stream: &str) -> LocalEndpoint {
+    allocator
+        .bind(DEVICE, capability(stream, Duration::from_secs(30)))
+        .await
+        .expect("bind")
 }
 
 /// Binds one endpoint and serves one local connection over `session`.
 async fn serve_one(
     allocator: Arc<ProxyAllocator>,
-    session: SessionPath,
+    session: &SessionPath,
+    stream: &str,
     limits: ProxyLimits,
-) -> (JoinHandle<Result<ProxySummary, ProxyError>>, LocalEndpoint) {
-    let endpoint = allocator
-        .bind(DEVICE, capability(Duration::from_secs(30)))
-        .await
-        .expect("bind");
+) -> (
+    JoinHandle<Result<phoneconnect_native::proxy::ProxySummary, ProxyError>>,
+    LocalEndpoint,
+) {
+    let endpoint = bind(&allocator, stream).await;
     let proxy = session
-        .proxy_session(STREAM, limits)
+        .proxy_session(stream, limits)
+        .await
         .expect("proxy session");
     let served = endpoint.clone();
     let handle = tokio::spawn(async move { allocator.serve(&served, proxy).await });
@@ -310,11 +67,14 @@ async fn read_until_closed(client: &mut TcpStream) {
     }
 }
 
-fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
+async fn echo_reply(client: &mut TcpStream, payload: &[u8], expected: &[u8], timeout: Duration) {
+    client.write_all(payload).await.expect("write");
+    let mut echoed = vec![0u8; expected.len()];
+    tokio::time::timeout(timeout, client.read_exact(&mut echoed))
+        .await
+        .expect("echo arrives")
+        .expect("read echo");
+    assert_eq!(echoed, expected, "bytes survived the proxy untouched");
 }
 
 // --------------------------------------------------------------------------------------
@@ -325,12 +85,12 @@ fn unix_ms() -> i64 {
 async fn an_endpoint_is_loopback_only_and_uses_an_unused_ephemeral_port() {
     let allocator = ProxyAllocator::new();
     let endpoint = allocator
-        .bind(DEVICE, capability(Duration::from_secs(60)))
+        .bind(DEVICE, capability("adb", Duration::from_secs(60)))
         .await
         .expect("bind");
 
     assert_eq!(endpoint.device_id, DEVICE);
-    assert_eq!(endpoint.stream, STREAM);
+    assert_eq!(endpoint.stream, "adb");
     assert!(
         endpoint.url.starts_with("http://127.0.0.1:"),
         "an endpoint is a loopback HTTP URL, got {}",
@@ -339,7 +99,7 @@ async fn an_endpoint_is_loopback_only_and_uses_an_unused_ephemeral_port() {
     assert_ne!(port_of(&endpoint), 0, "an ephemeral port was assigned");
 
     let address = allocator
-        .local_addr(DEVICE, STREAM)
+        .local_addr(DEVICE, "adb")
         .await
         .expect("the bound address is reported");
     assert!(address.ip().is_loopback(), "never bound to a routable IP");
@@ -381,30 +141,11 @@ async fn concurrent_binds_never_share_a_port() {
 }
 
 #[tokio::test]
-async fn an_already_expired_capability_never_binds() {
-    let allocator = ProxyAllocator::new();
-    let expired = ProxyCapability::new(STREAM, Instant::now() - Duration::from_secs(1))
-        .expect("a stream identifier");
-    let error = allocator
-        .bind(DEVICE, expired)
-        .await
-        .expect_err("an expired capability must not open a port");
-    assert!(
-        matches!(error, ProxyError::CapabilityExpired { .. }),
-        "{error:?}"
-    );
-    assert!(allocator.endpoints().await.is_empty());
-}
-
-#[tokio::test]
 async fn binding_one_stream_twice_is_refused() {
     let allocator = ProxyAllocator::new();
-    allocator
-        .bind(DEVICE, capability(Duration::from_secs(60)))
-        .await
-        .expect("first bind");
+    bind(&allocator, "adb").await;
     let error = allocator
-        .bind(DEVICE, capability(Duration::from_secs(60)))
+        .bind(DEVICE, capability("adb", Duration::from_secs(60)))
         .await
         .expect_err("a second endpoint for one stream would be ambiguous");
     assert!(
@@ -424,7 +165,7 @@ async fn a_non_identifier_device_or_stream_is_refused() {
 
     let allocator = ProxyAllocator::new();
     let error = allocator
-        .bind("not a device", capability(Duration::from_secs(30)))
+        .bind("not a device", capability("adb", Duration::from_secs(30)))
         .await
         .expect_err("a device id must be an identifier");
     assert!(
@@ -433,45 +174,57 @@ async fn a_non_identifier_device_or_stream_is_refused() {
     );
 }
 
+#[tokio::test]
+async fn an_already_expired_capability_never_binds() {
+    let allocator = ProxyAllocator::new();
+    let expired = ProxyCapability::new("adb", Instant::now() - Duration::from_secs(1))
+        .expect("a stream identifier");
+    let error = allocator
+        .bind(DEVICE, expired)
+        .await
+        .expect_err("an expired capability must not open a port");
+    assert!(
+        matches!(error, ProxyError::CapabilityExpired { .. }),
+        "{error:?}"
+    );
+    assert!(allocator.endpoints().await.is_empty());
+}
+
 // --------------------------------------------------------------------------------------
-// Byte carriage.
+// Byte carriage and demultiplexing.
 // --------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn proxy_bytes_are_preserved_in_both_directions() {
     let session = relay_session("proxy_echo");
     assert_eq!(session.client.path_kind(), PathKind::Relay);
-    let (echo, seen) = spawn_echo(Arc::clone(&session.device));
+    let (echo, seen) = spawn_echo(Arc::clone(&session.device), EchoMode::Plain);
     let allocator = Arc::new(ProxyAllocator::new());
-    let (server, endpoint) = serve_one(Arc::clone(&allocator), session.client, limits()).await;
+    let (server, _endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "adb", limits()).await;
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let bound = allocator.endpoints().await;
+    let mut client = TcpStream::connect(addr_of(&bound[0]))
         .await
         .expect("local client connects");
     // Every byte value across several proxy frames, so a text-only path cannot pass.
     let payload: Vec<u8> = (0..70_000u32).map(|index| (index % 251) as u8).collect();
-    client.write_all(&payload).await.expect("write");
-    let mut echoed = vec![0u8; payload.len()];
-    tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut echoed))
-        .await
-        .expect("echo arrives")
-        .expect("read echo");
-    assert_eq!(echoed, payload, "bytes survived the proxy untouched");
+    echo_reply(&mut client, &payload, &payload, Duration::from_secs(10)).await;
 
     let frames = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
     assert!(frames.len() >= 4, "the payload was split into frames");
-    let now = unix_ms();
-    for envelope in &frames {
-        assert_eq!(envelope.stream_kind, i32::from(StreamKind::Proxy));
-        assert_eq!(envelope.request_id, format!("proxy-{STREAM}"));
-        assert!(
-            envelope.deadline_unix_ms > now,
-            "every proxy frame carries a live deadline, got {}",
-            envelope.deadline_unix_ms
+    for (index, envelope) in frames.iter().enumerate() {
+        assert_eq!(
+            envelope.sequence,
+            (index + 1) as u32,
+            "every proxy frame carries a per-stream sequence"
         );
-        assert!(envelope.payload.len() <= limits().max_chunk_bytes);
+        assert!(
+            envelope.deadline_unix_ms > support::unix_ms(),
+            "every proxy frame carries a live deadline"
+        );
+        assert!(envelope.payload.len() <= 16 * 1024);
     }
-    assert_eq!(endpoint.stream, STREAM);
 
     drop(client);
     let summary = server.await.expect("session task").expect("clean close");
@@ -482,42 +235,117 @@ async fn proxy_bytes_are_preserved_in_both_directions() {
 }
 
 #[tokio::test]
-async fn a_frame_for_another_stream_closes_the_session() {
-    // The peer answers with the wrong request id: the session must not deliver those bytes
-    // to the local client, because they belong to another mapped stream.
-    let session = relay_session("proxy_wrong_stream");
-    let device = Arc::clone(&session.device);
-    let misdirected = tokio::spawn(async move {
-        if let Ok(_envelope) = device.recv_frame().await {
-            let request = RequestId::new("proxy-other").expect("request id");
-            let mut reply = Envelope::new(
-                StreamKind::Proxy,
-                &DeviceId::new(DEVICE).expect("device id"),
-                &session_id("proxy_wrong_stream"),
-                &request,
-            );
-            reply.payload = b"not for you".to_vec();
-            let _ = device.send_frame(&reply).await;
-        }
-    });
+async fn two_streams_on_one_path_both_carry_bytes() {
+    let session = relay_session("proxy_two_streams");
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::Plain);
     let allocator = Arc::new(ProxyAllocator::new());
-    let (server, _endpoint) = serve_one(Arc::clone(&allocator), session.client, limits()).await;
+    let (first, first_endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "adb", limits()).await;
+    let (second, second_endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "screen", limits()).await;
+    assert_ne!(first_endpoint.url, second_endpoint.url);
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let mut first_client = TcpStream::connect(addr_of(&first_endpoint))
+        .await
+        .expect("first client");
+    let mut second_client = TcpStream::connect(addr_of(&second_endpoint))
+        .await
+        .expect("second client");
+    echo_reply(
+        &mut first_client,
+        b"first stream",
+        b"first stream",
+        Duration::from_secs(5),
+    )
+    .await;
+    echo_reply(
+        &mut second_client,
+        b"second stream",
+        b"second stream",
+        Duration::from_secs(5),
+    )
+    .await;
+
+    drop(first_client);
+    drop(second_client);
+    first.await.expect("first task").expect("first clean close");
+    second
+        .await
+        .expect("second task")
+        .expect("second clean close");
+    echo.abort();
+}
+
+#[tokio::test]
+async fn an_interleaved_events_frame_does_not_disturb_the_tunnel() {
+    let session = relay_session("proxy_events");
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::WithEvents);
+    let allocator = Arc::new(ProxyAllocator::new());
+    let (server, endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "adb", limits()).await;
+
+    let mut client = TcpStream::connect(addr_of(&endpoint))
         .await
         .expect("local client connects");
-    client.write_all(b"hello").await.expect("write");
+    echo_reply(
+        &mut client,
+        b"survives an events frame",
+        b"survives an events frame",
+        Duration::from_secs(5),
+    )
+    .await;
+    drop(client);
+    server
+        .await
+        .expect("session task")
+        .expect("an Events frame on the path is not a failure");
+    echo.abort();
+}
+
+#[tokio::test]
+async fn a_frame_for_another_stream_is_ignored() {
+    let session = relay_session("proxy_foreign");
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::WithForeignFrame);
+    let allocator = Arc::new(ProxyAllocator::new());
+    let (server, endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "adb", limits()).await;
+
+    let mut client = TcpStream::connect(addr_of(&endpoint))
+        .await
+        .expect("local client connects");
+    // Two frames, so the stub emits the foreign request id between their echoes.
+    let payload: Vec<u8> = (0..40_000u32).map(|index| (index % 241) as u8).collect();
+    echo_reply(&mut client, &payload, &payload, Duration::from_secs(10)).await;
+    drop(client);
+    server
+        .await
+        .expect("session task")
+        .expect("a frame for another stream must not tear this one down");
+    echo.abort();
+}
+
+#[tokio::test]
+async fn a_sequence_gap_closes_the_stream_with_an_explicit_error() {
+    let session = relay_session("proxy_gap");
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::WithSequenceGap);
+    let allocator = Arc::new(ProxyAllocator::new());
+    let (server, endpoint) =
+        serve_one(Arc::clone(&allocator), &session.client, "adb", limits()).await;
+
+    let mut client = TcpStream::connect(addr_of(&endpoint))
+        .await
+        .expect("local client connects");
+    // Two frames; the stub answers the second with sequence 3, so the client sees a hole.
+    let payload: Vec<u8> = (0..40_000u32).map(|index| (index % 239) as u8).collect();
+    client.write_all(&payload).await.expect("write");
     read_until_closed(&mut client).await;
 
     let error = server
         .await
         .expect("session task")
-        .expect_err("wrong stream is refused");
-    assert!(
-        matches!(error, ProxyError::UnexpectedFrame { .. }),
-        "{error:?}"
-    );
-    misdirected.abort();
+        .expect_err("a hole is never a successful close");
+    assert!(matches!(error, ProxyError::SequenceGap { .. }), "{error:?}");
+    echo.abort();
 }
 
 // --------------------------------------------------------------------------------------
@@ -527,14 +355,11 @@ async fn a_frame_for_another_stream_closes_the_session() {
 #[tokio::test]
 async fn a_failed_send_is_reported_and_closes_the_local_connection() {
     let allocator = Arc::new(ProxyAllocator::new());
-    let (server, _endpoint) = serve_one(
-        Arc::clone(&allocator),
-        refusing_session("proxy_refused"),
-        limits(),
-    )
-    .await;
+    let session = refusing_session("proxy_refused");
+    let (server, _endpoint) = serve_one(Arc::clone(&allocator), &session, "adb", limits()).await;
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let bound = allocator.endpoints().await;
+    let mut client = TcpStream::connect(addr_of(&bound[0]))
         .await
         .expect("local client connects");
     client.write_all(b"ping").await.expect("write");
@@ -554,9 +379,10 @@ async fn a_failed_send_is_reported_and_closes_the_local_connection() {
 async fn a_stalled_transport_applies_backpressure_instead_of_buffering() {
     let (session, relay) = stalled_session("proxy_stalled");
     let allocator = Arc::new(ProxyAllocator::new());
-    let (server, _endpoint) = serve_one(Arc::clone(&allocator), session, limits()).await;
+    let (server, _endpoint) = serve_one(Arc::clone(&allocator), &session, "adb", limits()).await;
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let bound = allocator.endpoints().await;
+    let mut client = TcpStream::connect(addr_of(&bound[0]))
         .await
         .expect("local client connects");
     let writer = tokio::spawn(async move {
@@ -566,7 +392,7 @@ async fn a_stalled_transport_applies_backpressure_instead_of_buffering() {
     });
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let attempts = relay.attempts.load(Ordering::SeqCst);
+    let attempts = relay.attempts.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         attempts, 1,
         "only the chunk in flight may reach a stalled transport"
@@ -578,20 +404,27 @@ async fn a_stalled_transport_applies_backpressure_instead_of_buffering() {
 
 #[tokio::test]
 async fn an_expired_capability_closes_the_endpoint_immediately() {
-    let ttl = Duration::from_millis(150);
     let session = relay_session("proxy_expiry");
-    let (echo, _seen) = spawn_echo(Arc::clone(&session.device));
+    let (echo, _seen) = spawn_echo(Arc::clone(&session.device), EchoMode::Plain);
     let allocator = Arc::new(ProxyAllocator::new());
-    let endpoint = allocator.bind(DEVICE, capability(ttl)).await.expect("bind");
+    let endpoint = allocator
+        .bind(
+            DEVICE,
+            ProxyCapability::new("adb", Instant::now() + Duration::from_millis(150))
+                .expect("capability"),
+        )
+        .await
+        .expect("bind");
     let proxy = session
         .client
-        .proxy_session(STREAM, limits())
+        .proxy_session("adb", limits())
+        .await
         .expect("proxy session");
     let served = endpoint.clone();
     let allocator_for_task = Arc::clone(&allocator);
     let server = tokio::spawn(async move { allocator_for_task.serve(&served, proxy).await });
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let mut client = TcpStream::connect(addr_of(&endpoint))
         .await
         .expect("local client connects");
     client.write_all(b"hello").await.expect("write");
@@ -615,7 +448,8 @@ async fn an_expired_capability_closes_the_endpoint_immediately() {
             &endpoint,
             session
                 .client
-                .proxy_session(STREAM, limits())
+                .proxy_session("adb", limits())
+                .await
                 .expect("proxy session"),
         )
         .await
@@ -628,13 +462,15 @@ async fn an_expired_capability_closes_the_endpoint_immediately() {
 }
 
 #[tokio::test]
-async fn an_idle_connection_is_closed_at_the_idle_deadline() {
-    let session = relay_session("proxy_idle");
+async fn uplink_activity_keeps_an_idle_tunnel_alive() {
+    // No echo task: only the local upload produces activity.
+    let session = relay_session("proxy_idle_uplink");
     let allocator = Arc::new(ProxyAllocator::new());
-    let idle = Duration::from_millis(150);
+    let idle = Duration::from_millis(300);
     let (server, _endpoint) = serve_one(
         Arc::clone(&allocator),
-        session.client,
+        &session.client,
+        "adb",
         ProxyLimits {
             idle_timeout: idle,
             ..limits()
@@ -642,7 +478,50 @@ async fn an_idle_connection_is_closed_at_the_idle_deadline() {
     )
     .await;
 
-    let mut client = TcpStream::connect(allocator.local_addr(DEVICE, STREAM).await.unwrap())
+    let bound = allocator.endpoints().await;
+    let mut client = TcpStream::connect(addr_of(&bound[0]))
+        .await
+        .expect("local client connects");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1200) {
+        client
+            .write_all(b"still here")
+            .await
+            .expect("the tunnel stays writable");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !server.is_finished(),
+            "an upload keeps the tunnel alive without inbound frames"
+        );
+    }
+
+    let error = server.await.expect("session task").expect_err("idle ends");
+    assert!(matches!(error, ProxyError::Idle { .. }), "{error:?}");
+    assert!(
+        started.elapsed() > Duration::from_millis(1200),
+        "an upload every 100 ms outlived a {idle:?} idle deadline"
+    );
+    read_until_closed(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_tunnel_with_no_traffic_closes_at_the_idle_deadline() {
+    let session = relay_session("proxy_idle_silent");
+    let allocator = Arc::new(ProxyAllocator::new());
+    let idle = Duration::from_millis(150);
+    let (server, _endpoint) = serve_one(
+        Arc::clone(&allocator),
+        &session.client,
+        "adb",
+        ProxyLimits {
+            idle_timeout: idle,
+            ..limits()
+        },
+    )
+    .await;
+
+    let bound = allocator.endpoints().await;
+    let mut client = TcpStream::connect(addr_of(&bound[0]))
         .await
         .expect("local client connects");
     let started = Instant::now();
@@ -653,21 +532,30 @@ async fn an_idle_connection_is_closed_at_the_idle_deadline() {
 }
 
 #[tokio::test]
-async fn one_path_carries_one_proxy_stream_at_a_time() {
+async fn one_path_carries_one_pump_per_stream() {
     let session = relay_session("proxy_claim");
     let first = session
         .client
-        .proxy_session(STREAM, limits())
+        .proxy_session("adb", limits())
+        .await
         .expect("first proxy session");
     let error = session
         .client
-        .proxy_session(STREAM, limits())
-        .expect_err("a second pump would interleave bytes");
+        .proxy_session("adb", limits())
+        .await
+        .expect_err("a second pump for one stream would interleave bytes");
     assert!(matches!(error, ProxyError::StreamInUse { .. }), "{error:?}");
+    // A different stream is a different route and is allowed.
+    session
+        .client
+        .proxy_session("screen", limits())
+        .await
+        .expect("another stream");
     drop(first);
     session
         .client
-        .proxy_session(STREAM, limits())
+        .proxy_session("adb", limits())
+        .await
         .expect("the claim is released when the pump ends");
 }
 
@@ -677,15 +565,18 @@ async fn an_oversized_chunk_limit_is_refused_before_the_endpoint_exists() {
     let error = session
         .client
         .proxy_session(
-            STREAM,
+            "adb",
             ProxyLimits {
                 max_chunk_bytes: usize::MAX,
                 ..limits()
             },
         )
+        .await
         .expect_err("an unbounded chunk cannot be sealed");
     assert!(
         matches!(error, ProxyError::InvalidLimits { .. }),
         "{error:?}"
     );
 }
+
+fn _relay_session_keeps_the_type(_: RelaySession) {}

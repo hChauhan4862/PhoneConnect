@@ -292,10 +292,22 @@ pub fn host_context_script(context: &NativeHostContext) -> String {
     )
 }
 
+/// URL patterns that match exactly the configured origin, for the runtime capability.
+///
+/// The shell mints its IPC capability at startup from these instead of a wildcard, so a page
+/// on any other origin can never reach the four commands — including a subframe on Windows,
+/// where WebView2 installs initialization scripts into frames too.
+pub fn capability_origins(server: &Url) -> Vec<String> {
+    let origin = server.origin().ascii_serialization();
+    vec![origin.clone(), format!("{origin}/*")]
+}
+
 /// The initialization script that installs `window.__PHONECONNECT_BRIDGE__`.
 ///
 /// Every method is optional to the page: if the shell does not install this script, or IPC
-/// fails, the page falls back to its in-page behavior for that one operation.
+/// fails, the page falls back to its in-page behavior for that one operation. The endpoint
+/// methods go beyond the browser/native contract Task 5 consumes today; they are how the page
+/// establishes a session with the shell's identity key and opens a mapped stream.
 pub fn bridge_script() -> String {
     let global = HOST_BRIDGE_GLOBAL;
     format!(
@@ -317,7 +329,12 @@ pub fn bridge_script() -> String {
       openWindow: function (route) {{ return invoke("open_window", {{ route: route }}); }},
       setTrayStatus: function (status) {{ return invoke("set_tray_status", {{ status: status }}); }},
       localEndpoints: function () {{ return invoke("local_endpoints"); }},
-      notify: function (input) {{ return invoke("notify", {{ input: input }}); }}
+      notify: function (input) {{ return invoke("notify", {{ input: input }}); }},
+      identityKey: function () {{ return invoke("native_identity_key"); }},
+      openEndpoint: function (request) {{ return invoke("open_endpoint", {{ request: request }}); }},
+      closeEndpoint: function (deviceId, stream) {{
+        return invoke("close_endpoint", {{ deviceId: deviceId, stream: stream }});
+      }}
     }})
   }});
 }})();"#
@@ -551,6 +568,9 @@ mod tests {
             "set_tray_status",
             "local_endpoints",
             "notify",
+            "native_identity_key",
+            "open_endpoint",
+            "close_endpoint",
         ] {
             assert!(script.contains(command), "{command} missing from {script}");
         }
@@ -666,6 +686,30 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn the_ipc_capability_matches_only_the_configured_origin() {
+        let https = resolve_url("https://phoneconnect.example").expect("https");
+        assert_eq!(
+            capability_origins(&https),
+            vec![
+                "https://phoneconnect.example".to_owned(),
+                "https://phoneconnect.example/*".to_owned()
+            ]
+        );
+        let loopback = resolve_url("http://127.0.0.1:8080").expect("loopback");
+        assert_eq!(
+            capability_origins(&loopback),
+            vec![
+                "http://127.0.0.1:8080".to_owned(),
+                "http://127.0.0.1:8080/*".to_owned()
+            ]
+        );
+        for pattern in capability_origins(&https) {
+            assert_ne!(pattern, "*", "no wildcard capability");
+            assert!(pattern.contains("phoneconnect.example"), "{pattern}");
+        }
     }
 
     #[test]

@@ -138,6 +138,7 @@ async fn the_root_serves_the_spa_document_with_a_strict_csp() {
         "script-src 'self'",
         // The native shell's bridge rides Tauri IPC from this same document.
         "connect-src 'self' ipc: http://ipc.localhost",
+        "frame-src 'self'",
         "object-src 'none'",
         "base-uri 'none'",
         "frame-ancestors 'none'",

@@ -2,21 +2,25 @@
 //!
 //! Built with `--features shell`. It is deliberately thin: the webview loads the
 //! server-served UI at the configured URL, and the only native additions are the injected
-//! host context, a tray, detached OS windows, OS notifications, and the loopback endpoints
-//! the proxy allocator holds. There is no second UI tree here.
+//! host context, a tray, detached OS windows, OS notifications, and the loopback proxy
+//! endpoints the endpoint manager owns. There is no second UI tree here.
 //!
 //! Run with `PHONECONNECT_SERVER_URL` set (default `http://127.0.0.1:8080`). The shell uses
-//! the page's normal session cookies; it never embeds a server credential.
+//! the page's normal session cookies; it never embeds a server credential, and its transport
+//! identity private half never leaves this process.
 
 #[cfg(feature = "shell")]
 mod shell {
     use std::sync::Arc;
 
-    use phoneconnect_native::proxy::{LocalEndpoint, ProxyAllocator};
+    use phoneconnect_native::endpoints::{EndpointManager, OpenEndpointRequest};
+    use phoneconnect_native::proxy::{LocalEndpoint, ProxyLimits};
     use phoneconnect_native::web_shell::{
-        self, NativeHostContext, NotificationInput, TrayStatus, bridge_script, host_context,
+        self, NotificationInput, TrayStatus, bridge_script, capability_origins, host_context,
         host_context_script, is_same_origin, resolve_route, route_window_label, tray_tooltip,
     };
+    use phoneconnect_transport::IdentityKey;
+    use tauri::ipc::CapabilityBuilder;
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
@@ -27,11 +31,21 @@ mod shell {
     const MAIN_WINDOW: &str = "main";
     /// Tray id, so a command can find the one tray the shell installs.
     const TRAY_ID: &str = "phoneconnect";
+    /// Identifier of the runtime capability that grants the bridge commands to the server.
+    const REMOTE_CAPABILITY: &str = "phoneconnect-remote";
 
     struct ShellState {
         server_url: Url,
-        host_context: NativeHostContext,
-        proxies: Arc<ProxyAllocator>,
+        endpoints: Arc<EndpointManager>,
+    }
+
+    impl ShellState {
+        /// The context to inject. `proxyCapabilities` is what the manager is serving *now*,
+        /// never a placeholder: a window opened later sees the endpoints open at that moment,
+        /// and the page refreshes the list through `localEndpoints()`.
+        async fn host_context(&self) -> web_shell::NativeHostContext {
+            host_context(&self.server_url, self.endpoints.endpoints().await)
+        }
     }
 
     /// Opens a route the page asked for in a detached OS window.
@@ -39,7 +53,7 @@ mod shell {
     /// The route is re-resolved against the configured origin; a protocol-relative path or
     /// another host is rejected, so the page cannot use the shell to open an arbitrary site.
     #[tauri::command]
-    fn open_window(
+    async fn open_window(
         app: AppHandle,
         state: State<'_, ShellState>,
         route: String,
@@ -51,6 +65,7 @@ mod shell {
             existing.set_focus().map_err(|error| error.to_string())?;
             return Ok(());
         }
+        let host_script = host_context_script(&state.host_context().await);
         let server = state.server_url.clone();
         let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
             .title(format!("PhoneConnect \u{2014} {route}"))
@@ -58,7 +73,7 @@ mod shell {
             // A page that navigated off the server would inherit the bridge capabilities, so
             // the webview never leaves the configured origin.
             .on_navigation(move |url| is_same_origin(&server, url))
-            .initialization_script(host_context_script(&state.host_context))
+            .initialization_script(&host_script)
             .initialization_script(bridge_script())
             .build()
             .map_err(|error| error.to_string())?;
@@ -97,17 +112,48 @@ mod shell {
             .map_err(|error| error.to_string())
     }
 
+    /// The identity public key the page pins when it creates a session for this shell.
+    #[tauri::command]
+    fn native_identity_key(state: State<'_, ShellState>) -> String {
+        state.endpoints.identity_public_key()
+    }
+
+    /// Establishes (or reuses) a session for the device, binds a loopback port, and starts
+    /// serving it. The returned URL is the endpoint the page can use.
+    #[tauri::command]
+    async fn open_endpoint(
+        state: State<'_, ShellState>,
+        request: OpenEndpointRequest,
+    ) -> Result<LocalEndpoint, String> {
+        state
+            .endpoints
+            .open(request)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stops one endpoint; `false` means it was not open.
+    #[tauri::command]
+    async fn close_endpoint(
+        state: State<'_, ShellState>,
+        device_id: String,
+        stream: String,
+    ) -> Result<bool, String> {
+        Ok(state.endpoints.close(&device_id, &stream).await)
+    }
+
     /// The loopback endpoints currently exposed to the page.
     #[tauri::command]
     async fn local_endpoints(state: State<'_, ShellState>) -> Result<Vec<LocalEndpoint>, String> {
-        Ok(state.proxies.endpoints().await)
+        Ok(state.endpoints.endpoints().await)
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let server_url = web_shell::configured_server_url()?;
-        let host_context = host_context(&server_url, Vec::new());
-        let host_script = host_context_script(&host_context);
-        let bridge = bridge_script();
+        let identity = IdentityKey::generate()?;
+        let endpoints = Arc::new(EndpointManager::new(identity, ProxyLimits::default()));
+        let setup_endpoints = Arc::clone(&endpoints);
+        let setup_server = server_url.clone();
         let window_url = server_url.clone();
         let navigation_url = server_url.clone();
 
@@ -115,23 +161,28 @@ mod shell {
             .plugin(tauri_plugin_notification::init())
             .manage(ShellState {
                 server_url,
-                host_context,
-                proxies: Arc::new(ProxyAllocator::new()),
+                endpoints,
             })
             .invoke_handler(tauri::generate_handler![
                 open_window,
                 set_tray_status,
-                local_endpoints,
-                notify
+                notify,
+                native_identity_key,
+                open_endpoint,
+                close_endpoint,
+                local_endpoints
             ])
             .setup(move |app| {
                 install_tray(app.handle())?;
+                install_remote_capability(app, &setup_server)?;
+                let capabilities = tauri::async_runtime::block_on(setup_endpoints.endpoints());
+                let context = host_context(&setup_server, capabilities);
                 WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::External(window_url))
                     .title("PhoneConnect")
                     .inner_size(1100.0, 760.0)
                     .on_navigation(move |url| is_same_origin(&navigation_url, url))
-                    .initialization_script(&host_script)
-                    .initialization_script(&bridge)
+                    .initialization_script(host_context_script(&context))
+                    .initialization_script(bridge_script())
                     .build()?;
                 Ok(())
             })
@@ -146,6 +197,28 @@ mod shell {
                 }
             });
         Ok(())
+    }
+
+    /// Grants the seven bridge commands to exactly the configured origin.
+    ///
+    /// The static capability in `capabilities/default.json` carries no `remote` entry; this
+    /// runtime capability is the only way a page gets IPC, so another origin — or a subframe
+    /// on Windows, which receives initialization scripts too — cannot reach the commands.
+    fn install_remote_capability(app: &mut tauri::App, server: &Url) -> tauri::Result<()> {
+        let mut capability = CapabilityBuilder::new(REMOTE_CAPABILITY)
+            .local(false)
+            .windows(["*"])
+            .permission("allow-open-window")
+            .permission("allow-set-tray-status")
+            .permission("allow-local-endpoints")
+            .permission("allow-notify")
+            .permission("allow-native-identity-key")
+            .permission("allow-open-endpoint")
+            .permission("allow-close-endpoint");
+        for pattern in capability_origins(server) {
+            capability = capability.remote(pattern);
+        }
+        app.add_capability(capability)
     }
 
     fn install_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -197,6 +270,7 @@ fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::FAILURE;
             }
         };
+        // Before any endpoint is opened; the live list is what a window injects.
         let context = phoneconnect_native::web_shell::host_context(&server, Vec::new());
         println!(
             "{}",

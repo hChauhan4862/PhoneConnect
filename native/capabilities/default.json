@@ -1,25 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The server-served page may use the four bridge capabilities its host adapter declares: detached windows, tray status, loopback endpoints, and notifications. Nothing else is exposed.",
+  "description": "Local permissions for the shell's own windows. The four bridge commands plus the endpoint and identity commands are granted to the configured server origin by a capability minted at startup (main.rs), not by a wildcard here.",
   "windows": [
     "*"
   ],
-  "remote": {
-    "urls": [
-      "https://*",
-      "http://127.0.0.1:*",
-      "http://127.0.0.1/*",
-      "http://localhost:*",
-      "http://localhost/*"
-    ]
-  },
   "permissions": [
     "core:default",
-    "notification:default",
     "allow-open-window",
     "allow-set-tray-status",
     "allow-local-endpoints",
-    "allow-notify"
+    "allow-notify",
+    "allow-native-identity-key",
+    "allow-open-endpoint",
+    "allow-close-endpoint"
   ]
 }

@@ -18,6 +18,9 @@ fn main() {
             "set_tray_status",
             "local_endpoints",
             "notify",
+            "native_identity_key",
+            "open_endpoint",
+            "close_endpoint",
         ]),
     ))
     .expect("generate the Tauri ACL");

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-native-identity-key"
+description = "Enables the native_identity_key command without any pre-configured scope."
+commands.allow = ["native_identity_key"]
+
+[[permission]]
+identifier = "deny-native-identity-key"
+description = "Denies the native_identity_key command without any pre-configured scope."
+commands.deny = ["native_identity_key"]

@@ -27,11 +27,17 @@ pub const INDEX_DOCUMENT: &str = "index.html";
 /// document and installs its bridge before load; the bridge's `fetch("ipc://localhost/…")`
 /// is governed by this page policy, so leaving it out would silently disable every native
 /// capability. A browser has neither the scheme nor the host and is unaffected.
+///
+/// `frame-src 'self'` is explicit even though `default-src 'self'` already implies it:
+/// WebView2 installs the shell's initialization scripts into subframes too, so a frame from
+/// another origin would otherwise be a place the bridge globals could appear. The shell also
+/// mints its IPC capability for the configured origin only; this header is the second half of
+/// the same mitigation.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
      style-src 'self'; img-src 'self' data:; font-src 'self'; \
      connect-src 'self' ipc: http://ipc.localhost; \
-     manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; \
-     frame-ancestors 'none'";
+     manifest-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; \
+     form-action 'self'; frame-ancestors 'none'";
 
 /// Cache policy for a built asset: the build fingerprints file names, so an asset is
 /// immutable while the app shell always revalidates.

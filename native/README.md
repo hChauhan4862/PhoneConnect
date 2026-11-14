@@ -47,11 +47,18 @@ initialization scripts from `native/src/web_shell.rs`:
 { kind: "native", serverUrl: "https://phoneconnect.example/", proxyCapabilities: [...] }
 
 // __PHONECONNECT_BRIDGE__ — the capabilities this shell actually provides
-openWindow(route)        // detached OS window on the same origin
-setTrayStatus(status)    // { label, health, detail? }
-localEndpoints()         // [{ deviceId, stream, url }]
-notify({ title, body })  // OS notification
+openWindow(route)              // detached OS window on the same origin
+setTrayStatus(status)          // { label, health, detail? }
+localEndpoints()               // [{ deviceId, stream, url }]
+notify({ title, body })        // OS notification
+identityKey()                  // the shell's X25519 public key, for POST /api/sessions
+openEndpoint(request)          // establish/reuse a session, bind a port
+closeEndpoint(deviceId, stream)
 ```
+
+`proxyCapabilities` is derived from what the endpoint manager is serving when the window is
+created; it is never a placeholder. A window opened later sees the endpoints open at that
+moment, and the page refreshes through `localEndpoints()`.
 
 Field names and JSON shape match `web/src/host/hostContext.ts` exactly; a page that cannot
 read the context stays a browser, and each missing bridge method falls back to the page's
@@ -63,19 +70,44 @@ configured origin; a protocol-relative path, a full URL, or a path that lands on
 origin is refused. Detached windows are reused by a stable per-route label rather than
 duplicated.
 
+### Endpoints and sessions
+
+`open_endpoint` is the command that makes a mapped port real:
+
+1. The page asks `identityKey()` for the shell's X25519 public key and creates the session on
+   the server (`POST /api/sessions` with that key), exactly as any client does.
+2. The page registers its candidates and passes the issued ticket, its candidates view, and
+   the session capability to `openEndpoint({ deviceId, stream, ttlSeconds, session })` with
+   `session.kind = "rendezvous"`.
+3. `EndpointManager` verifies everything through the shared transport
+   (`SessionClient::connect`: signed ticket, authenticated direct probe against the relay,
+   shortest validated path), reusing the session for the next endpoint on that device.
+4. It binds `127.0.0.1:0`, registers the endpoint with its capability deadline, and starts a
+   serving task that accepts one local connection at a time until closed, expired, or the
+   session path fails.
+
+The shell's identity private half never leaves the process and no server credential is
+embedded in the page: the ticket is single-use and short-lived, and the capability is the one
+the signed-in user already holds. `EndpointManager` is plain Rust, so this whole command path
+is covered by `native/tests/endpoints.rs`; the Tauri command is three lines of glue.
+
+An endpoint disappears from `localEndpoints()` when it is closed, when its capability
+expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when its serving task ends
+because the session path failed.
+
 ### Tauri IPC scope
 
 Tauri grants IPC to remote origins only through an explicit capability. `native/build.rs`
-declares the four application commands, so tauri-build generates `allow-open-window`,
-`allow-set-tray-status`, `allow-local-endpoints`, and `allow-notify`; `native/capabilities/
-default.json` grants exactly those (plus the standard `core:default` window/event set and
-`notification:default`) on any window label, for HTTPS origins and the two loopback HTTP
-origins. A compromised page can therefore open same-origin windows, set tray text, read the
-loopback endpoint list, and raise a notification; it cannot read files, spawn processes, or
-reach the local system beyond that.
+declares the seven application commands, so tauri-build generates `allow-open-window`,
+`allow-set-tray-status`, `allow-local-endpoints`, `allow-notify`, `allow-native-identity-key`,
+`allow-open-endpoint`, and `allow-close-endpoint`.
 
-The webview also refuses to navigate off the configured origin (`on_navigation`), because a
-page on another origin would inherit the same capability.
+`native/capabilities/default.json` carries **no** `remote` entry. At startup `main.rs` mints a
+runtime capability for exactly the configured origin (`capability_origins`: `https://host` and
+`https://host/*`, never a wildcard) and grants those seven permissions there. Another origin — or a subframe on Windows, where WebView2
+installs initialization scripts into frames too — cannot reach the commands. The server sends
+`frame-src 'self'` as the second half of that mitigation, and the webview also refuses to
+navigate off the configured origin (`on_navigation`).
 
 The server's CSP must let the page reach that IPC. `server/src/web.rs` therefore adds `ipc:`
 and `http://ipc.localhost` to `connect-src`; a reverse proxy that replaces the CSP with its own
@@ -102,19 +134,32 @@ title 200, body 2,000.
 - `ProxyAllocator::bind(device_id, capability)` binds `127.0.0.1:0` — loopback only, OS-chosen
   ephemeral port, never `0.0.0.0` and never a fixed port. Concurrent binds cannot collide; a
   second endpoint for the same `device/stream` is refused.
-- `ProxyAllocator::serve(endpoint, ProxySession)` accepts one local TCP connection and pumps
-  it as `StreamKind::Proxy` envelopes over the session's `ConnectedPath`.
-- The request id is derived from the stream (`proxy-<stream>`), so the peer echoes it and a
-  frame for another stream is refused instead of written to the wrong local client.
-- Every frame carries `deadline_unix_ms`. A send that exceeds `send_timeout`, a transport
-  error, a wrong-stream frame, an idle connection, and capability expiry all close the local
-  socket immediately and return an explicit error. A capability that has expired is removed
-  from `endpoints()`, so the page never lists a dead port.
+- `ProxyHub` is the **single reader** of the session's `ConnectedPath`, as the transport
+  requires. It routes each `StreamKind::Proxy` frame to the stream that owns its
+  `request_id`; frames of other kinds (control, events, file) and frames for a stream that is
+  not open belong to another consumer and are ignored. One tunnel therefore cannot tear down
+  another, and several streams share the session concurrently (`adb`, `screen`, …).
+- `ProxyAllocator::serve(endpoint, session)` accepts one local TCP connection and pumps it as
+  `StreamKind::Proxy` envelopes. The request id is derived from the stream
+  (`proxy-<stream>`), and each stream keeps its own pump and its own inbound queue.
+- Every frame carries `deadline_unix_ms` and a per-stream `sequence`. The receiver requires
+  contiguous sequences: a jump, or a `FramesLost` report (the path already discarded frames),
+  closes that tunnel with `SequenceGap` / `FramesLost` instead of writing a hole into a TCP
+  stream. Bytes are never reported as delivered across a gap.
+- A slow local reader fails only its own stream (`Backpressure`); it cannot stall the shared
+  path or make the reader drop frames.
+- A send over `send_timeout`, a transport error, an idle connection, and capability expiry all
+  close the local socket immediately and return an explicit error. A capability that has
+  expired is removed from `endpoints()`, so the page never lists a dead port.
 - The uplink reads one chunk, sends it, and only then reads the next. A stalled transport
   therefore stops the local socket with TCP backpressure instead of buffering.
+- Idle means silence in **either** direction, and the default is 300 s: `adb shell sleep 60`
+  moves nothing for a minute and is still healthy. Five minutes bounds an abandoned port
+  without killing a quiet session.
 - **`send_frame` returning `Ok` is not proof of delivery.** It means the sealed frame was
   handed to the direct socket or the relay; neither acknowledges the peer. `ProxySummary`
-  counts bytes *accepted by the transport*, never bytes delivered.
+  counts bytes *accepted by the transport*, never bytes delivered, and `bytes_down` counts
+  bytes actually written in sequence.
 
 Only loopback clients can reach an endpoint. There is no authentication on the endpoint itself
 — an ADB-shaped port accepts the local tool that connects to it — so it is a capability for
@@ -124,20 +169,28 @@ local capability into an unauthenticated remote one; the allocator cannot do tha
 ### What is not implemented yet
 
 There is **no Android-side TCP bridge**, so nothing here claims ADB proxying works end to end.
+The Task 5 page also does not call `openEndpoint` yet; it reads `localEndpoints()`, so the
+endpoint API is complete, tested, and reachable from the bridge, but no shipped screen opens
+one.
 What is proven is the native half:
 
 - `native/tests/proxy.rs` binds real loopback ports and drives a real `ConnectedPath` over an
-  in-process relay, with a device-side stub that echoes `StreamKind::Proxy` envelopes. It
+  in-process relay, with a device-side stub that answers `StreamKind::Proxy` envelopes. It
   covers loopback-only binding, concurrent allocation, byte preservation across many frames,
-  per-frame deadlines, backpressure, failed sends, wrong-stream frames, idle deadlines,
-  capability expiry, and relay fallback (`PathKind::Relay`).
+  per-stream sequences and deadlines, two streams on one path, an interleaved Events frame, a
+  foreign request id, a sequence gap, backpressure, failed sends, idle deadlines in both
+  directions, capability expiry, and relay fallback (`PathKind::Relay`).
+- `native/tests/endpoints.rs` exercises the command path through `EndpointManager`: an
+  endpoint opened through it is reachable on `127.0.0.1`, carries bytes to the stub, two
+  endpoints share one session, and it disappears from `endpoints()` after close or expiry. A
+  closed session and a ticket for another device are refused before any port opens.
+- Unit tests in `native/src/proxy.rs` prove a `FramesLost` report ends every live stream with
+  that error and that a full queue fails only its own stream.
 - The same tests would run unchanged against the Android agent once it answers proxy frames;
   the stub is the contract.
-
-Also not wired yet: the shell does not create a device session from the server, so
-`proxyCapabilities` starts empty and `localEndpoints()` returns `[]`. Binding a session
-(server ticket + candidates, then `SessionClient::connect`) and opening the endpoint is the
-next step, together with the Android bridge.
+- The Docker transport end-to-end test still proves a control frame crosses processes over
+  the relay: the driver now grants a lease and creates a control session, so the stub's
+  CONTROL frames are authorized rather than silently dropped on a read-only session.
 
 ## Session client
 

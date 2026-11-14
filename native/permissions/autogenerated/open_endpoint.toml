@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-endpoint"
+description = "Enables the open_endpoint command without any pre-configured scope."
+commands.allow = ["open_endpoint"]
+
+[[permission]]
+identifier = "deny-open-endpoint"
+description = "Denies the open_endpoint command without any pre-configured scope."
+commands.deny = ["open_endpoint"]
