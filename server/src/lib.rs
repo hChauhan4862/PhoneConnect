@@ -62,9 +62,9 @@ pub struct AppState {
     /// bounded in-flight command table commands are dispatched through.
     pub management: Arc<DeviceRegistry>,
     pub clock: Arc<dyn Clock>,
-    /// Dispatch audit rows are written after the command is enqueued and are best-effort.
-    /// This counts the writes that failed, so an untraced attempt is visible in `/health`
-    /// instead of only on stderr.
+    /// Dispatch audit rows are written after the attempt is resolved and are best-effort.
+    /// This counts the writes that failed, so an untraced attempt — accepted or refused — is
+    /// visible in `/health` instead of only on stderr.
     audit_write_failures: AtomicU64,
 }
 

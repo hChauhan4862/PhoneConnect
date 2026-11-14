@@ -246,9 +246,10 @@ pub async fn record_refusal(state: &AppState, device_id: &str, actor: &str, code
     record_attempt(state, device_id, actor, "refused", Some(code)).await;
 }
 
-/// Writes the durable trace for one attempt, after the command was enqueued. This is
-/// best-effort: a write failure increments the counter `/health` reports and is logged, and it
-/// never changes the caller's outcome.
+/// Writes the durable trace for one attempt after it is resolved (accepted attempts are
+/// enqueued first; refusals are recorded before the response). This is best-effort: a write
+/// failure increments the counter `/health` reports and is logged, and it never changes the
+/// caller's outcome.
 async fn record_attempt(
     state: &AppState,
     device_id: &str,
@@ -265,7 +266,7 @@ async fn record_attempt(
         error: error.map(str::to_owned),
     };
     if let Err(error) = state.store.insert_audit(entry).await {
-        // The command is already enqueued; the row is the durable trace, so a failure is an
+        // The attempt already happened; the row is the durable trace, so a failure is an
         // operational error, not the caller's outcome. `/health` reports the count.
         let failures = state.note_audit_write_failure();
         eprintln!("phoneconnect: error: command audit write failed ({failures} total): {error}");

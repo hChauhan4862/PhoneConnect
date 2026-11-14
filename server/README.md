@@ -357,14 +357,19 @@ enqueue; see [Audit](#audit)), not the command itself.
 
 Every dispatch attempt — accepted, refused, or timed out — writes one durable `audit_log` row:
 `at_ms`, `actor`, `action` (`command.dispatch`), `device_id`, `outcome` (`accepted` or
-`refused`), and the machine `error` code when there is one. The row is written **after** the
-command is enqueued and is best-effort: a failed write is logged at error level, counted as
+`refused`), and the machine `error` code when there is one. The row is written **after the
+attempt is resolved**: accepted attempts are enqueued first, and refusals are recorded before
+the response. That write is best-effort: a failed write is logged at error level, counted as
 `audit_write_failures` in `GET /health`, and never changes the caller's outcome. The counter is
-the honest limit of the claim — a non-zero value means an executed command may be untraced.
+an upper bound on untraced attempts: it counts a missing refusal row too, which is not an
+executed command. A non-zero value means at least one attempt has no durable row.
 
 Every revocation writes its row **inside the same store transaction** that performs it, so a
-revocation can never commit untraced. The row is stamped with the effective revocation time
-and the affected device, and these endpoints are idempotent: a retried `device.revoke`,
+revocation can never commit untraced. If the audit row cannot be written, the whole revocation
+rolls back and the request answers `500 store_failure`: the device, session, or lease stays
+active until the store is repaired. That is the deliberate trade — a revocation that cannot be
+traced does not happen. The row is stamped with the effective revocation time and the
+affected device, and these endpoints are idempotent: a retried `device.revoke`,
 `session.revoke`, or `lease.revoke` keeps the first time and appends nothing, so a retry can
 never claim a later event or another actor. `lease.handoff` records the replaced lease and the
 actor that granted it; a handoff that replaces nothing writes no row. A session revocation is

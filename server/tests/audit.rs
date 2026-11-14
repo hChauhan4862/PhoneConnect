@@ -12,7 +12,9 @@ use std::sync::Arc;
 use axum::http::{Method, StatusCode};
 use common::{ADMIN_TOKEN, NOW_MS, TestApp};
 use phoneconnect_server::retention::RetentionJob;
-use phoneconnect_server::store::{AuditEntry, DeviceStore, SqliteStore, StoreError, UnixMs};
+use phoneconnect_server::store::{
+    AUDIT_PAGE_SQL, AuditEntry, DeviceStore, SqliteStore, StoreError, UnixMs,
+};
 use phoneconnect_server::telemetry::RETENTION_MS;
 use serde_json::{Value, json};
 
@@ -509,6 +511,65 @@ async fn a_dispatch_audit_failure_is_counted_and_reported_by_health() {
 }
 
 #[tokio::test]
+async fn a_revocation_whose_audit_row_cannot_be_written_fails_closed() {
+    // The row is part of the revocation transaction, so a store that cannot write it must not
+    // let the revocation happen: the request is a store failure and the record stays active.
+    let path = scratch_path("revocation-audit-failure");
+    let store = Arc::new(SqliteStore::open(&path).expect("file store"));
+    let app = TestApp::with_store(store);
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+    let lease_id = granted["lease_id"].as_str().expect("lease id").to_owned();
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let probe = rusqlite::Connection::open(&path).expect("probe connection");
+    probe
+        .execute_batch("DROP TABLE audit_log")
+        .expect("the audit table is broken on purpose");
+
+    let (status, body) = app.revoke("devices", &device_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "store_failure");
+    assert!(
+        !app.store
+            .device(&device_id)
+            .await
+            .expect("device")
+            .is_revoked(),
+        "a failed audit write must not leave the device revoked"
+    );
+
+    let (status, body) = app.revoke_lease(&lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "store_failure");
+    assert!(
+        !app.store
+            .lease(&lease_id)
+            .await
+            .expect("lease")
+            .is_revoked(),
+        "a failed audit write must not leave the lease revoked"
+    );
+
+    let (status, body) = app.revoke("sessions", &session_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "store_failure");
+    assert!(
+        !app.store
+            .session(&session_id)
+            .await
+            .expect("session")
+            .is_revoked(),
+        "a failed audit write must not leave the session revoked"
+    );
+}
+
+#[tokio::test]
 async fn the_unfiltered_listing_is_served_by_an_index_not_a_table_scan() {
     let path = scratch_path("unfiltered-listing");
     let store = SqliteStore::open(&path).expect("file store");
@@ -529,14 +590,10 @@ async fn the_unfiltered_listing_is_served_by_an_index_not_a_table_scan() {
     let probe = rusqlite::Connection::open(&path).expect("probe connection");
     let plan = {
         let mut statement = probe
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT at_ms, actor, action, device_id, outcome, error
-                 FROM audit_log ORDER BY at_ms DESC, id DESC LIMIT 50",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {AUDIT_PAGE_SQL}"))
             .expect("prepare");
         statement
-            .query_map([], |row| row.get::<_, String>(3))
+            .query_map([50_i64], |row| row.get::<_, String>(3))
             .expect("plan")
             .collect::<Result<Vec<_>, _>>()
             .expect("plan rows")

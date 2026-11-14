@@ -214,6 +214,11 @@ pub struct AuditEntry {
 /// this is the hard bound that keeps a query from reading the whole log.
 pub const MAX_AUDIT_PAGE: usize = 1_000;
 
+/// The unfiltered newest-first page. One constant, so the query-plan test asserts the exact
+/// SQL the store runs instead of a copy that can drift from it.
+pub const AUDIT_PAGE_SQL: &str = "SELECT at_ms, actor, action, device_id, outcome, error
+     FROM audit_log ORDER BY at_ms DESC, id DESC LIMIT ?1";
+
 impl AuditEntry {
     /// The columns as the store returns them.
     fn validate(&self) -> Result<(), StoreError> {
@@ -1217,12 +1222,8 @@ impl DeviceStore for SqliteStore {
                         .map_err(backend_error)?
                 }
                 None => {
-                    let mut statement = connection
-                        .prepare(
-                            "SELECT at_ms, actor, action, device_id, outcome, error
-                             FROM audit_log ORDER BY at_ms DESC, id DESC LIMIT ?1",
-                        )
-                        .map_err(backend_error)?;
+                    let mut statement =
+                        connection.prepare(AUDIT_PAGE_SQL).map_err(backend_error)?;
                     statement
                         .query_map(params![limit], audit_from_row)
                         .map_err(backend_error)?

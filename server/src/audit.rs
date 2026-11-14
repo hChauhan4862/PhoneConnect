@@ -2,8 +2,10 @@
 //!
 //! The log is append-only. A revocation writes its row inside the same store transaction that
 //! changes the record, stamped with the effective revocation time, so an idempotent retry
-//! appends nothing and no revocation commits untraced. A dispatch attempt is recorded after it
-//! is enqueued and is best-effort: [`crate::commands`] counts a failed write and `/health`
+//! appends nothing and no revocation commits untraced; if the row cannot be written, the
+//! revocation rolls back and the request answers `store_failure`. A dispatch attempt is
+//! recorded after it is resolved — accepted attempts are enqueued first, refusals before the
+//! response — and is best-effort: [`crate::commands`] counts a failed write and `/health`
 //! reports it rather than hiding it. This module reads the log back, filtered and bounded. A
 //! row carries identity, the action, the outcome, and a machine error code only: never a
 //! command argument, a file path, a file byte, or an image.
