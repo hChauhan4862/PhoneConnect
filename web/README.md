@@ -14,6 +14,11 @@ asserted user id; the lease rules constrain what an accepted user may do, but th
 authenticate that user. Local password login and MFA replace the access gate without changing
 the screens.
 
+`docs/capabilities.md` is the device-side command matrix: what each command does, whether an
+ordinary installed app can perform it, the exact refusal it gives when it cannot, and whether
+it was verified on the emulator or only in a unit test. A screen here renders that truth and
+never claims a capability beyond it.
+
 ```sh
 npm ci
 npm test          # Vitest + Testing Library

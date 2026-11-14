@@ -8,11 +8,13 @@ with keys the server never holds. Nothing here exposes raw ADB to a network.
 
 ## Milestone status
 
-This is the foundation milestone, not a finished product.
+This is an early milestone, not a finished product.
 
 - The server, protocol, and transport are implemented and covered by automated tests.
 - The Android agent's code path enrolls and holds one relay session against a real server in
-  its JVM test harness. No run on a physical device is recorded in this repository.
+  its JVM test harness. No run on a physical device is recorded in this repository; the
+  end-to-end runs recorded here used an Android 15 emulator, and `docs/capabilities.md` says for
+  each command whether it was exercised there or only in a unit test.
 - The native shell builds on macOS and runs its headless `--print-context` path. It is a
   webview over the server-served UI plus loopback proxy endpoints; the GUI path was not
   exercised here, and those endpoints have no Android peer, so nothing on the phone is
@@ -20,18 +22,11 @@ This is the foundation milestone, not a finished product.
 - The web UI is a static admin surface. It renders the snapshot it last read and polls a
   command until the device answers; there is no server-to-client push channel.
 - Each enrolled device keeps a second, authenticated management connection to the server
-  carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, the
-  `files.*` commands, the `apps.*` commands, `screen.snapshot` (one frame, only with the
-  `MediaProjection` consent the user granted on the setup screen), `system.props` (a
-  documented allowlist), and the `control.*` commands work end to end from the one web UI.
-  Device control reports every reading it can produce and changes three keys — screen
-  brightness (with the user-granted `WRITE_SETTINGS`), music volume, and the Do Not Disturb
-  filter (with notification-policy access) — while Wi-Fi, Bluetooth, mobile data, night mode,
-  rotation, and a reboot are explicit `not_permitted` refusals with a machine reason. An
-  ordinary app cannot hold the signature-level permissions `apps.clear` and
-  `apps.set_enabled` need, cannot run `adb shell`, and cannot read logcat (`READ_LOGS` is
-  signature-level), so those are explicit refusals too — documented and rendered as
-  unavailable. The sealed peer relay is unchanged and the server still cannot read it.
+  carrying JSON telemetry and commands. `docs/capabilities.md` is the single table of those
+  commands: what each one does, whether an ordinary installed app can perform it, the exact
+  refusal code and reason when it cannot, and whether it was verified on the emulator, by a
+  unit test only, or not at all. The sealed peer relay is unchanged and the server still cannot
+  read it.
 - Direct hole-punched paths are implemented and tested in the transport, but both shipped
   clients use the relay. Production connectivity is relay-only.
 - Telemetry aggregates are bounded and kept in memory.
@@ -49,7 +44,8 @@ This is the foundation milestone, not a finished product.
   endpoints.
 - `web/` — the only UI implementation, served by the server.
 - `docker/` — the server image, the compose file, and the container transport end-to-end test.
-- `docs/` — the design spec and the implementation plan.
+- `docs/` — the design spec, the implementation plan, and `docs/capabilities.md`, the device
+  command matrix.
 
 ## Prerequisites
 
@@ -78,26 +74,78 @@ cargo test --workspace                            # Rust server, protocol, trans
 Each component's README documents its own commands, including `cargo clippy`, the web build,
 the APK build, and the Docker end-to-end test.
 
-## Not implemented yet
+## What works today
 
-The component READMEs are the source of truth for what does and does not work:
+Only what the suites and the emulator smoke actually exercised is listed. `docs/capabilities.md`
+is the single table of every device command: what it does, whether an ordinary installed app can
+perform it, the exact refusal code and reason when it cannot, and whether it was verified on the
+emulator, by a unit test only, or not at all.
 
-- `android/README.md` — no direct-path port, no ticket-signature verification, and a small
-  management vocabulary (`device.info`, `device.ping`, `telemetry.now`, the `files.*` commands
-  inside one app-private directory, the `apps.*` commands, one-frame `screen.snapshot`, the
-  `system.props` allowlist, and the `control.*` commands that change only brightness, music
-  volume, and the Do Not Disturb filter). Package listing depends on `QUERY_ALL_PACKAGES`; a
-  background activity start is usually blocked (`launch_blocked`); `apps.clear`/
-  `apps.set_enabled`, `shell.exec`, `logcat.tail`, the Wi-Fi/Bluetooth/mobile-data/night-mode/
-  rotation setters, and `control.reboot` are refused because an installed app cannot hold the
-  signature-level permissions or the ADB/root UID. Screen *mirroring*, input injection, audio,
-  and continuous capture are not implemented, and the phone is not remotely controllable.
-- `native/README.md` — there is no Android-side TCP bridge, so the loopback proxy does not
-  reach a phone yet; no screen creates a session until the server's user login and MFA land.
-  Only macOS has been built here; Windows and Linux are untested.
-- `web/README.md` and `server/README.md` — the UI is not live, and local password login/MFA do
-  not exist. Access uses the admin bearer token, so control leases constrain an already
-  accepted user but are not an authorization boundary.
+- **Enrollment and recovery.** A device enrolls with a one-time token, holds one relay session
+  and one authenticated management connection, and reconnects with bounded backoff. The agent's
+  session flow runs against a real HTTP/WebSocket server in its JVM harness; enrollment and the
+  management channel were exercised on an Android 15 emulator, where one service and one
+  notification held.
+- **Identity and telemetry.** `device.info` and `telemetry.now` work end to end (emulator).
+  `device.ping` is covered by unit tests only. `telemetry.now` reports battery, memory, and the
+  active network transport; CPU percentage is always absent because Android does not expose it
+  to an ordinary app.
+- **Files.** All six `files.*` commands work inside the app's own external files directory
+  (emulator): a 256 KiB read chunk with an honest `truncated`, a non-recursive delete, and
+  `path_outside_root` for a traversal. The 1 MiB write cap is enforced by the server before
+  dispatch (a live `413 too_large`) and by the device (unit test).
+- **Apps.** `apps.list`, `apps.launch` (only while Android permits a background start; the live
+  run saw both a real launch and `launch_blocked`), and `apps.stop` (a kill *request*, never a
+  confirmed stop) work (emulator). `apps.clear` and `apps.set_enabled` are constant refusals:
+  they need signature-level permissions.
+- **Screen.** `screen.snapshot` returns one real frame after the user grants screen capture on
+  the device (emulator, including a resize on rotation); without that grant it is
+  `consent_required` and no code path can prompt.
+- **System properties and the console.** `system.props` reports a six-name allowlist (emulator).
+  `shell.exec` and `logcat.tail` are constant `not_permitted` refusals with a reason, because an
+  installed app has neither a shell UID nor `READ_LOGS`.
+- **Device control.** `control.get` reports its twelve readings (emulator). `control.set` really
+  changes screen brightness (with the user-granted `WRITE_SETTINGS`), music volume, and the Do
+  Not Disturb filter (with notification-policy access), confirming each by reading it back, and
+  it refuses Wi-Fi, Bluetooth, mobile data, night mode, and rotation with a machine reason.
+  `control.reboot` always refuses: `REBOOT` is signature-level.
+- **Server, protocol, and transport.** Covered by the Rust tests, including the relay limits,
+  leases, retention, and the sealed-frame compatibility vectors. Direct hole-punched paths are
+  implemented and tested in the Rust transport.
+- **Web UI.** Routes, panels, and API errors are covered by Vitest. The control, file, app,
+  screen, and console screens were driven against the emulator in a browser. There is no
+  server-to-client push, so every screen renders the snapshot it last read.
+- **Native shell.** Builds on macOS and runs its headless `--print-context` path. The GUI path
+  was not exercised here.
+
+A command is `ok` only when the device produced that answer; nothing above is inferred from a
+dispatch.
+
+## Not implemented
+
+None of this exists in code. It is not a roadmap promise; it is what a reader must not assume.
+
+- **Mirroring and input.** No continuous screen stream, no video encode, and no touch or key
+  injection. `screen.snapshot` is one frame per command.
+- **Microphone and recordings.** No audio capture, streaming, or recording.
+- **Calls, SMS, and notification records.** No call log, SMS, or notification history, and no
+  device history export (CSV or otherwise).
+- **Agent OTA.** No self-update, no signed manifest, and no release channel.
+- **Accounts, login, and MFA.** Access uses the admin bearer token, so control leases constrain
+  an already accepted user but are not an authorization boundary. There are no device
+  assignments or per-user visibility.
+- **The Android TCP proxy bridge.** The native shell's loopback proxy has no Android peer, so it
+  reaches no phone. No screen creates a session until local login and MFA land.
+- **Direct hole-punched paths on Android.** The Rust transport implements and tests them; the
+  Android agent always uses the relay, and it does not verify ticket signatures (TLS to the hub
+  is its trust anchor).
+- **CI publishing.** There is no CI pipeline and there are no signed release artifacts: no
+  container image, APK, or native installer is published.
+- **Windows and Linux native builds.** Only macOS has been built here.
+- **Device control of Wi-Fi, Bluetooth, mobile data, rotation, night mode, or reboot.** These are
+  refusals, not features: an ordinary installed app cannot hold the signature-level permissions
+  or the system-UI role they need. ADB is not implemented, exposed, or tunnelled either; the
+  agent is not a shell.
 
 ## License
 

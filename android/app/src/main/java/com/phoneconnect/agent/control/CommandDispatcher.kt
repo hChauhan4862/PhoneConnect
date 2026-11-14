@@ -132,6 +132,38 @@ open class CommandDispatcher(
         const val CONTROL_SET = "control.set"
         const val CONTROL_REBOOT = "control.reboot"
 
+        /**
+         * Every command name this build registers, in family order.
+         *
+         * These are the same constants the [dispatch] branches use, so a command cannot be
+         * routed without appearing here. `CapabilityMatrixTest` reads this list, the
+         * constants in this file, and `docs/capabilities.md`, and fails when the three
+         * disagree in either direction.
+         */
+        val COMMANDS: List<String> = listOf(
+            DEVICE_INFO,
+            DEVICE_PING,
+            TELEMETRY_NOW,
+            FILES_LIST,
+            FILES_READ,
+            FILES_WRITE,
+            FILES_MKDIR,
+            FILES_DELETE,
+            FILES_RENAME,
+            APPS_LIST,
+            APPS_LAUNCH,
+            APPS_STOP,
+            APPS_CLEAR,
+            APPS_SET_ENABLED,
+            SCREEN_SNAPSHOT,
+            SYSTEM_PROPS,
+            SHELL_EXEC,
+            LOGCAT_TAIL,
+            CONTROL_GET,
+            CONTROL_SET,
+            CONTROL_REBOOT,
+        )
+
         /** The server's default deadline, used when a caller does not supply a budget. */
         const val DEFAULT_BUDGET_MS: Long = 10_000
     }

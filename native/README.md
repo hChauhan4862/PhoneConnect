@@ -228,6 +228,8 @@ and `endpoints` — and a browser reports the capability as unavailable with a r
 than rendering a dead control, but no screen creates a session yet: that needs the server's
 user login/MFA, which is a later plan. The next task is the create-session UI plus the Android
 TCP bridge.
+The device-side command matrix in `../docs/capabilities.md` applies unchanged: this shell adds
+no device capability, and no command covers proxy streams, audio, mirroring, or input.
 What is proven is the native half:
 
 - `native/tests/proxy.rs` binds real loopback ports and drives a real `ConnectedPath` over an

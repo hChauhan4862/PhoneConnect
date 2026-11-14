@@ -7,6 +7,11 @@ visible status notification.
 
 ADB is used only to sideload the app; it is never the runtime identity or the transport.
 
+`docs/capabilities.md` at the repository root is the single table of the commands this agent
+implements: what each one does, whether an ordinary installed app can perform it, the exact
+refusal code and reason when it cannot, and whether it was verified on the emulator or only in a
+unit test. This file describes how they are built; the matrix is the authority on what works.
+
 ## How it connects
 
 1. **Setup.** `SetupActivity` takes the hub URL and a one-time enrollment token, requests
@@ -289,6 +294,10 @@ and one channel; the extra type changes nothing the user sees.
   terminal close, a relay 409 that is never retried, and a 204 poll loop.
 - **Setup.** `SetupActivityTest` enrolls through the screen into a Keystore-sealed store and
   starts the one service.
+- **The capability matrix matches the code.** `CapabilityMatrixTest` compares
+  `CommandDispatcher.COMMANDS`, the command constants in `CommandDispatcher.kt`, and the table
+  in `../docs/capabilities.md`, and fails when they disagree in either direction — a command
+  the code registers but the document omits, or a row the code does not implement.
 
 ## Best-effort persistence
 
@@ -307,10 +316,11 @@ still stop the agent. The notification and setup screen say so and show recovery
   documents for trust-on-first-use. Porting Ed25519 verification is follow-up work.
 - **The management vocabulary is small.** `device.info`, `device.ping`, `telemetry.now`, the
   `files.*` commands, the `apps.*` commands, `screen.snapshot`, `system.props`, the
-  `control.*` commands, and the three documented refusals (`shell.exec`, `logcat.tail`,
-  `control.reboot`) are implemented; another feature adds a handler file and a branch to the
-  same dispatcher. Device control changes three keys (brightness with `WRITE_SETTINGS`, music
-  volume, and the Do Not Disturb filter with policy access) and refuses the rest; Wi-Fi,
+  `control.*` commands, and the five constant refusals (`apps.clear`, `apps.set_enabled`,
+  `shell.exec`, `logcat.tail`, `control.reboot`) are implemented; another feature adds a handler
+  file and a branch to the same dispatcher. `docs/capabilities.md` lists every one with its
+  verification status. Device control changes three keys (brightness with `WRITE_SETTINGS`,
+  music volume, and the Do Not Disturb filter with policy access) and refuses the rest; Wi-Fi,
   Bluetooth, mobile data, night mode, and the rotation lock stay with the system UI. File
   transfers stay inside the app's own external files directory: shared storage at large needs
   a scoped-storage design of its own and is not offered. CPU percentage is reported as `null`:

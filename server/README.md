@@ -81,6 +81,9 @@ The file routes are commands with a typed front door: the same authorization, ca
 deadline, and audit row as `POST /commands`, and the same refusals (`403 lease_read_only`,
 `409 device_offline`, `429 command_capacity`). The device's `PathGuard` is the safety
 authority; the server's own checks are structural (`invalid_request`) plus the write size cap.
+Whatever a forwarded command can and cannot do is the device's answer, not the server's
+decision: `../docs/capabilities.md` is the single device-side matrix of every command, its
+refusal code and reason, and whether it was verified on the emulator or only in a unit test.
 The app routes follow the same pattern. The server's own checks are structural
 (`invalid_request`: a missing, non-string, blank, NUL-containing, or over-255-byte package, or
 a non-boolean `enabled`); every capability decision is the device's, so `launch_blocked`,
