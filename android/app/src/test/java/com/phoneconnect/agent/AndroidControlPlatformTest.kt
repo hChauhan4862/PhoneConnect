@@ -16,6 +16,7 @@ import com.phoneconnect.agent.control.ControlReason
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -87,6 +88,26 @@ class AndroidControlPlatformTest {
             Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
             platform.brightnessMode().value,
         )
+    }
+
+    @Test
+    fun `a revoked grant is rethrown, not reported as an ordinary write failure`() {
+        val denied = AndroidControlPlatform(context) { _, _ -> throw SecurityException("denied") }
+
+        assertThrows(SecurityException::class.java) { denied.writeBrightness(10) }
+        assertThrows(SecurityException::class.java) {
+            denied.writeBrightnessMode(Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+        }
+        // A read that no longer has the grant is still a read the platform refused, not a throw.
+        assertNull(denied.brightnessMode().value)
+    }
+
+    @Test
+    fun `a write the provider refuses is a plain false, not an exception`() {
+        val refused = AndroidControlPlatform(context) { _, _ -> false }
+
+        assertFalse(refused.writeBrightness(10))
+        assertFalse(refused.writeBrightnessMode(Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL))
     }
 
     @Test

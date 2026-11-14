@@ -185,6 +185,10 @@ unit test. This file describes how they are built; the matrix is the authority o
     `not_applied` (`brightness_not_applied`, `volume_not_applied`, `dnd_not_applied`), never
     `ok`. A write the platform accepted but would not let the app confirm — the read-back
     throws or is unavailable — is `unconfirmed` / `read_back_unavailable`, never `ok` either.
+    A grant the user revokes mid-change is neither of those: `Settings.System.putInt` throws
+    `SecurityException`, and the adapter rethrows it so the answer is `not_permitted` /
+    `write_settings_required` (with the mode restored, or `_mode_left_manual` when it cannot
+    be), because "you may not write this" is not the same answer as "the value did not stick".
     A volume whose stream max cannot be read is `platform_read_failed` with
     `volume_max_unreadable`. `control.get` names every refused key in `unavailable` — including
     `reboot` — so the web panel renders a disabled control with the reason as visible text.

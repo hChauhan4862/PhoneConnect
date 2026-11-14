@@ -17,9 +17,20 @@ import android.telephony.TelephonyManager
  *
  * Nothing here decides what is allowed; it reports what Android reports. A service this device
  * does not have, a setting it does not keep, and a call it refuses all become a [Reading] with
- * a constant reason, so the handler never has to catch a platform exception itself.
+ * a constant reason. A *write* is the one place the two failures stay apart: a provider that
+ * refused the write is `false`, while a grant that is gone throws `SecurityException`, because
+ * "you may not do this" is not the same answer as "the value did not stick".
  */
-class AndroidControlPlatform(private val context: Context) : ControlPlatform {
+class AndroidControlPlatform(
+    private val context: Context,
+    /**
+     * The settings write. The real one throws `SecurityException` when the grant is gone; the
+     * seam exists so both answers can be tested against the provider's own behaviour.
+     */
+    private val writeSetting: (name: String, value: Int) -> Boolean = { name, value ->
+        Settings.System.putInt(context.applicationContext.contentResolver, name, value)
+    },
+) : ControlPlatform {
     private val app = context.applicationContext
     private val resolver = app.contentResolver
 
@@ -100,19 +111,13 @@ class AndroidControlPlatform(private val context: Context) : ControlPlatform {
         false
     }
 
-    override fun writeBrightness(value: Int): Boolean = try {
-        Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS, value) &&
+    override fun writeBrightness(value: Int): Boolean =
+        writeSetting(Settings.System.SCREEN_BRIGHTNESS, value) &&
             systemSetting(Settings.System.SCREEN_BRIGHTNESS).value == value
-    } catch (_: SecurityException) {
-        false
-    }
 
-    override fun writeBrightnessMode(mode: Int): Boolean = try {
-        Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS_MODE, mode) &&
+    override fun writeBrightnessMode(mode: Int): Boolean =
+        writeSetting(Settings.System.SCREEN_BRIGHTNESS_MODE, mode) &&
             systemSetting(Settings.System.SCREEN_BRIGHTNESS_MODE).value == mode
-    } catch (_: SecurityException) {
-        false
-    }
 
     override fun hasPolicyAccess(): Boolean = try {
         notifications()?.isNotificationPolicyAccessGranted == true
