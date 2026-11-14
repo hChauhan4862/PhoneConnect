@@ -165,9 +165,9 @@ internal class MediaProjectionScreenCapture(
     }
 
     /**
-     * The mirror for this grant, created once. A display cannot be resized and a token cannot
-     * create a second one, so a size change ends the grant rather than returning a frame at the
-     * wrong size.
+     * The mirror for this grant, created once. A token cannot create a second display, but the
+     * one it owns can be resized, so a size change keeps the grant; only a refused resize ends
+     * it rather than returning a frame at the wrong size.
      */
     private fun mirrorFor(active: MirrorSource, screen: ScreenMetrics): ScreenMirror {
         val existing = synchronized(lock) { mirror }
