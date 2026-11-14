@@ -118,8 +118,8 @@ Each peer receives a signed, short-lived ticket: an Ed25519 signature over the s
 device id, role, rendezvous nonce, 256-bit probe key, both pinned identity public keys, and
 a 30-second expiry that never outlives the session. The public verification key travels with the ticket
 (`verification_key`) so a peer verifies the signature itself; only the server holds the
-private half, and the key is generated at startup, which invalidates outstanding tickets
-across a restart.
+private half, and the key is persisted at `PHONECONNECT_TICKET_KEY_PATH`, so a restart keeps
+the same verification key and outstanding tickets stay valid.
 
 Both roles of one rendezvous round receive the same nonce and probe key — that shared value
 is what authenticates direct-path probes — while each ticket is signed for its own role.
@@ -289,6 +289,14 @@ intentional for single-node deployments; a PostgreSQL adapter can implement the 
 `DeviceStore` trait without leaking backend types through it.
 
 ## Running
+
+`cargo` builds `crates/protocol`, whose `build.rs` shells out to `protoc`, so every Cargo
+command in this workspace needs it:
+
+```sh
+brew install protobuf                          # macOS
+sudo apt-get install -y protobuf-compiler      # Debian/Ubuntu
+```
 
 ```sh
 cargo test -p phoneconnect-server

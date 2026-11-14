@@ -8,7 +8,7 @@
 
 **Tech Stack:** Kotlin/Android, Rust, Tokio, Tauri-compatible Rust library boundaries, React/TypeScript for the minimal status UI, Protobuf schema generation for stable envelopes, SQLite for development tests, PostgreSQL-compatible repository interfaces for production, Docker Compose for local integration.
 
-**Spec:** [2026-11-13-phoneconnect-design.md](/Volumes/wise/HARENDRA/MobileConnect/PhoneConnect/docs/superpowers/specs/2026-11-13-phoneconnect-design.md)
+**Spec:** [2026-11-13-phoneconnect-design.md](../specs/2026-11-13-phoneconnect-design.md)
 
 ## Global Constraints
 

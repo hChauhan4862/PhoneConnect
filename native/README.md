@@ -5,6 +5,10 @@ server-served app at the configured URL in a webview and adds only what a browse
 tray, detached OS windows, OS notifications, and loopback proxy endpoints. It does not bundle,
 fork, or reimplement the React app, and it does not rewrite its paths.
 
+Every Cargo command here builds `crates/protocol`, whose `build.rs` shells out to `protoc`.
+Install it first: `brew install protobuf` on macOS, or
+`sudo apt-get install -y protobuf-compiler` on Debian/Ubuntu.
+
 ```sh
 # the headless logic: URL policy, host context, proxy pump, session client
 cargo test -p phoneconnect-native
@@ -284,8 +288,8 @@ request ids.
 
 Direct-path and relay transport live in `crates/transport`, not here, so the native client and
 the Android agent run the same negotiation. A successful send on either path is best-effort
-until the peer answers; the transport's own README documents the handshake, keepalive, and
-fallback rules.
+until the peer answers; [the transport's own README](../crates/transport/README.md)
+documents the handshake, keepalive, and fallback rules.
 
 ## Packaging status
 

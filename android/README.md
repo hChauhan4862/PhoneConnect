@@ -77,6 +77,15 @@ export GRADLE_USER_HOME="$PWD/.gradle-home"
 ./gradlew :app:lintDebug           # app/build/reports/lint-results-debug.xml
 ```
 
+## Cleartext policy for a loopback hub
+
+`HubClient` accepts `https` anywhere and plain `http` only for `127.0.0.1`, `localhost`, and
+`::1`, and the compose default is that loopback origin. Because `targetSdk` 35 denies
+cleartext by default, `app/src/main/res/xml/network_security_config.xml` permits cleartext for
+exactly those three literals and leaves every other host on TLS; the manifest applies it with
+`android:networkSecurityConfig`. `NetworkSecurityConfigTest` parses the manifest and the XML
+and fails if a non-loopback domain is covered or the base config starts allowing cleartext.
+
 ## Foreground service type
 
 The service is `connectedDevice` with `FOREGROUND_SERVICE_CONNECTED_DEVICE` and

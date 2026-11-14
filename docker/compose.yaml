@@ -1,3 +1,11 @@
+# PhoneConnect server and relay.
+#
+# Environment (export these, or put them in an untracked .env next to this file):
+#   PHONECONNECT_ADMIN_TOKEN  Required. Compose refuses to start without it.
+#   PHONECONNECT_PUBLIC_URL   The origin clients dial. Defaults to
+#                             http://127.0.0.1:8080 for a local run; a real deployment sets
+#                             it to the public HTTPS origin behind its TLS proxy, because the
+#                             server advertises this value as the relay base.
 services:
   server:
     build:
@@ -8,7 +16,7 @@ services:
       # Required: compose refuses to start without it, so no deployment inherits a
       # publicly known bootstrap token. Generate one with `openssl rand -base64 32`.
       PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:?set PHONECONNECT_ADMIN_TOKEN to a random admin bearer token}
-      PHONECONNECT_PUBLIC_URL: http://127.0.0.1:8080
+      PHONECONNECT_PUBLIC_URL: ${PHONECONNECT_PUBLIC_URL:-http://127.0.0.1:8080}
       # Persisted, so a restart does not rotate the key native clients pinned.
       PHONECONNECT_TICKET_KEY_PATH: /data/ticket-signing-key
     ports:
