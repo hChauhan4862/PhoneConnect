@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::commands::{
-    CommandAccepted, CommandError, CommandQuery, authorize_control, dispatch_for_actor,
-    record_refusal, required_user,
+    CommandAccepted, CommandError, CommandQuery, authorize_control, charge_attempt,
+    dispatch_for_actor, record_refusal, required_user,
 };
 use crate::{ApiJson, AppState};
 
@@ -141,6 +141,11 @@ async fn submit(
         .require_admin(headers)
         .map_err(CommandError::from)?;
     let actor = required_user(query)?;
+    // Every attempt that can be traced charges the device's creation budget before an outcome
+    // is decided, so a flood of refusals cannot append rows through the throttle.
+    if let Some(error) = charge_attempt(state, device_id) {
+        return Err(ConsoleRequestError::Command(error));
+    }
     // The authorization decision comes before the request-shape check, so a refusal row is
     // only written for a caller that could act on the device it named, and an unauthorized
     // attempt is classified by the authorization failure.

@@ -784,3 +784,109 @@ async fn an_unauthorized_caller_cannot_shape_or_redirect_the_refusal_it_causes()
     assert_eq!(rows[0].error.as_deref(), Some("invalid_request"));
     assert_eq!(rows[0].actor, "owner-1");
 }
+
+#[tokio::test]
+async fn refused_attempts_charge_the_creation_budget_so_the_log_is_bounded() {
+    // A refusal is traced, so it takes the same per-device token a dispatch takes. Past the
+    // burst nothing more is appended: rows per device are bounded by the documented throttle,
+    // not by how fast a caller can send requests.
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+
+    let mut refused = 0;
+    loop {
+        let (status, body) = app
+            .request(
+                Method::POST,
+                &format!("/api/devices/{device_id}/files/list?user_id=owner-1"),
+                Some(ADMIN_TOKEN),
+                Some(json!({})),
+            )
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["error"], "rate_limited");
+            break;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_request");
+        refused += 1;
+        assert!(refused <= 128, "the throttle never fired");
+    }
+    assert!(
+        refused >= 20,
+        "at least the documented burst of refusals is traced: {refused}"
+    );
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 200)
+        .await
+        .expect("audit rows");
+    assert_eq!(
+        rows.len(),
+        refused,
+        "a throttled attempt appends nothing: {rows:?}"
+    );
+    assert!(rows.iter().all(|row| {
+        row.outcome == "refused" && row.error.as_deref() == Some("invalid_request")
+    }));
+
+    // The bucket refills with time, so the refusal is traceable again.
+    app.clock.advance_ms(1_000);
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/files/list?user_id=owner-1"),
+            Some(ADMIN_TOKEN),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 200)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), refused + 1, "a refilled bucket traces again");
+}
+
+#[tokio::test]
+async fn an_unauthorized_callers_refusals_are_throttled_too() {
+    // The device-access decision is the first traceable step, so its refusals take the token as
+    // well. A stranger cannot append `lease_read_only` rows at HTTP speed either.
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+
+    let mut refused = 0;
+    loop {
+        let (status, body) = app
+            .request(
+                Method::POST,
+                &format!("/api/devices/{device_id}/files/list?user_id=user-b"),
+                Some(ADMIN_TOKEN),
+                Some(json!({})),
+            )
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(body["error"], "rate_limited");
+            break;
+        }
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "lease_read_only");
+        refused += 1;
+        assert!(refused <= 128, "the throttle never fired");
+    }
+    assert!(refused >= 20, "the burst of traced refusals is {refused}");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 200)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), refused, "the throttled attempt appends nothing");
+    assert!(rows.iter().all(|row| {
+        row.outcome == "refused"
+            && row.error.as_deref() == Some("lease_read_only")
+            && row.actor == "user-b"
+    }));
+}

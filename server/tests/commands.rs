@@ -592,14 +592,23 @@ async fn command_creation_is_throttled_per_device() {
         .expect("seconds");
     assert!((1..=60).contains(&retry_after), "{retry_after}");
 
-    // A throttled attempt is still a traceable attempt.
+    // A throttled attempt appends nothing: the throttle is the bound on the log's growth, so
+    // nothing may write through it. The 429 with `Retry-After` is the caller's answer.
     let rows = app
         .store
-        .list_audit(Some(&device_id), 10)
+        .list_audit(Some(&device_id), 200)
         .await
         .expect("audit rows readable");
-    assert_eq!(rows[0].outcome, "refused");
-    assert_eq!(rows[0].error.as_deref(), Some("rate_limited"));
+    assert!(
+        rows.iter()
+            .all(|row| row.error.as_deref() != Some("rate_limited")),
+        "a throttled attempt is not traced: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        accepted,
+        "one row per attempt that got past the throttle"
+    );
 
     // The bucket refills with time, so the device is usable again.
     app.clock.advance_ms(1_000);

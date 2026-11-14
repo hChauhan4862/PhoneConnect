@@ -7,10 +7,12 @@
 //! so a caller never waits on a device that cannot answer.
 //!
 //! The command table itself is in memory and bounded (see [`crate::management`]); only the
-//! audit rows are durable. Every dispatch attempt writes one `command.dispatch` row, accepted
-//! or refused, and a command that then ends without a device answer writes one more
-//! `command.outcome` row (`timeout` or `device_offline`). `accepted` means the frame reached
-//! the device's channel, not that the device executed it.
+//! audit rows are durable. Every attempt that gets past the per-device creation throttle writes
+//! one `command.dispatch` row, accepted or refused, and a command that then ends without a
+//! device answer writes one more `command.outcome` row (`timeout` or `device_offline`).
+//! `accepted` means the frame reached the device's channel, not that the device executed it. A
+//! throttled attempt answers `429 rate_limited` and appends nothing: the throttle is what bounds
+//! the log's growth, so nothing may write through it.
 //!
 //! The actor comes from the `user_id` query parameter, matching the status and lease routes:
 //! the bootstrap admin token carries no user identity of its own.
@@ -150,7 +152,6 @@ impl From<DispatchError> for CommandError {
             DispatchError::Capacity { device_id, limit } => Self::Capacity { device_id, limit },
             DispatchError::InvalidTimeout => Self::InvalidTimeout,
             DispatchError::InvalidName => Self::InvalidName,
-            DispatchError::RateLimited { retry_after_ms } => Self::RateLimited { retry_after_ms },
             DispatchError::Internal => {
                 Self::StoreFailure("command id was not generated".to_owned())
             }
@@ -180,6 +181,9 @@ pub async fn dispatch_command(
 ) -> Result<(StatusCode, Json<CommandAccepted>), CommandError> {
     state.auth.require_admin(&headers)?;
     let actor = required_user(&query)?;
+    if let Some(error) = charge_attempt(&state, &device_id) {
+        return Err(error);
+    }
 
     let dispatch = dispatch_for_actor(
         &state,
@@ -198,10 +202,25 @@ pub async fn dispatch_command(
     ))
 }
 
+/// Charges one attempt against `device_id`'s creation budget before any outcome is decided.
+/// `Some(error)` is the `429` the caller returns: the throttle sits at the attempt's entry point,
+/// so a flood of refusals — a shapeless body, a stranger's `lease_read_only` — cannot append
+/// audit rows through the very limit meant to bound them.
+pub(crate) fn charge_attempt(state: &AppState, device_id: &str) -> Option<CommandError> {
+    state
+        .management
+        .charge_command(device_id)
+        .map(|retry_after_ms| CommandError::RateLimited { retry_after_ms })
+}
+
 /// Authorizes and dispatches one command for an already authenticated [actor], writing the
 /// audit row the command route writes. The feature routes (files, and later apps) use this so
 /// there is one dispatch path — authorization, capacity, deadlines, audit — not one per
 /// feature.
+///
+/// The caller charges the attempt first ([`charge_attempt`]) and answers its `429`; every route
+/// does that before it decides anything, so an attempt that will be traced is charged exactly
+/// once and a throttled one is never traced.
 pub async fn dispatch_for_actor(
     state: &AppState,
     device_id: &str,
@@ -268,6 +287,9 @@ pub async fn authorize_control(
 /// Records a request the server refused before it could reach [`dispatch_for_actor`] (an
 /// oversized write, say), so a refusal is as traceable as an accepted dispatch. The caller must
 /// have already decided the actor's access to the device: this only writes what it is told.
+///
+/// The route charges the attempt first ([`charge_attempt`]), so this only writes a row for an
+/// attempt the throttle admitted.
 pub async fn record_refusal(state: &AppState, device_id: &str, actor: &str, code: &str) {
     record_attempt(state, device_id, actor, "refused", Some(code)).await;
 }

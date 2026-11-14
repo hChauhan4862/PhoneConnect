@@ -476,6 +476,89 @@ async fn revoking_a_device_closes_its_channel_and_stops_telemetry() {
     server.abort();
 }
 
+#[tokio::test]
+async fn a_deadline_that_passed_before_the_channel_closed_is_a_timeout() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    let (status, body) = app
+        .dispatch_command(
+            &device_id,
+            "user-a",
+            json!({ "name": "device.ping", "args": null, "timeout_ms": 500 }),
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+    control::next_json(&mut socket).await;
+
+    // Nothing reads the command table while the deadline passes, so the record is still
+    // `pending` when the channel ends. The deadline happened first, and the trace must say so.
+    app.clock.advance_ms(600);
+    socket.close(None).await.expect("channel closed");
+    control::wait_offline(&app, &device_id).await;
+
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = app
+            .store
+            .list_audit(Some(&device_id), 10)
+            .await
+            .expect("audit rows readable");
+        if rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 2, "dispatch plus outcome: {rows:?}");
+    let outcome = rows
+        .iter()
+        .find(|row| row.action == "command.outcome")
+        .expect("the terminal state is traced");
+    assert_eq!(
+        outcome.outcome, "timeout",
+        "a passed deadline is a timeout, not a channel ending: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.outcome == "device_offline"),
+        "the channel ended after the deadline, so nothing is device_offline: {rows:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_channel_that_registers_after_revocation_is_closed_without_being_registered() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+
+    // The upgrade's `require_device` passed before revocation committed; `connect` is the last
+    // place that can refuse the registration. Calling the registry directly models exactly that
+    // interleaving: the credential is still valid, the device is already revoked.
+    assert!(
+        !app.state.management.revoke(&device_id).await,
+        "nothing was open yet"
+    );
+
+    let (base, server) = control::serve(&app).await;
+    let mut socket = control::connect(&base, &device_id, &credential)
+        .await
+        .expect("the handshake still authenticates: revocation committed after it");
+
+    let (code, reason) = control::next_close(&mut socket).await;
+    assert_eq!(code, 1008);
+    assert_eq!(
+        reason, "device_revoked",
+        "a refused registration tells the device why"
+    );
+    assert!(
+        !app.state.management.is_online(&device_id),
+        "a refused registration never becomes online"
+    );
+
+    server.abort();
+}
+
 async fn wait_for_completion(app: &TestApp, command_id: &str, user_id: &str) -> serde_json::Value {
     for _ in 0..200 {
         let (status, body) = app.command(command_id, user_id).await;

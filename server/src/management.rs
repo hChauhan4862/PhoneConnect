@@ -94,6 +94,13 @@ const MAX_RETAINED_TEXT_BYTES: usize = 4 * 1024;
 /// Longest accepted command name. Names belong to the device; the server only bounds them.
 const MAX_COMMAND_NAME_BYTES: usize = 128;
 
+/// Command-creation budget entries. A bucket is created for every device id an attempt names,
+/// including an id that matches no device — such an attempt is refused and traced, and the
+/// rejection happens before the store is consulted. The table is therefore capped: past it, an
+/// id it has never seen is refused `429` instead of growing the table. Four thousand is far above
+/// the 200-device ceiling, so the cost of a spoofed id is one refusal and never a row.
+const MAX_CREATION_BUCKETS: usize = 4 * 1024;
+
 /// Inbound WebSocket message ceiling: the largest acceptable result plus frame overhead. A
 /// result larger than [`MAX_RESULT_BYTES`] still arrives and is refused by name.
 const MAX_CLIENT_MESSAGE_BYTES: usize = MAX_RESULT_BYTES + 64 * 1024;
@@ -222,8 +229,6 @@ pub enum DispatchError {
     InvalidTimeout,
     #[error("command name must be 1 to {MAX_COMMAND_NAME_BYTES} bytes")]
     InvalidName,
-    #[error("command creation is throttled; retry in {retry_after_ms}ms")]
-    RateLimited { retry_after_ms: i64 },
     #[error("command state is unavailable")]
     Internal,
 }
@@ -407,6 +412,35 @@ impl RegistryInner {
         outcomes
     }
 
+    /// Settles one device's table before its channel changes: a command whose deadline passed
+    /// is `timeout` — the deadline happened first — and only what is still pending when the
+    /// channel ends becomes `device_offline`. The outcomes are returned in that order so the
+    /// durable rows record the same sequence.
+    fn settle_device(&mut self, device_id: &str, now_ms: UnixMs) -> Vec<CommandOutcome> {
+        let mut outcomes = self.expire(now_ms);
+        outcomes.extend(self.fail_pending(device_id, "device_offline", now_ms));
+        outcomes
+    }
+
+    /// Charges one command creation against `device_id`'s bucket. `Some(retry_after_ms)` means
+    /// the attempt is throttled and must answer `429` without being traced.
+    fn charge_create(&mut self, device_id: &str, now: UnixMs) -> Option<i64> {
+        if !self.creates.contains_key(device_id) && self.creates.len() >= MAX_CREATION_BUCKETS {
+            return Some(1_000);
+        }
+        self.creates
+            .entry(device_id.to_owned())
+            .or_insert_with(|| {
+                TokenBucket::new(
+                    limits::COMMAND_BURST,
+                    limits::COMMAND_CREATES_PER_SECOND,
+                    now,
+                )
+            })
+            .take(1.0, now)
+            .err()
+    }
+
     fn in_flight(&self, device_id: &str) -> usize {
         self.commands
             .values()
@@ -510,6 +544,10 @@ impl DeviceRegistry {
 
     /// Registers a device channel. A previous channel for the same device is told to close
     /// with [`CLOSE_REPLACED`], and its pending commands complete as `device_offline`.
+    ///
+    /// A device revoked between the handshake's `require_device` and this call is refused
+    /// here: the channel is closed with [`CLOSE_DEVICE_REVOKED`] and never registered, so the
+    /// device learns why instead of holding a channel that silently drops everything.
     pub async fn connect(
         &self,
         device_id: &str,
@@ -521,30 +559,35 @@ impl DeviceRegistry {
             let now = self.now_ms();
             inner.next_connection_id += 1;
             let connection_id = inner.next_connection_id;
-            let previous = inner.connections.insert(
-                device_id.to_owned(),
-                Connection {
-                    id: connection_id,
-                    commands,
-                    close,
-                    hello: None,
-                },
-            );
-            let outcomes = if let Some(previous) = previous {
-                // The replacement is live before the old one is told to go: a device never
-                // observes a window with no management channel.
-                let _ = previous.close.send(Some(CLOSE_REPLACED));
-                inner.fail_pending(device_id, "device_offline", now)
-            } else {
-                Vec::new()
+            let connection = ManagementConnection {
+                device_id: device_id.to_owned(),
+                connection_id,
             };
-            (
-                ManagementConnection {
-                    device_id: device_id.to_owned(),
-                    connection_id,
-                },
-                outcomes,
-            )
+            if inner.revoked.contains(device_id) {
+                // The handler authenticated before revocation committed; this is the last place
+                // that can refuse the registration. `commands` and `close` are dropped after the
+                // close signal, so the task writes the close frame and stops.
+                let _ = close.send(Some(CLOSE_DEVICE_REVOKED));
+                (connection, Vec::new())
+            } else {
+                let previous = inner.connections.insert(
+                    device_id.to_owned(),
+                    Connection {
+                        id: connection_id,
+                        commands,
+                        close,
+                        hello: None,
+                    },
+                );
+                let mut outcomes = inner.expire(now);
+                if let Some(previous) = previous {
+                    // The replacement is live before the old one is told to go: a device never
+                    // observes a window with no management channel.
+                    let _ = previous.close.send(Some(CLOSE_REPLACED));
+                }
+                outcomes.extend(inner.fail_pending(device_id, "device_offline", now));
+                (connection, outcomes)
+            }
         };
         self.record_outcomes(outcomes).await;
         connection
@@ -564,15 +607,16 @@ impl DeviceRegistry {
                 Vec::new()
             } else {
                 inner.connections.remove(&connection.device_id);
-                inner.fail_pending(&connection.device_id, "device_offline", now)
+                inner.settle_device(&connection.device_id, now)
             }
         };
         self.record_outcomes(outcomes).await;
     }
 
     /// Revocation's effect on the live channel: the device is marked revoked (so a frame
-    /// already in flight is dropped even before its socket observes the close), its pending
-    /// commands complete as `device_offline`, and the channel is closed with
+    /// already in flight is dropped even before its socket observes the close, and a channel
+    /// that registers afterwards is refused), its pending commands complete — a passed deadline
+    /// as `timeout`, the rest as `device_offline` — and the channel is closed with
     /// [`CLOSE_DEVICE_REVOKED`]. Returns whether a channel was open.
     pub async fn revoke(&self, device_id: &str) -> bool {
         let (was_online, outcomes) = {
@@ -586,13 +630,23 @@ impl DeviceRegistry {
                 // channel task reports the reason rather than a generic end.
                 let _ = connection.close.send(Some(CLOSE_DEVICE_REVOKED));
             }
-            (
-                was_online,
-                inner.fail_pending(device_id, "device_offline", now),
-            )
+            (was_online, inner.settle_device(device_id, now))
         };
         self.record_outcomes(outcomes).await;
         was_online
+    }
+
+    /// Charges one command creation against `device_id`'s budget. `Some(retry_after_ms)` means
+    /// the attempt is throttled and must answer `429` **without** appending an audit row: the
+    /// throttle is what bounds the log's growth, so a flood must not write through it.
+    ///
+    /// Every attempt whose outcome can be traced — accepted, refused for want of access, refused
+    /// for its shape, or refused because the id matches no device — charges this bucket, which is
+    /// why it is keyed by the asserted id and capped ([`MAX_CREATION_BUCKETS`]). Attempts stopped
+    /// before any row could exist (a missing actor, a bad token) do not charge.
+    pub fn charge_command(&self, device_id: &str) -> Option<i64> {
+        let now = self.now_ms();
+        self.inner().charge_create(device_id, now)
     }
 
     /// Records the `hello` a connection sent. A replaced connection's late hello is ignored:
@@ -624,6 +678,11 @@ impl DeviceRegistry {
     }
 
     /// Hands one command to the device's channel.
+    ///
+    /// The caller charges the device's creation budget first ([`Self::charge_command`]) and
+    /// answers `429` itself when it is exhausted: the throttle sits at the audit boundary, where
+    /// every traced attempt — accepted or refused — is charged exactly once.
+    /// [`crate::commands::dispatch_for_actor`] is the one caller and owns that ordering.
     pub async fn dispatch(
         &self,
         device_id: &str,
@@ -660,20 +719,6 @@ impl DeviceRegistry {
         let mut inner = self.inner();
         let mut outcomes = Vec::new();
         let result = (|| -> Result<Dispatch, DispatchError> {
-            // Throttle creation before anything else: a flood of attempts must not append
-            // audit rows or reach the device.
-            inner
-                .creates
-                .entry(device_id.to_owned())
-                .or_insert_with(|| {
-                    TokenBucket::new(
-                        limits::COMMAND_BURST,
-                        limits::COMMAND_CREATES_PER_SECOND,
-                        now,
-                    )
-                })
-                .take(1.0, now)
-                .map_err(|retry_after_ms| DispatchError::RateLimited { retry_after_ms })?;
             outcomes = inner.expire(now);
             // Clone the sender out of the map: the guard borrows the whole registry, so one
             // borrow cannot stay alive while the command table is updated.
@@ -1091,5 +1136,86 @@ fn policy_close(reason: &'static str) -> CloseFrame {
     CloseFrame {
         code: POLICY_CLOSE_CODE,
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::relay::RelayLimits;
+    use crate::store::{ManualClock, SqliteStore};
+
+    /// The defence-in-depth half of revocation: a frame read from a socket that has not yet
+    /// observed the close is dropped, so it cannot refresh telemetry after the device is revoked.
+    #[tokio::test]
+    async fn a_revoked_devices_telemetry_frame_is_dropped() {
+        let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
+        let clock = Arc::new(ManualClock::new(1_760_000_000_000));
+        let state = AppState::new(
+            store,
+            "test-admin-token",
+            "https://relay.test/api/sessions",
+            RelayLimits::default(),
+            clock,
+        )
+        .expect("app state with a non-empty admin token");
+        state.management.revoke("dev_a").await;
+        assert!(state.management.is_revoked("dev_a"));
+
+        let connection = ManagementConnection {
+            device_id: "dev_a".to_owned(),
+            connection_id: 1,
+        };
+        let frame = json!({
+            "type": "telemetry",
+            "sample": { "sampled_at_ms": 1_760_000_000_000i64, "battery_percent": 99 }
+        })
+        .to_string();
+        handle_frame(&state, "dev_a", &connection, &frame)
+            .await
+            .expect("a revoked frame is dropped, not a framing fault");
+
+        assert!(
+            state.telemetry.aggregate("dev_a").is_none(),
+            "no sample may be ingested from a revoked device"
+        );
+    }
+
+    /// An attempt may name an id that matches no device, and it is traced — so the budget table
+    /// must be capped rather than grown by every spoofed name.
+    #[tokio::test]
+    async fn creation_budgets_are_capped_for_ids_that_name_no_device() {
+        let store = Arc::new(SqliteStore::in_memory().expect("in-memory store"));
+        let clock = Arc::new(ManualClock::new(1_760_000_000_000));
+        let state = AppState::new(
+            store,
+            "test-admin-token",
+            "https://relay.test/api/sessions",
+            RelayLimits::default(),
+            clock,
+        )
+        .expect("app state with a non-empty admin token");
+
+        for index in 0..MAX_CREATION_BUCKETS {
+            assert!(
+                state
+                    .management
+                    .charge_command(&format!("dev_spoofed_{index}"))
+                    .is_none(),
+                "a fresh id starts with a full bucket"
+            );
+        }
+        assert!(
+            state.management.charge_command("dev_one_more").is_some(),
+            "past the cap an id it has never seen is refused instead of growing the table"
+        );
+        assert!(
+            state.management.charge_command("dev_spoofed_0").is_none(),
+            "an id that already has a bucket is still charged from it"
+        );
     }
 }

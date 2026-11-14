@@ -346,8 +346,13 @@ crossed — a trimmed command reads as `command_unknown`, the same as one past t
 Each `message`/`error` is itself kept to 4 KiB (its beginning plus an ellipsis) so one result
 cannot spend the budget on prose, and one budget serves every device, so a large fleet cannot
 multiply the ceiling. The channel is rate-limited per device, not just bounded: 20 inbound
-frames/s and 4 MiB/s, with an over-budget channel closed as `rate_limited`; command creation
-is throttled at 10/s per device (burst 20) and answers `429 rate_limited` with `Retry-After`.
+frames/s and 4 MiB/s, with an over-budget channel closed as `rate_limited`; command creation —
+and every attempt that can be traced, including a refused one — is throttled at 10/s per device
+(burst 20) and answers `429 rate_limited` with `Retry-After`. The throttle is checked at the
+attempt's entry, before any other decision, because it is also the bound on audit growth: an
+attempt it refuses is not traced. The per-device bucket table is capped (4 096 ids), because an
+attempt may name an id that matches no device and is still traced; past the cap a new name is
+refused rather than remembered.
 The bursts are sized from the caps, not guessed: at least one result frame per in-flight
 command, and enough bytes for a full-size result from each of them, so a device that fell
 behind can always deliver what it owes. The same per-device ingress budget is charged by
@@ -359,19 +364,24 @@ name, and an unimplemented one comes back as `unknown_command`.
 
 Dispatch requires the admin token *and* the actor's access to the device (its owner, or the
 active lease holder); the actor is the `user_id` query parameter because the admin token
-carries no identity. Every attempt writes one `command.dispatch` row with actor, action,
-device, outcome, and error code — written best-effort after enqueue, and **`accepted` means the
-frame reached the device's channel, not that the device executed it**. A command that then
+carries no identity. Every attempt the creation throttle admits writes one `command.dispatch`
+row with actor, action, device, outcome, and error code — written best-effort after enqueue, and
+**`accepted` means the frame reached the device's channel, not that the device executed it**. A command that then
 ends without a device answer appends a second `command.outcome` row (`timeout` or
 `device_offline`); see [Audit](#audit).
 
 ## Audit
 
-Two actions describe a command's life. Every dispatch attempt writes one durable
-`command.dispatch` row: `at_ms`, `actor`, `action`, `device_id`, `outcome` (`accepted` or
-`refused`), and the machine `error` code when there is one. A command that then ends **without
+Two actions describe a command's life. Every attempt that gets past the per-device creation
+throttle writes one durable `command.dispatch` row: `at_ms`, `actor`, `action`, `device_id`,
+`outcome` (`accepted` or `refused`), and the machine `error` code when there is one. An attempt
+the throttle refuses answers `429 rate_limited` and appends nothing — tracing it would let a
+flood write rows through the very limit that is meant to bound the log. A command that then ends **without
 a device answer** writes one more row with action `command.outcome` and outcome `timeout` (its
-deadline passed) or `device_offline` (the device's channel ended first). Nothing else writes an
+deadline passed) or `device_offline` (the device's channel ended first). When both are true —
+the deadline passed while nothing observed the table, then the channel ended — `timeout` wins,
+because it happened first; every terminal path settles passed deadlines before it fails the
+rest. Nothing else writes an
 outcome row: an answered command — `ok` or `error`, including `result_too_large` — keeps only
 its `command.dispatch` row and its in-memory record, and a refused dispatch never became a
 command, so it has no outcome row. `accepted` therefore means *delivered to the device's
@@ -391,11 +401,18 @@ or outcome row too. A non-zero value means at least one event has no durable row
 lease body's `actor_id`), which any admin-token holder can set to any string, because the
 bootstrap token carries no identity of its own. A row is therefore attribution, not
 non-repudiation: it records what the server did for *someone claiming* that identity, not who
-did it. Accounts and MFA turn it into a real boundary. What the server does enforce is the
-device-access decision: a route only appends its own refusal row after it has established that
-the caller may act on the device it named, so a stranger cannot use a malformed request to
-append a row against a device it could not otherwise touch — though it can still name itself
-anything.
+did it. Accounts and MFA turn it into a real boundary.
+
+What the server does enforce is the **order and classification** of the decision. Access to the
+named device is decided first, and a refusal is classified by that decision: an unauthorized
+attempt is still traced, against the device it named, with the authorization code
+(`lease_read_only`, `device_revoked`, `device_unknown`) rather than whatever code its request
+body would otherwise have produced. Only a caller that has access has its request-shape code
+recorded (`invalid_request`, `too_large`, …). So a caller cannot choose the code on its row, but
+it can always name itself anything, and access to one device says nothing about another. The
+refusal row is deliberately *not* withheld from an unauthorized attempt — that is the order in
+this code, and the docs describe it so a later change does not "fix" the code to match a
+stronger claim.
 
 Every revocation writes its row **inside the same store transaction** that performs it, so a
 revocation can never commit untraced. If the audit row cannot be written, the whole revocation
@@ -443,14 +460,19 @@ lease links that ended more than 30 days earlier, and audit rows written more th
 earlier. `main` runs it once at startup and then every six hours through `spawn_interval`;
 there is no separate scheduler daemon. A failed run is logged and retried on the next tick.
 
-Age is the only bound on the audit log, and the documented throttle sets its worst case. Command
-creation is capped at 10/s per device (burst 20), and each attempt writes at most two rows (one
-`command.dispatch`, one `command.outcome`), so one device can append at most **about 1.7 million
-rows a day and 51.8 million rows per 30-day window**; the 200-device ceiling makes that roughly
-**10.4 billion rows** (order 1 TB at ~100 bytes a row) if every device dispatched at full
-throttle, unanswered, for the whole window. Real deployments sit far below it — an outcome row
-appears only for a command no device answered, and a device that answers writes one row — but
-there is no count cap, so size the database for the window you actually retain.
+Age is the only bound on the audit log, and the per-device creation throttle sets its worst case.
+Every traced attempt — accepted, refused for want of access, or refused for its shape — charges
+that bucket, and only an attempt the bucket admits writes rows, so the rate is a real ceiling
+rather than an estimate for accepted dispatches. At 10/s per device (burst 20) and at most two
+rows per attempt (one `command.dispatch`, one `command.outcome`), one device can append at most
+**about 1.7 million rows a day and 51.8 million rows per 30-day window**; the 200-device ceiling
+makes that roughly **10.4 billion rows** (order 1 TB at ~100 bytes a row) if every device
+attempted at full throttle, unanswered, for the whole window. Real deployments sit far below it —
+an outcome row appears only for a command no device answered, and a device that answers writes
+one row — but there is no count cap, so size the database for the window you actually retain.
+The other row writers are revocation rows (idempotent: a retried revoke appends nothing), a
+`lease.handoff` row per successful handoff, and nothing at all for an enrollment-token
+revocation; handoffs are the one action bounded only by admin request rate.
 
 The 30-day window applies to leases, session records, and the audit log. Telemetry aggregates
 are a separate, in-memory concern: they are not persisted at all, the job's aggregate purge
