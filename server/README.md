@@ -64,11 +64,22 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/files/mkdir?user_id=` | admin | Forwards `files.mkdir`; body is `{path}`. |
 | `POST` | `/api/devices/{id}/files/delete?user_id=` | admin | Forwards `files.delete`; body is `{path}`. The device removes a file or an empty directory only. |
 | `POST` | `/api/devices/{id}/files/rename?user_id=` | admin | Forwards `files.rename`; body is `{from, to}`. |
+| `POST` | `/api/devices/{id}/apps/list?user_id=` | admin | Forwards `apps.list`; the body is ignored (an object or `null`). Responds `202 {command_id}`, polled like any command. |
+| `POST` | `/api/devices/{id}/apps/launch?user_id=` | admin | Forwards `apps.launch`; body is `{package}`. The device answers `launch_blocked` or `no_launch_activity` when its platform refuses. |
+| `POST` | `/api/devices/{id}/apps/stop?user_id=` | admin | Forwards `apps.stop`; body is `{package}`. The device reports `kill_requested`, not a confirmed stop. |
+| `POST` | `/api/devices/{id}/apps/clear?user_id=` | admin | Forwards `apps.clear`; body is `{package}`. The device refuses it as `not_permitted` (it needs a signature-level permission). |
+| `POST` | `/api/devices/{id}/apps/set_enabled?user_id=` | admin | Forwards `apps.set_enabled`; body is `{package, enabled}`. The device refuses it as `not_permitted` (it needs a signature-level permission). |
 
 The file routes are commands with a typed front door: the same authorization, capacity,
 deadline, and audit row as `POST /commands`, and the same refusals (`403 lease_read_only`,
 `409 device_offline`, `429 command_capacity`). The device's `PathGuard` is the safety
 authority; the server's own checks are structural (`invalid_request`) plus the write size cap.
+The app routes follow the same pattern. The server's own checks are structural
+(`invalid_request`: a missing, non-string, blank, NUL-containing, or over-255-byte package, or
+a non-boolean `enabled`); every capability decision is the device's, so `launch_blocked`,
+`no_launch_activity`, `unknown_package`, and `not_permitted` arrive verbatim and are never
+translated into a success. Nothing about an app list is persisted.
+
 File bytes are never written to disk, stored in the database, or logged: an accepted write is
 forwarded as the caller's own base64, and the command record keeps only the device's answer
 (`bytes_written`, entries, or one read chunk) in the bounded in-memory table.

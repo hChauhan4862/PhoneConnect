@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod apps;
 pub mod auth;
 pub mod commands;
 pub mod config;
@@ -237,6 +238,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/devices/{device_id}/files/rename",
             post(files::rename_entry),
+        )
+        // App operations are commands with a typed front door too. The device decides what
+        // its platform permits; the server forwards and never invents an app.
+        .route("/api/devices/{device_id}/apps/list", post(apps::list_apps))
+        .route(
+            "/api/devices/{device_id}/apps/launch",
+            post(apps::launch_app),
+        )
+        .route("/api/devices/{device_id}/apps/stop", post(apps::stop_app))
+        .route("/api/devices/{device_id}/apps/clear", post(apps::clear_app))
+        .route(
+            "/api/devices/{device_id}/apps/set_enabled",
+            post(apps::set_app_enabled),
         )
         .route(
             "/api/devices/{device_id}/lease",
