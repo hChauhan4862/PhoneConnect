@@ -11,6 +11,7 @@ pub mod apps;
 pub mod auth;
 pub mod commands;
 pub mod config;
+pub mod console;
 pub mod enrollment;
 pub mod files;
 pub mod leases;
@@ -18,6 +19,7 @@ pub mod management;
 pub mod relay;
 pub mod rendezvous;
 pub mod retention;
+pub mod screen;
 pub mod signing_key;
 pub mod status;
 pub mod store;
@@ -251,6 +253,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/devices/{device_id}/apps/set_enabled",
             post(apps::set_app_enabled),
+        )
+        // Screen capture and the console: one real capability and two documented refusals.
+        // The device decides whether it holds a projection; the server forwards and bounds.
+        .route(
+            "/api/devices/{device_id}/screen/snapshot",
+            post(screen::snapshot_screen),
+        )
+        .route(
+            "/api/devices/{device_id}/console/props",
+            post(console::read_properties),
+        )
+        .route(
+            "/api/devices/{device_id}/console/shell",
+            post(console::run_shell),
+        )
+        .route(
+            "/api/devices/{device_id}/console/logcat",
+            post(console::tail_logcat),
         )
         .route(
             "/api/devices/{device_id}/lease",

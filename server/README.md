@@ -69,6 +69,10 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/apps/stop?user_id=` | admin | Forwards `apps.stop`; body is `{package}`. The device reports `kill_requested`, not a confirmed stop. |
 | `POST` | `/api/devices/{id}/apps/clear?user_id=` | admin | Forwards `apps.clear`; body is `{package}`. The device refuses it as `not_permitted` (it needs a signature-level permission). |
 | `POST` | `/api/devices/{id}/apps/set_enabled?user_id=` | admin | Forwards `apps.set_enabled`; body is `{package, enabled}`. The device refuses it as `not_permitted` (it needs a signature-level permission). |
+| `POST` | `/api/devices/{id}/screen/snapshot?user_id=` | admin | Forwards `screen.snapshot` with no arguments; the body must be an object or `null`. The device answers `consent_required` unless the user enabled screen capture on its setup screen. A result over the 2 MiB cap is refused `result_too_large`. |
+| `POST` | `/api/devices/{id}/console/props?user_id=` | admin | Forwards `system.props`; body is `{}` or `{keys:[...]}` (at most 32 names of at most 64 bytes). The device reports its documented allowlist and answers `not_permitted` for a name outside it; a platform reader failure is `props_unavailable`. |
+| `POST` | `/api/devices/{id}/console/shell?user_id=` | admin | Forwards `shell.exec`; the body must be an object or `null`. The device always answers `not_permitted`: a shell needs the ADB/root UID. |
+| `POST` | `/api/devices/{id}/console/logcat?user_id=` | admin | Forwards `logcat.tail`; the body must be an object or `null`. The device always answers `not_permitted`: `READ_LOGS` is signature-level. |
 
 The file routes are commands with a typed front door: the same authorization, capacity,
 deadline, and audit row as `POST /commands`, and the same refusals (`403 lease_read_only`,
@@ -83,6 +87,21 @@ translated into a success. Nothing about an app list is persisted.
 File bytes are never written to disk, stored in the database, or logged: an accepted write is
 forwarded as the caller's own base64, and the command record keeps only the device's answer
 (`bytes_written`, entries, or one read chunk) in the bounded in-memory table.
+
+The screen and console routes are the same pattern, and the honest half of this milestone:
+
+- `screen/snapshot` forwards `{}` and nothing else. The device captures only with the
+  `MediaProjection` consent the user granted on its setup screen; without it the answer is
+  `consent_required`, and the server never asks the device to prompt. A frame is bounded by the
+  device (base64 under 2 MiB) and by the server: an answer over the result cap becomes
+  `result_too_large`, never a stored oversized payload. Nothing about a frame is written
+  anywhere.
+- `console/props` forwards an optional key list and lets the device decide what its allowlist
+  permits; `not_permitted` and `props_unavailable` arrive verbatim.
+- `console/shell` and `console/logcat` exist so a caller receives the device's constant
+  `not_permitted` (with its reason) instead of `unknown_command`. Neither can succeed for an
+  ordinary installed app, and the server never fabricates output for them. There is no
+  streaming endpoint: one answer per accepted command.
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
 An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA
