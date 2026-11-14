@@ -9,6 +9,7 @@ import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.CommandFailure
 import com.phoneconnect.agent.control.CommandReasons
 import com.phoneconnect.agent.control.ControlHandler
+import com.phoneconnect.agent.control.ControlKey
 import com.phoneconnect.agent.control.DeviceDescription
 import com.phoneconnect.agent.control.DeviceInfoHandler
 import com.phoneconnect.agent.control.FileHandler
@@ -44,10 +45,10 @@ import java.io.File
  * cannot look up.
  *
  * The inputs are the registered command list, the command constants in the dispatcher, the token
- * constants `CommandReasons.kt` declares, the failure-code literals anywhere in the main
- * sources, and the document itself. The document is read relative to this module
- * (`android/app`), which is the Gradle test working directory, so the same path resolves
- * locally and in CI.
+ * constants `CommandReasons.kt` declares, the token literals written in a failure, reason, or
+ * `unavailable` position anywhere in the main sources, and the document itself. The document is
+ * read relative to this module (`android/app`), which is the Gradle test working directory, so
+ * the same path resolves locally and in CI.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -61,6 +62,33 @@ class CapabilityMatrixTest {
     private val reasonsSource =
         File("src/main/java/com/phoneconnect/agent/control/CommandReasons.kt")
     private val mainSources = File("src/main/java")
+    private val controlSources = File("src/main/java/com/phoneconnect/agent/control")
+
+    /**
+     * `const val`s under `control/` that are control keys or answer field names, not tokens.
+     * A new key or field name must be added here, which is the point: it cannot slip in as a
+     * token that the document does not name.
+     */
+    private val controlFieldNames = setOf(
+        ControlKey.BRIGHTNESS,
+        ControlKey.BRIGHTNESS_MODE,
+        ControlKey.VOLUME_MUSIC,
+        ControlKey.VOLUME_MAX,
+        ControlKey.ROTATION,
+        ControlKey.DND_FILTER,
+        ControlKey.NIGHT_MODE,
+        ControlKey.WIFI_ENABLED,
+        ControlKey.BLUETOOTH_ENABLED,
+        ControlKey.MOBILE_DATA_ENABLED,
+        ControlKey.BATTERY_SAVER,
+        ControlKey.BATTERY_PERCENT,
+        ControlKey.WIFI,
+        ControlKey.BLUETOOTH,
+        ControlKey.MOBILE_DATA,
+        ControlKey.REBOOT,
+        ControlHandler.MODE_CHANGED,
+        ControlHandler.UNAVAILABLE,
+    )
 
     /** The first cell of a table row that names one command, e.g. ``| `device.info` | … |``. */
     private val commandRow = Regex("""^\|\s*`([a-z][a-z_]*\.[a-z][a-z_]*)`\s*\|""")
@@ -68,13 +96,24 @@ class CapabilityMatrixTest {
     /** Any backticked machine token, e.g. `` `write_settings_required` ``. */
     private val backtickedToken = Regex("""`([a-z][a-z0-9_]*)`""")
 
-    private val commandConstant = Regex("""const val [A-Z_0-9]+ = "([^"]+)"""")
+    private val commandConstant =
+        Regex("""const val [A-Z_0-9]+\s*(?::\s*String\s*)?=\s*"([^"]+)"""")
 
-    /** A token constant in `CommandReasons.kt`, whatever its value. */
-    private val reasonConstant = Regex("""const val [A-Z_0-9]+ = "([a-z0-9_]+)"""")
+    /**
+     * A token-shaped `const val` in any declaration shape this package uses: untyped, typed
+     * (`: String`), and with the value on the next line.
+     */
+    private val tokenConstant =
+        Regex("""const val [A-Za-z_0-9]+\s*(?::\s*String\s*)?=\s*"([a-z][a-z0-9_]*)"""")
 
-    /** A failure code written as a literal instead of read from `CommandReasons`. */
-    private val failureLiteral = Regex("""CommandFailure\(\s*"([a-z0-9_]+)"""")
+    /**
+     * A call the vocabulary says carries a stable token: a failure's code or message, a
+     * `Reading.unavailable` reason, or a reason placed in the `unavailable` map.
+     */
+    private val tokenCall = Regex("""\b(?:unavailable\.put|CommandFailure|unavailable)\(""")
+
+    /** A string literal a token can be written as: lowercase, underscores, no spaces. */
+    private val tokenShapedLiteral = Regex("\"([a-z][a-z0-9_]*)\"")
 
     @Test
     fun `the capability document lists exactly the commands this build registers`() {
@@ -122,7 +161,7 @@ class CapabilityMatrixTest {
 
     @Test
     fun `the token list is exactly the constants CommandReasons declares`() {
-        val declared = reasonConstant.findAll(reasonsSource.readText())
+        val declared = tokenConstant.findAll(reasonsSource.readText())
             .map { match -> match.groupValues[1] }
             .toSet()
 
@@ -134,20 +173,68 @@ class CapabilityMatrixTest {
     }
 
     @Test
-    fun `no handler builds a failure code from a literal outside the token list`() {
-        val literals = mainSources.walkTopDown()
-            .filter { file -> file.isFile && file.extension == "kt" }
-            .flatMap { file ->
-                failureLiteral.findAll(file.readText())
-                    .map { match -> "${file.name}: ${match.groupValues[1]}" }
+    fun `no control constant declares a token outside the list`() {
+        assertTrue(
+            "the control source root must exist at ${controlSources.absolutePath}",
+            controlSources.isDirectory,
+        )
+        val declared = controlSources.walkTopDown()
+            .filter { file ->
+                file.isFile && file.extension == "kt" && file.name != "CommandReasons.kt"
             }
+            .flatMap { file ->
+                tokenConstant.findAll(file.readText())
+                    .map { match -> "${file.name}: ${match.groupValues[1]}" }
+                    .toList()
+            }
+            .filter { entry -> entry.substringAfter(": ") !in controlFieldNames }
             .toList()
+
+        val outside = declared.filter { entry ->
+            entry.substringAfter(": ") !in CommandReasons.tokens
+        }
+
+        assertTrue(
+            "a token constant outside CommandReasons (and outside the field-name allowlist) " +
+                "would escape the matrix; outside: $outside",
+            outside.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `no handler writes a token literal outside the token list`() {
+        assertTrue(
+            "the main source root must exist at ${mainSources.absolutePath}",
+            mainSources.isDirectory,
+        )
+        val files = mainSources.walkTopDown()
+            .filter { file -> file.isFile && file.extension == "kt" }
+            .toList()
+        assertTrue("no Kotlin sources under ${mainSources.absolutePath}", files.isNotEmpty())
+
+        var calls = 0
+        val literals = files.flatMap { file ->
+            val text = file.readText()
+            tokenCall.findAll(text).flatMap { match ->
+                calls++
+                tokenShapedLiteral.findAll(callArguments(text, match.range.last))
+                    .map { literal -> "${file.name}: ${literal.groupValues[1]}" }
+                    .toList()
+            }
+        }
+        assertTrue(
+            "no token-carrying call found under ${mainSources.absolutePath}: the scan would pass " +
+                "vacuously",
+            calls > 0,
+        )
+
         val outside = literals.filter { entry ->
             entry.substringAfter(": ") !in CommandReasons.tokens
         }
 
         assertTrue(
-            "CommandFailure(\"…\") literals must come from CommandReasons.tokens; outside: $outside",
+            "a token literal in a failure, reason, or unavailable position must come from " +
+                "CommandReasons.tokens (and be named in docs/capabilities.md); outside: $outside",
             outside.isEmpty(),
         )
     }
@@ -184,6 +271,40 @@ class CapabilityMatrixTest {
         .lineSequence()
         .mapNotNull { line -> commandRow.find(line)?.groupValues?.get(1) }
         .toList()
+
+    /**
+     * The arguments of the call whose `(` is at [openParen], up to its matching `)`.
+     *
+     * Parens inside string literals are not counted, and a raw string is skipped whole, so a
+     * message such as `"(limit 2 000 apps)"` cannot cut the call short.
+     */
+    private fun callArguments(text: String, openParen: Int): String {
+        var depth = 0
+        var index = openParen
+        while (index < text.length) {
+            val char = text[index]
+            if (char == '"') {
+                if (text.startsWith("\"\"\"", index)) {
+                    val end = text.indexOf("\"\"\"", index + 3)
+                    if (end < 0) return text.substring(openParen + 1)
+                    index = end + 3
+                    continue
+                }
+                index++
+                while (index < text.length && text[index] != '"') {
+                    if (text[index] == '\\') index++
+                    index++
+                }
+            } else if (char == '(') {
+                depth++
+            } else if (char == ')') {
+                depth--
+                if (depth == 0) return text.substring(openParen + 1, index)
+            }
+            index++
+        }
+        return text.substring(openParen + 1)
+    }
 
     /**
      * A dispatcher with every handler configured, so a registered name cannot answer

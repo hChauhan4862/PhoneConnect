@@ -146,11 +146,11 @@ not assume.
 - **Direct hole-punched paths on Android.** The Rust transport implements and tests them; the
   Android agent always uses the relay, and it does not verify ticket signatures (TLS to the hub
   is its trust anchor).
-- **Signed release publishing.** CI exists: `.github/workflows/ci.yml` runs Rust clippy and
-  tests, the web typecheck, lint, tests, and build, the Android unit tests, lint, and debug
-  APK, and a Docker image build on every push to `main` and every pull request. Nothing is
-  *published*: there is no signed release artifact, no APK or native installer release, and
-  no GHCR image push.
+- **Signed release publishing.** CI is configured in `.github/workflows/ci.yml` to run Rust
+  clippy and tests, the web typecheck, lint, tests, and build, the Android unit tests, lint,
+  and debug APK, and a Docker image build on push and pull request. It has not yet been
+  observed running on GitHub — this checkout has no remote. Nothing is *published*: there is
+  no signed release artifact, no APK or native installer release, and no GHCR image push.
 - **Windows and Linux native builds.** Only macOS has been built here.
 - **Device control of Wi-Fi, Bluetooth, mobile data, rotation, night mode, or reboot.** These are
   refusals, not features: an ordinary installed app cannot hold the signature-level permissions

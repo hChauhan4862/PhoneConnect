@@ -314,10 +314,13 @@ and one channel; the extra type changes nothing the user sees.
   `CommandDispatcher.COMMANDS`, the command constants in `CommandDispatcher.kt`, and the table
   in `../docs/capabilities.md`, and fails when they disagree in either direction — a command
   the code registers but the document omits, or a row the code does not implement. On the
-  token side it checks the table against `CommandReasons.tokens`, checks that list against the
-  constants `CommandReasons.kt` declares (a constant omitted from the list fails), and scans
-  `src/main/java` for a `CommandFailure("…")` literal outside the list — so a new refusal
-  cannot reach a caller without a place to look it up.
+  token side it checks the table against `CommandReasons.tokens`, checks that list against
+  every constant `CommandReasons.kt` declares in any shape this package uses (untyped,
+  `: String`, or the value on the next line), scans `src/main/java` for a token-shaped literal
+  in a `CommandFailure(...)`, `Reading.unavailable(...)`, or `unavailable.put(...)` position
+  outside the list, and checks every token-shaped constant under `control/` against it, with an
+  explicit allowlist for control keys and answer field names — so a new refusal cannot reach a
+  caller without a place to look it up.
 
 ## Best-effort persistence
 
