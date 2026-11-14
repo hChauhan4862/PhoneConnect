@@ -49,6 +49,13 @@ open class SetupActivity : Activity() {
     /** What this screen last knew about the projection; the service is the authority. */
     private var captureOn = false
 
+    /**
+     * Whether the status bus has published since this screen opened. The enrollment snapshot is
+     * read off the main thread and can finish after a connection status; a live status is newer
+     * and must never be replaced by that snapshot.
+     */
+    private var statusShown = false
+
     /** Test seams: the real implementations are the Keystore store and the HTTPS client. */
     internal open fun enrollmentStore(): EnrollmentStore = KeystoreEnrollmentStore(this)
 
@@ -88,6 +95,7 @@ open class SetupActivity : Activity() {
         scope.launch {
             ConnectionStatusBus.status.collectLatest { status ->
                 if (status != null) {
+                    statusShown = true
                     statusView.text = describe(status)
                 }
             }
@@ -228,6 +236,10 @@ open class SetupActivity : Activity() {
                 val store = enrollmentStore()
                 store.info() to store.lastClearReason()
             }
+            // The read is asynchronous: a connection status that arrived meanwhile is newer
+            // than this snapshot, so the enrollment line must not overwrite it. This runs on the
+            // same main thread as the collector, so the check and the write cannot interleave.
+            if (statusShown) return@launch
             val base = when {
                 enrollment != null -> getString(R.string.setup_enrolled, enrollment.deviceId)
                 cleared != null -> getString(R.string.setup_enrolled_cleared, cleared.name.lowercase())

@@ -135,7 +135,7 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 
     | Key | Result |
     | --- | --- |
-    | `brightness` (0–255) | real, through `Settings.System.SCREEN_BRIGHTNESS`, only with the user-granted `WRITE_SETTINGS`; otherwise `not_permitted` / `write_settings_required` |
+    | `brightness` (0–255) | real, through `Settings.System.SCREEN_BRIGHTNESS`, only with the user-granted `WRITE_SETTINGS`; otherwise `not_permitted` / `write_settings_required`. Automatic brightness is turned off first (the mode is written to `MANUAL`), because a stored value would not reach a display an ambient-light strategy governs; the answer reports the resulting `brightness_mode` and whether this call changed it (`mode_changed`) |
     | `volume_music` (0 to the reported `volume_max`) | real, `AudioManager.setStreamVolume` on `STREAM_MUSIC`; no permission. A change that would toggle Do Not Disturb is `not_permitted` / `policy_access_required` |
     | `dnd_filter` (1 All, 2 Priority, 3 None, 4 Alarms) | real, `NotificationManager.setInterruptionFilter`, only with notification-policy access; otherwise `not_permitted` / `policy_access_required` |
     | `wifi` | `not_permitted` / `wifi_setter_removed` — `WifiManager.setWifiEnabled` returns false for an app targeting Android 10+ |
@@ -152,14 +152,25 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
     outside 0 to the reported max, a filter outside 1–4, or a value of the wrong type is
     `invalid_args`; a key this build does not implement is `invalid_args` too. A key Android has
     no setter for is `not_permitted` whatever value it is given — the refusal is about the
-    platform, not the value. A write is confirmed by reading the value back: if the settings
-    provider accepted the brightness but the setting did not stick, the audio service accepted
-    the volume but the stream reports another index, or the interruption filter did not change,
-    the answer is `not_applied` (`brightness_not_applied`, `volume_not_applied`,
-    `dnd_not_applied`), never `ok`. A volume whose stream max cannot be read is
-    `platform_read_failed` with `volume_max_unreadable`. `control.get` names every refused key
-    in `unavailable` — including `reboot` — so the web panel renders a disabled control with
-    the reason as visible text.
+    platform, not the value.
+
+    **Automatic brightness is an explicit, reported side effect, not a silent no-op.** A
+    `SCREEN_BRIGHTNESS` write only governs the display in manual mode, so when the mode is
+    `AUTOMATIC` — or cannot be read, which is treated as automatic — the agent writes
+    `SCREEN_BRIGHTNESS_MODE_MANUAL` first, then the brightness, and the answer carries
+    `brightness_mode` and `mode_changed`. If the mode write does not stick, the answer is
+    `not_applied` / `brightness_mode_automatic` and the brightness is not written at all: a
+    value the display would ignore is never reported as applied.
+
+    A write is confirmed by reading the value back: if the settings provider accepted the
+    brightness but the setting did not stick, the audio service accepted the volume but the
+    stream reports another index, or the interruption filter did not change, the answer is
+    `not_applied` (`brightness_not_applied`, `volume_not_applied`, `dnd_not_applied`), never
+    `ok`. A write the platform accepted but would not let the app confirm — the read-back
+    throws or is unavailable — is `unconfirmed` / `read_back_unavailable`, never `ok` either.
+    A volume whose stream max cannot be read is `platform_read_failed` with
+    `volume_max_unreadable`. `control.get` names every refused key in `unavailable` — including
+    `reboot` — so the web panel renders a disabled control with the reason as visible text.
 
     Both grants are given in Android's own settings, never by this app: the setup screen opens
     them and reports what Android says. `WRITE_SETTINGS` and `ACCESS_NOTIFICATION_POLICY` are

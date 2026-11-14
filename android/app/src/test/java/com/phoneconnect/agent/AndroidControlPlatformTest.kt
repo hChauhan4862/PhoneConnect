@@ -73,6 +73,23 @@ class AndroidControlPlatformTest {
     }
 
     @Test
+    fun `writing the brightness mode is read back`() {
+        Settings.System.putInt(
+            resolver,
+            Settings.System.SCREEN_BRIGHTNESS_MODE,
+            Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC,
+        )
+
+        assertTrue(
+            platform.writeBrightnessMode(Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL),
+        )
+        assertEquals(
+            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL,
+            platform.brightnessMode().value,
+        )
+    }
+
+    @Test
     fun `write settings is granted through the app op the user allows`() {
         val appOps = context.getSystemService(AppOpsManager::class.java)
         shadowOf(appOps).setMode(

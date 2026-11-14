@@ -107,6 +107,13 @@ class AndroidControlPlatform(private val context: Context) : ControlPlatform {
         false
     }
 
+    override fun writeBrightnessMode(mode: Int): Boolean = try {
+        Settings.System.putInt(resolver, Settings.System.SCREEN_BRIGHTNESS_MODE, mode) &&
+            systemSetting(Settings.System.SCREEN_BRIGHTNESS_MODE).value == mode
+    } catch (_: SecurityException) {
+        false
+    }
+
     override fun hasPolicyAccess(): Boolean = try {
         notifications()?.isNotificationPolicyAccessGranted == true
     } catch (_: Exception) {

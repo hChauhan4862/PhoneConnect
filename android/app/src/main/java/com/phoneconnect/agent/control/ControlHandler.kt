@@ -52,6 +52,12 @@ interface ControlPlatform {
      */
     fun writeBrightness(value: Int): Boolean
 
+    /**
+     * Writes `Settings.System.SCREEN_BRIGHTNESS_MODE`; `false` when the provider refused the
+     * write. Throws `SecurityException` when the grant vanished before the write.
+     */
+    fun writeBrightnessMode(mode: Int): Boolean
+
     /** Whether the user has granted notification-policy (Do Not Disturb) access. */
     fun hasPolicyAccess(): Boolean
 
@@ -136,6 +142,18 @@ object ControlReason {
     /** The settings provider accepted the brightness write but the value did not stick. */
     const val BRIGHTNESS_NOT_APPLIED = "brightness_not_applied"
 
+    /**
+     * Automatic brightness governs the display from ambient light, so a stored value would not
+     * hold; the mode could not be turned off.
+     */
+    const val BRIGHTNESS_MODE_AUTOMATIC = "brightness_mode_automatic"
+
+    /**
+     * The platform accepted a write but would not report the value back, so nothing confirms
+     * that the change took.
+     */
+    const val READ_BACK_UNAVAILABLE = "read_back_unavailable"
+
     /** The audio service accepted the volume change but the stream reports another index. */
     const val VOLUME_NOT_APPLIED = "volume_not_applied"
 
@@ -159,7 +177,10 @@ object ControlReason {
  *   never throw) and never a fabricated zero.
  * - `control.set` validates the value before any write, refuses a missing grant with the
  *   machine reason the UI shows, and confirms an accepted write by reading the value back.
- *   A write the platform accepted but did not apply is `not_applied`, never `ok`.
+ *   Brightness turns automatic mode off first and reports that side effect, because a value
+ *   written under an ambient-light strategy would never reach the display. A write the
+ *   platform accepted but did not apply is `not_applied`, and a write it would not let the app
+ *   confirm is `unconfirmed`: neither is ever `ok`.
  * - `control.reboot` exists so a caller gets `reboot_requires_privilege` rather than
  *   `unknown_command`; there is no reboot path that cannot work.
  */
@@ -245,6 +266,16 @@ class ControlHandler(private val platform: ControlPlatform) {
         if (!writeSettingsGranted()) {
             throw CommandFailure(NOT_PERMITTED, ControlReason.WRITE_SETTINGS_REQUIRED)
         }
+        // Under automatic brightness the display is governed by the ambient-light strategy, so
+        // a value written to the setting would never reach it: the mode is turned off first and
+        // that side effect is reported in the answer. An unreadable mode is treated as
+        // automatic, because writing a value the display might ignore is the failure this
+        // guards against.
+        val mode = observed(platform::brightnessMode)
+        val modeChanged = mode != BRIGHTNESS_MODE_MANUAL
+        if (modeChanged) {
+            writeMode(BRIGHTNESS_MODE_MANUAL)
+        }
         val accepted = try {
             platform.writeBrightness(value)
         } catch (_: SecurityException) {
@@ -254,13 +285,33 @@ class ControlHandler(private val platform: ControlPlatform) {
         if (!accepted) {
             throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_NOT_APPLIED)
         }
-        // A stored value the system overrides (automatic brightness) is not the value the
-        // caller asked for, so the answer says so instead of claiming success.
+        // The value itself is read back from the store that was written: a provider that
+        // accepted the write but kept another value did not apply the change.
         val current = observed(platform::brightness)
-        if (current != null && current != value) {
+            ?: throw CommandFailure(UNCONFIRMED, ControlReason.READ_BACK_UNAVAILABLE)
+        if (current != value) {
             throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_NOT_APPLIED)
         }
+        // A device that turned automatic back on between the two writes did not keep the value.
+        val finalMode = observed(platform::brightnessMode)
+        if (finalMode != null && finalMode != BRIGHTNESS_MODE_MANUAL) {
+            throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_MODE_AUTOMATIC)
+        }
         return applied(ControlKey.BRIGHTNESS, value)
+            .put(ControlKey.BRIGHTNESS_MODE, finalMode ?: BRIGHTNESS_MODE_MANUAL)
+            .put(MODE_CHANGED, modeChanged)
+    }
+
+    /** Turns automatic brightness off, or refuses rather than leaving a value that cannot hold. */
+    private fun writeMode(mode: Int) {
+        val accepted = try {
+            platform.writeBrightnessMode(mode)
+        } catch (_: SecurityException) {
+            throw CommandFailure(NOT_PERMITTED, ControlReason.WRITE_SETTINGS_REQUIRED)
+        }
+        if (!accepted) {
+            throw CommandFailure(NOT_APPLIED, ControlReason.BRIGHTNESS_MODE_AUTOMATIC)
+        }
     }
 
     private fun setVolume(value: Int): JSONObject {
@@ -289,7 +340,8 @@ class ControlHandler(private val platform: ControlPlatform) {
             throw CommandFailure(NOT_APPLIED, ControlReason.VOLUME_NOT_APPLIED)
         }
         val current = observed(platform::volumeMusic)
-        if (current != null && current != value) {
+            ?: throw CommandFailure(UNCONFIRMED, ControlReason.READ_BACK_UNAVAILABLE)
+        if (current != value) {
             throw CommandFailure(NOT_APPLIED, ControlReason.VOLUME_NOT_APPLIED)
         }
         return applied(ControlKey.VOLUME_MUSIC, value)
@@ -308,7 +360,8 @@ class ControlHandler(private val platform: ControlPlatform) {
             throw CommandFailure(NOT_APPLIED, ControlReason.DND_NOT_APPLIED)
         }
         val current = observed(platform::dndFilter)
-        if (current != null && current != value) {
+            ?: throw CommandFailure(UNCONFIRMED, ControlReason.READ_BACK_UNAVAILABLE)
+        if (current != value) {
             throw CommandFailure(NOT_APPLIED, ControlReason.DND_NOT_APPLIED)
         }
         return applied(ControlKey.DND_FILTER, value)
@@ -406,6 +459,19 @@ class ControlHandler(private val platform: ControlPlatform) {
 
         /** The platform accepted a call but the value did not take, so the answer is not `ok`. */
         const val NOT_APPLIED = "not_applied"
+
+        /**
+         * The platform accepted a call but would not report the value back, so the change is
+         * not confirmed either way and the answer is not `ok`.
+         */
+        const val UNCONFIRMED = "unconfirmed"
+
+        /** The answer's field naming the brightness mode the device now runs under. */
+        const val MODE_CHANGED = "mode_changed"
+
+        /** `Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL` and `_AUTOMATIC`. */
+        const val BRIGHTNESS_MODE_MANUAL = 0
+        const val BRIGHTNESS_MODE_AUTOMATIC = 1
 
         /** The map of keys the platform refuses, keyed by the control's own name. */
         const val UNAVAILABLE = "unavailable"

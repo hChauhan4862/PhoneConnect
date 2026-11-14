@@ -162,29 +162,104 @@ class ControlHandlerTest {
     }
 
     @Test
-    fun `brightness with write settings is written and confirmed by the read-back`() {
+    fun `brightness in manual mode is written once and confirmed`() {
         platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_MANUAL)
 
         val output = handler.handle(
             CommandDispatcher.CONTROL_SET,
             JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120),
         )
 
-        assertEquals(listOf("brightness" to 120), platform.writes)
+        assertEquals(
+            "manual mode needs no mode change",
+            listOf("brightness" to 120),
+            platform.writes,
+        )
         assertEquals(ControlKey.BRIGHTNESS, output.getString("key"))
         assertEquals(120, output.getInt("value"))
         assertEquals(true, output.getBoolean("applied"))
+        assertEquals(ControlHandler.BRIGHTNESS_MODE_MANUAL, output.getInt(ControlKey.BRIGHTNESS_MODE))
+        assertEquals(false, output.getBoolean(MODE_CHANGED))
+    }
+
+    @Test
+    fun `an automatic display is switched to manual and the answer reports it`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+
+        val output = handler.handle(
+            CommandDispatcher.CONTROL_SET,
+            JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120),
+        )
+
+        // A stored value under automatic brightness is a no-op for the display, so the mode is
+        // turned off first and the side effect is in the answer.
+        assertEquals(
+            listOf("brightness_mode" to ControlHandler.BRIGHTNESS_MODE_MANUAL, "brightness" to 120),
+            platform.writes,
+        )
+        assertEquals(true, output.getBoolean("applied"))
+        assertEquals(ControlHandler.BRIGHTNESS_MODE_MANUAL, output.getInt(ControlKey.BRIGHTNESS_MODE))
+        assertEquals(true, output.getBoolean(MODE_CHANGED))
+        assertEquals(ControlHandler.BRIGHTNESS_MODE_MANUAL, platform.brightnessMode.value)
+    }
+
+    @Test
+    fun `an automatic mode that will not turn off is not_applied and nothing is written`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_AUTOMATIC)
+        platform.brightnessModeWriteAccepted = false
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("not_applied", failure.code)
+        assertEquals(ControlReason.BRIGHTNESS_MODE_AUTOMATIC, failure.message)
+        assertTrue(
+            "the brightness must not be written when the display would ignore it: ${platform.writes}",
+            platform.writes.none { it.first == "brightness" },
+        )
+    }
+
+    @Test
+    fun `an unreadable brightness mode is still turned to manual before the write`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.unavailable(ControlReason.PLATFORM_READ_FAILED)
+
+        val output = handler.handle(
+            CommandDispatcher.CONTROL_SET,
+            JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120),
+        )
+
+        assertEquals(true, output.getBoolean("applied"))
+        assertTrue(
+            "an unknown mode must be made manual defensively: ${platform.writes}",
+            platform.writes.contains("brightness_mode" to ControlHandler.BRIGHTNESS_MODE_MANUAL),
+        )
     }
 
     @Test
     fun `a brightness write the setting does not keep is not_applied, never ok`() {
         platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_MANUAL)
         platform.brightnessAfterWrite = { Reading.of(255) }
 
         val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
 
         assertEquals("not_applied", failure.code)
         assertEquals(ControlReason.BRIGHTNESS_NOT_APPLIED, failure.message)
+    }
+
+    @Test
+    fun `a brightness read-back that cannot be read is unconfirmed, never ok`() {
+        platform.writeSettings = true
+        platform.brightnessMode = Reading.of(ControlHandler.BRIGHTNESS_MODE_MANUAL)
+        platform.brightnessAfterWrite = { Reading.unavailable(ControlReason.PLATFORM_READ_FAILED) }
+
+        val failure = setFails(JSONObject().put("key", ControlKey.BRIGHTNESS).put("value", 120))
+
+        assertEquals("unconfirmed", failure.code)
+        assertEquals(ControlReason.READ_BACK_UNAVAILABLE, failure.message)
     }
 
     @Test
@@ -231,6 +306,16 @@ class ControlHandlerTest {
     }
 
     @Test
+    fun `a volume read-back that cannot be read is unconfirmed, never ok`() {
+        platform.volumeAfterWrite = Reading.unavailable(ControlReason.PLATFORM_READ_FAILED)
+
+        val failure = setFails(JSONObject().put("key", ControlKey.VOLUME_MUSIC).put("value", 15))
+
+        assertEquals("unconfirmed", failure.code)
+        assertEquals(ControlReason.READ_BACK_UNAVAILABLE, failure.message)
+    }
+
+    @Test
     fun `a volume change the DND guard refuses is not_permitted with the policy reason`() {
         platform.volumeWriteError = SecurityException("DND change needs policy access")
 
@@ -247,6 +332,17 @@ class ControlHandlerTest {
         assertEquals("not_permitted", failure.code)
         assertEquals(ControlReason.POLICY_ACCESS_REQUIRED, failure.message)
         assertTrue("nothing may be written without the grant", platform.writes.isEmpty())
+    }
+
+    @Test
+    fun `a dnd read-back that cannot be read is unconfirmed, never ok`() {
+        platform.policyAccess = true
+        platform.dndAfterWrite = Reading.unavailable(ControlReason.PLATFORM_READ_FAILED)
+
+        val failure = setFails(JSONObject().put("key", ControlKey.DND_FILTER).put("value", 3))
+
+        assertEquals("unconfirmed", failure.code)
+        assertEquals(ControlReason.READ_BACK_UNAVAILABLE, failure.message)
     }
 
     @Test
@@ -386,6 +482,7 @@ class ControlHandlerTest {
         var writeSettings = false
         var policyAccess = false
         var writeSettingsChecks = 0
+        var brightnessModeWriteAccepted = true
         var writeBrightnessError: RuntimeException? = null
         var volumeWriteError: RuntimeException? = null
         var dndWriteError: RuntimeException? = null
@@ -429,6 +526,13 @@ class ControlHandlerTest {
             return true
         }
 
+        override fun writeBrightnessMode(mode: Int): Boolean {
+            if (!brightnessModeWriteAccepted) return false
+            writes += "brightness_mode" to mode
+            brightnessMode = Reading.of(mode)
+            return true
+        }
+
         override fun hasPolicyAccess(): Boolean = policyAccess
 
         override fun writeVolumeMusic(value: Int): Boolean {
@@ -448,5 +552,6 @@ class ControlHandlerTest {
 
     private companion object {
         const val UNAVAILABLE = "unavailable"
+        const val MODE_CHANGED = "mode_changed"
     }
 }

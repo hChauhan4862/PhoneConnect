@@ -79,7 +79,9 @@ class SetupActivityTest {
         activity.findViewById<EditText>(R.id.enrollment_token).setText("pcenr_setup")
         activity.findViewById<Button>(R.id.enroll).performClick()
 
-        awaitUntil { runBlockingInfo() != null }
+        // The screen's own confirmation is the observable. Waiting on the store alone races the
+        // coroutine that resumes on the main thread to write the status text.
+        awaitUntil { statusText(activity).contains("dev_setup") }
 
         val info = runBlockingInfo()
         assertNotNull("the enrollment must be persisted", info)
@@ -293,6 +295,9 @@ class SetupActivityTest {
             android.content.Intent(context, TestSetupActivity::class.java),
         ).setup().get()
     }
+
+    private fun statusText(activity: SetupActivity): String =
+        activity.findViewById<TextView>(R.id.status).text.toString()
 
     private fun runBlockingInfo(): EnrollmentInfo? = kotlinx.coroutines.runBlocking { store.info() }
 
