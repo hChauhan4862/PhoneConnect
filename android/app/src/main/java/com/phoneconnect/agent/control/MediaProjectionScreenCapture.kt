@@ -55,7 +55,7 @@ internal fun encodeWithinLimit(
         factor += 1
     }
     throw CommandFailure(
-        "result_too_large",
+        CommandReasons.RESULT_TOO_LARGE,
         "the frame could not be downscaled under the ${maxEncodedBytes}-byte base64 budget",
     )
 }
@@ -134,7 +134,7 @@ internal class MediaProjectionScreenCapture(
             active ?: throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             val screen = metrics()
             if (screen.widthPixels <= 0 || screen.heightPixels <= 0 || screen.densityDpi <= 0) {
-                throw CommandFailure("capture_failed", "the display size is not available")
+                throw CommandFailure(CommandReasons.CAPTURE_FAILED, "the display size is not available")
             }
             val frames = mirrorFor(grant, active, screen)
             val frame = awaitFrame(frames, timeoutMs)
@@ -152,7 +152,7 @@ internal class MediaProjectionScreenCapture(
             } catch (failure: CommandFailure) {
                 throw failure
             } catch (_: RuntimeException) {
-                throw CommandFailure("capture_failed", "the platform could not produce a frame")
+                throw CommandFailure(CommandReasons.CAPTURE_FAILED, "the platform could not produce a frame")
             }
         }
 
@@ -174,7 +174,7 @@ internal class MediaProjectionScreenCapture(
         if (!ours) {
             // A re-grant replaced this capture's grant while it was starting; the next command
             // uses the new one. Nothing here may touch the grant that replaced it.
-            throw CommandFailure("capture_failed", SUPERSEDED_MESSAGE)
+            throw CommandFailure(CommandReasons.CAPTURE_FAILED, SUPERSEDED_MESSAGE)
         }
         if (existing != null) {
             if (!existing.open) {
@@ -199,7 +199,7 @@ internal class MediaProjectionScreenCapture(
             discardGrant(grant)
             throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
         } catch (_: RuntimeException) {
-            throw CommandFailure("capture_failed", "the platform refused a virtual display")
+            throw CommandFailure(CommandReasons.CAPTURE_FAILED, "the platform refused a virtual display")
         }
         val raced = synchronized(lock) {
             // `handleEnded` or a re-grant may have replaced the source while the display was
@@ -213,7 +213,7 @@ internal class MediaProjectionScreenCapture(
         }
         if (raced != null) {
             raced.close()
-            throw CommandFailure("capture_failed", SUPERSEDED_MESSAGE)
+            throw CommandFailure(CommandReasons.CAPTURE_FAILED, SUPERSEDED_MESSAGE)
         }
         return created
     }
@@ -225,10 +225,10 @@ internal class MediaProjectionScreenCapture(
         while (true) {
             frames.newestFrame()?.let { return it }
             if (!frames.open) {
-                throw CommandFailure("capture_failed", "the projection ended before a frame arrived")
+                throw CommandFailure(CommandReasons.CAPTURE_FAILED, "the projection ended before a frame arrived")
             }
             if (SystemClock.elapsedRealtime() >= deadline) {
-                throw CommandFailure("capture_timeout", "no frame arrived within $bounded ms")
+                throw CommandFailure(CommandReasons.CAPTURE_TIMEOUT, "no frame arrived within $bounded ms")
             }
             Thread.sleep(FRAME_POLL_MS)
         }

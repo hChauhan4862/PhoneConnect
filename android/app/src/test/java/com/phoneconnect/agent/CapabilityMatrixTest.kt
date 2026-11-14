@@ -7,6 +7,7 @@ import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CapturedFrame
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.CommandFailure
+import com.phoneconnect.agent.control.CommandReasons
 import com.phoneconnect.agent.control.ControlHandler
 import com.phoneconnect.agent.control.DeviceDescription
 import com.phoneconnect.agent.control.DeviceInfoHandler
@@ -38,11 +39,14 @@ import java.io.File
 /**
  * `docs/capabilities.md` is the one place a reader learns what each command can do, so it must
  * agree with the dispatcher in both directions: a command the code registers but the document
- * omits is invisible drift, and a row the code does not implement is a fabricated capability.
+ * omits is invisible drift, a row the code does not implement is a fabricated capability, and a
+ * refusal token the handlers can answer with but the document never names is a refusal a reader
+ * cannot look up.
  *
- * The three inputs are the registered list, the command constants in the dispatcher, and the
- * document itself. The document is read relative to this module (`android/app`), which is the
- * Gradle test working directory, so the same path resolves locally and in CI.
+ * The inputs are the registered command list, the command constants in the dispatcher, the
+ * token list the handlers draw from, and the document itself. The document is read relative to
+ * this module (`android/app`), which is the Gradle test working directory, so the same path
+ * resolves locally and in CI.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -56,6 +60,9 @@ class CapabilityMatrixTest {
 
     /** The first cell of a table row that names one command, e.g. ``| `device.info` | … |``. */
     private val commandRow = Regex("""^\|\s*`([a-z][a-z_]*\.[a-z][a-z_]*)`\s*\|""")
+
+    /** Any backticked machine token, e.g. `` `write_settings_required` ``. */
+    private val backtickedToken = Regex("""`([a-z][a-z0-9_]*)`""")
 
     private val constant = Regex("""const val [A-Z_]+ = "([^"]+)"""")
 
@@ -76,6 +83,30 @@ class CapabilityMatrixTest {
             "a command appears in more than one row: $documented",
             documented.size,
             documented.toSet().size,
+        )
+    }
+
+    @Test
+    fun `every device token the handlers answer with appears in the capability document`() {
+        assertTrue(
+            "the capability document must exist at ${document.absolutePath}",
+            document.isFile,
+        )
+        val tokens = CommandReasons.tokens
+        assertEquals(
+            "CommandReasons.tokens must not repeat a token",
+            tokens.size,
+            tokens.toSet().size,
+        )
+
+        val documented = backtickedToken.findAll(document.readText())
+            .map { match -> match.groupValues[1] }
+            .toSet()
+        val missing = tokens.filterNot { token -> token in documented }
+
+        assertTrue(
+            "docs/capabilities.md must name every device token; missing: $missing",
+            missing.isEmpty(),
         )
     }
 

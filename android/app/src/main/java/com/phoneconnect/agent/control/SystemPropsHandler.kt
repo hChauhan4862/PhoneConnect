@@ -50,7 +50,10 @@ class AndroidSystemProperties(
     }
 
     private fun unavailable() =
-        CommandFailure(SystemPropertiesHandler.PROPS_UNAVAILABLE, SystemPropertiesHandler.PROPS_UNAVAILABLE_MESSAGE)
+        CommandFailure(
+            SystemPropertiesHandler.PROPS_UNAVAILABLE,
+            SystemPropertiesHandler.PROPS_UNAVAILABLE_MESSAGE,
+        )
 
     private companion object {
         const val SYSTEM_PROPERTIES_CLASS = "android.os.SystemProperties"
@@ -92,7 +95,7 @@ class SystemPropertiesHandler(
             }
             val key = value.trim()
             if (!SystemPropertyAllowlist.READABLE.containsKey(key)) {
-                throw CommandFailure("not_permitted", OUTSIDE_ALLOWLIST_MESSAGE)
+                throw CommandFailure(CommandReasons.NOT_PERMITTED, OUTSIDE_ALLOWLIST_MESSAGE)
             }
             keys += key
         }
@@ -100,7 +103,7 @@ class SystemPropertiesHandler(
     }
 
     companion object {
-        const val PROPS_UNAVAILABLE = "props_unavailable"
+        const val PROPS_UNAVAILABLE: String = CommandReasons.PROPS_UNAVAILABLE
 
         const val PROPS_UNAVAILABLE_MESSAGE =
             "this build's platform does not expose its system-property reader through " +

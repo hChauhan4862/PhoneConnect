@@ -309,7 +309,9 @@ and one channel; the extra type changes nothing the user sees.
 - **The capability matrix matches the code.** `CapabilityMatrixTest` compares
   `CommandDispatcher.COMMANDS`, the command constants in `CommandDispatcher.kt`, and the table
   in `../docs/capabilities.md`, and fails when they disagree in either direction — a command
-  the code registers but the document omits, or a row the code does not implement.
+  the code registers but the document omits, or a row the code does not implement. It also
+  fails when a token in `CommandReasons.tokens` is not named in the table, so a new refusal
+  reason cannot reach a caller without a place to look it up.
 
 ## Best-effort persistence
 

@@ -104,79 +104,81 @@ object ControlKey {
  */
 object ControlReason {
     /** The user has not allowed this package to modify system settings (`WRITE_SETTINGS`). */
-    const val WRITE_SETTINGS_REQUIRED = "write_settings_required"
+    const val WRITE_SETTINGS_REQUIRED: String = CommandReasons.WRITE_SETTINGS_REQUIRED
 
     /** The user has not granted notification-policy (Do Not Disturb) access. */
-    const val POLICY_ACCESS_REQUIRED = "policy_access_required"
+    const val POLICY_ACCESS_REQUIRED: String = CommandReasons.POLICY_ACCESS_REQUIRED
 
     /** `REBOOT` is signature-level; only a system or device-owner build could reboot. */
-    const val REBOOT_REQUIRES_PRIVILEGE = "reboot_requires_privilege"
+    const val REBOOT_REQUIRES_PRIVILEGE: String = CommandReasons.REBOOT_REQUIRES_PRIVILEGE
 
     /** `WifiManager.setWifiEnabled` returns false for an app targeting Android 10+. */
-    const val WIFI_SETTER_REMOVED = "wifi_setter_removed"
+    const val WIFI_SETTER_REMOVED: String = CommandReasons.WIFI_SETTER_REMOVED
 
     /** `BluetoothAdapter.enable` is a no-op for an app targeting Android 13+. */
-    const val BLUETOOTH_SETTER_REMOVED = "bluetooth_setter_removed"
+    const val BLUETOOTH_SETTER_REMOVED: String = CommandReasons.BLUETOOTH_SETTER_REMOVED
 
     /** `TelephonyManager.setDataEnabled` needs the signature-level `MODIFY_PHONE_STATE`. */
-    const val MOBILE_DATA_SETTER_SIGNATURE_GATED = "mobile_data_setter_signature_gated"
+    const val MOBILE_DATA_SETTER_SIGNATURE_GATED: String =
+        CommandReasons.MOBILE_DATA_SETTER_SIGNATURE_GATED
 
     /** `UiModeManager.setNightMode` needs the signature-level `MODIFY_DAY_NIGHT_MODE`. */
-    const val NIGHT_MODE_SETTER_SIGNATURE_GATED = "night_mode_setter_signature_gated"
+    const val NIGHT_MODE_SETTER_SIGNATURE_GATED: String =
+        CommandReasons.NIGHT_MODE_SETTER_SIGNATURE_GATED
 
     /** The rotation lock belongs to the system UI; an installed app has no setter for it. */
-    const val ROTATION_REQUIRES_SYSTEM_UI = "rotation_requires_system_ui"
+    const val ROTATION_REQUIRES_SYSTEM_UI: String = CommandReasons.ROTATION_REQUIRES_SYSTEM_UI
 
     /** The platform threw, or does not keep the setting this key names. */
-    const val PLATFORM_READ_FAILED = "platform_read_failed"
+    const val PLATFORM_READ_FAILED: String = CommandReasons.PLATFORM_READ_FAILED
 
     /** The device reports no Bluetooth adapter. */
-    const val NO_BLUETOOTH_ADAPTER = "no_bluetooth_adapter"
+    const val NO_BLUETOOTH_ADAPTER: String = CommandReasons.NO_BLUETOOTH_ADAPTER
 
     /** The device has no mobile-data radio. */
-    const val NO_TELEPHONY_DATA = "no_telephony_data"
+    const val NO_TELEPHONY_DATA: String = CommandReasons.NO_TELEPHONY_DATA
 
     /** `BatteryManager` does not report a capacity for this device. */
-    const val BATTERY_NOT_REPORTED = "battery_not_reported"
+    const val BATTERY_NOT_REPORTED: String = CommandReasons.BATTERY_NOT_REPORTED
 
     /** The settings provider accepted the brightness write but the value did not stick. */
-    const val BRIGHTNESS_NOT_APPLIED = "brightness_not_applied"
+    const val BRIGHTNESS_NOT_APPLIED: String = CommandReasons.BRIGHTNESS_NOT_APPLIED
 
     /**
      * Automatic brightness governs the display from ambient light, so a stored value would not
      * hold; the mode could not be turned off.
      */
-    const val BRIGHTNESS_MODE_AUTOMATIC = "brightness_mode_automatic"
+    const val BRIGHTNESS_MODE_AUTOMATIC: String = CommandReasons.BRIGHTNESS_MODE_AUTOMATIC
 
     /**
      * The platform accepted a write but would not report the value back, so nothing confirms
      * that the change took.
      */
-    const val READ_BACK_UNAVAILABLE = "read_back_unavailable"
+    const val READ_BACK_UNAVAILABLE: String = CommandReasons.READ_BACK_UNAVAILABLE
 
     /**
      * The brightness change failed after automatic brightness was turned off, and the mode
      * could not be put back: the device is left manual and the caller is told.
      */
-    const val BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL =
-        "brightness_not_applied_mode_left_manual"
+    const val BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL: String =
+        CommandReasons.BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL
 
     /** As [BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL], for a write that could not be confirmed. */
-    const val READ_BACK_UNAVAILABLE_MODE_LEFT_MANUAL =
-        "read_back_unavailable_mode_left_manual"
+    const val READ_BACK_UNAVAILABLE_MODE_LEFT_MANUAL: String =
+        CommandReasons.READ_BACK_UNAVAILABLE_MODE_LEFT_MANUAL
 
     /** As [BRIGHTNESS_NOT_APPLIED_MODE_LEFT_MANUAL], for a grant revoked mid-change. */
-    const val WRITE_SETTINGS_REQUIRED_MODE_LEFT_MANUAL =
-        "write_settings_required_mode_left_manual"
+    const val WRITE_SETTINGS_REQUIRED_MODE_LEFT_MANUAL: String =
+        CommandReasons.WRITE_SETTINGS_REQUIRED_MODE_LEFT_MANUAL
 
     /** The audio service accepted the volume change but the stream reports another index. */
-    const val VOLUME_NOT_APPLIED = "volume_not_applied"
+    const val VOLUME_NOT_APPLIED: String = CommandReasons.VOLUME_NOT_APPLIED
 
     /** The interruption filter did not become the requested one. */
-    const val DND_NOT_APPLIED = "dnd_not_applied"
+    const val DND_NOT_APPLIED: String = CommandReasons.DND_NOT_APPLIED
 
     /** The stream max cannot be read, so no volume in range can be validated. */
-    const val VOLUME_MAX_UNREADABLE = "volume_max_unreadable"
+    const val VOLUME_MAX_UNREADABLE: String = CommandReasons.VOLUME_MAX_UNREADABLE
 }
 
 /**
@@ -546,16 +548,16 @@ class ControlHandler(private val platform: ControlPlatform) {
     }
 
     companion object {
-        const val NOT_PERMITTED = "not_permitted"
+        const val NOT_PERMITTED: String = CommandReasons.NOT_PERMITTED
 
         /** The platform accepted a call but the value did not take, so the answer is not `ok`. */
-        const val NOT_APPLIED = "not_applied"
+        const val NOT_APPLIED: String = CommandReasons.NOT_APPLIED
 
         /**
          * The platform accepted a call but would not report the value back, so the change is
          * not confirmed either way and the answer is not `ok`.
          */
-        const val UNCONFIRMED = "unconfirmed"
+        const val UNCONFIRMED: String = CommandReasons.UNCONFIRMED
 
         /** The answer's field naming the brightness mode the device now runs under. */
         const val MODE_CHANGED = "mode_changed"

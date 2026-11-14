@@ -13,7 +13,7 @@ class ShellHandler {
     fun exec(): JSONObject = throw CommandFailure(NOT_PERMITTED, MESSAGE)
 
     companion object {
-        const val NOT_PERMITTED = "not_permitted"
+        const val NOT_PERMITTED: String = CommandReasons.NOT_PERMITTED
 
         const val MESSAGE =
             "an ordinary installed app cannot run a shell: executing commands on the device " +

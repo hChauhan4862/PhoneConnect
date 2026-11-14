@@ -13,7 +13,7 @@ class LogcatHandler {
     fun tail(): JSONObject = throw CommandFailure(NOT_PERMITTED, MESSAGE)
 
     companion object {
-        const val NOT_PERMITTED = "not_permitted"
+        const val NOT_PERMITTED: String = CommandReasons.NOT_PERMITTED
 
         const val MESSAGE =
             "an ordinary installed app cannot read the system log: READ_LOGS is a " +

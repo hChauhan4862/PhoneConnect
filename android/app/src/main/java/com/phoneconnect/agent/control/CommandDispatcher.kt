@@ -13,11 +13,13 @@ import org.json.JSONObject
 class CommandFailure(val code: String, message: String? = null) : Exception(message ?: code) {
     companion object {
         fun unknown(name: String): CommandFailure =
-            CommandFailure("unknown_command", "this agent does not implement '$name'")
+            CommandFailure(CommandReasons.UNKNOWN_COMMAND, "this agent does not implement '$name'")
 
-        fun invalid(message: String): CommandFailure = CommandFailure("invalid_args", message)
+        fun invalid(message: String): CommandFailure =
+            CommandFailure(CommandReasons.INVALID_ARGS, message)
 
-        fun internal(reason: String): CommandFailure = CommandFailure("internal_error", reason)
+        fun internal(reason: String): CommandFailure =
+            CommandFailure(CommandReasons.INTERNAL_ERROR, reason)
     }
 }
 

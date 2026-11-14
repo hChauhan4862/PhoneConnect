@@ -13,10 +13,10 @@ import java.nio.file.Path
 class PathError(val code: String, message: String) : Exception(message) {
     companion object {
         /** The request itself is unusable: a NUL byte, or a symlink that cannot be resolved. */
-        const val INVALID: String = "invalid_path"
+        const val INVALID: String = CommandReasons.INVALID_PATH
 
         /** The request would reach outside the one shared root. */
-        const val OUTSIDE_ROOT: String = "path_outside_root"
+        const val OUTSIDE_ROOT: String = CommandReasons.PATH_OUTSIDE_ROOT
     }
 }
 

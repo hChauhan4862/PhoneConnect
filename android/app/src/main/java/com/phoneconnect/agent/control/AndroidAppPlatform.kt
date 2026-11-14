@@ -26,7 +26,7 @@ class AndroidAppPlatform(private val context: Context) : AppPlatform {
             installedPackages()
         } catch (error: RuntimeException) {
             throw CommandFailure(
-                "io_error",
+                CommandReasons.IO_ERROR,
                 "reading the installed apps failed (${error.javaClass.simpleName})",
             )
         }

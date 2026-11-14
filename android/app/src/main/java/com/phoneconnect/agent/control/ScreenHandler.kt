@@ -62,14 +62,14 @@ class ScreenHandler(private val capture: ScreenCapture) {
         }
         val frame = capture.capture(MAX_ENCODED_BYTES, budgetMs.coerceIn(1L, CAPTURE_TIMEOUT_MS))
         if (frame.png.isEmpty() || frame.width <= 0 || frame.height <= 0) {
-            throw CommandFailure("capture_failed", "the platform produced no usable frame")
+            throw CommandFailure(CommandReasons.CAPTURE_FAILED, "the platform produced no usable frame")
         }
         val encoded = Base64.encodeToString(frame.png, Base64.NO_WRAP)
         // The capture downscales until the encoded frame fits; this is the last check, and it
         // refuses rather than handing the server something it must drop.
         if (encoded.length > MAX_ENCODED_BYTES) {
             throw CommandFailure(
-                "result_too_large",
+                CommandReasons.RESULT_TOO_LARGE,
                 "the encoded frame exceeds the ${MAX_ENCODED_BYTES}-byte base64 result budget",
             )
         }
@@ -81,7 +81,7 @@ class ScreenHandler(private val capture: ScreenCapture) {
     }
 
     companion object {
-        const val CONSENT_REQUIRED = "consent_required"
+        const val CONSENT_REQUIRED: String = CommandReasons.CONSENT_REQUIRED
 
         const val CONSENT_MESSAGE =
             "screen capture needs the user's consent, granted from the PhoneConnect setup " +

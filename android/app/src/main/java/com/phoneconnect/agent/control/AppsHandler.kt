@@ -79,7 +79,7 @@ class AppsHandler(private val platform: AppPlatform) {
             // as `files.list` does; a silently truncated listing would be a fabricated one.
             if (entries.size >= MAX_LIST_APPS || encodedBytes + encoded > MAX_LIST_BYTES) {
                 throw CommandFailure(
-                    "listing_too_large",
+                    CommandReasons.LISTING_TOO_LARGE,
                     "the device has more apps than one listing may carry " +
                         "(limit $MAX_LIST_APPS apps or $MAX_LIST_BYTES bytes)",
                 )
@@ -94,13 +94,13 @@ class AppsHandler(private val platform: AppPlatform) {
         val packageName = requireInstalled(args)
         val intent = platform.launchIntent(packageName)
             ?: throw CommandFailure(
-                "no_launch_activity",
+                CommandReasons.NO_LAUNCH_ACTIVITY,
                 "the package has no launchable activity",
             )
         if (!platform.mayStartActivityFromBackground()) {
             throw CommandFailure(
-                "launch_blocked",
-                "background_activity_start_restricted",
+                CommandReasons.LAUNCH_BLOCKED,
+                CommandReasons.BACKGROUND_ACTIVITY_START_RESTRICTED,
             )
         }
         try {
@@ -108,7 +108,7 @@ class AppsHandler(private val platform: AppPlatform) {
         } catch (_: RuntimeException) {
             // The platform's message can name absolute paths; the caller gets a code and a
             // short reason instead.
-            throw CommandFailure("launch_blocked", "platform_refused")
+            throw CommandFailure(CommandReasons.LAUNCH_BLOCKED, CommandReasons.PLATFORM_REFUSED)
         }
         // Success means the platform accepted the start. Android offers no callback proving
         // the activity became visible, and this response does not claim it did.
@@ -122,7 +122,7 @@ class AppsHandler(private val platform: AppPlatform) {
         try {
             platform.killBackgroundProcesses(packageName)
         } catch (_: RuntimeException) {
-            throw CommandFailure("not_permitted", KILL_REFUSED_MESSAGE)
+            throw CommandFailure(CommandReasons.NOT_PERMITTED, KILL_REFUSED_MESSAGE)
         }
         // A background kill is a request: Android never confirms that a process died, so the
         // answer says what was asked for and nothing more.
@@ -133,13 +133,13 @@ class AppsHandler(private val platform: AppPlatform) {
 
     fun clear(args: JSONObject?): JSONObject {
         requireInstalled(args)
-        throw CommandFailure("not_permitted", CLEAR_MESSAGE)
+        throw CommandFailure(CommandReasons.NOT_PERMITTED, CLEAR_MESSAGE)
     }
 
     fun setEnabled(args: JSONObject?): JSONObject {
         requireInstalled(args)
         requireBoolean(args, "enabled")
-        throw CommandFailure("not_permitted", SET_ENABLED_MESSAGE)
+        throw CommandFailure(CommandReasons.NOT_PERMITTED, SET_ENABLED_MESSAGE)
     }
 
     private fun describe(app: InstalledApp): JSONObject = JSONObject()
@@ -157,7 +157,7 @@ class AppsHandler(private val platform: AppPlatform) {
     private fun requireInstalled(args: JSONObject?): String {
         val requested = requiredPackage(args)
         if (platform.installed().none { it.packageName == requested }) {
-            throw CommandFailure("unknown_package", "the package is not installed on this device")
+            throw CommandFailure(CommandReasons.UNKNOWN_PACKAGE, "the package is not installed on this device")
         }
         return requested
     }

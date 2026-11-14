@@ -5,6 +5,7 @@ import com.phoneconnect.agent.IdentityBoundary
 import com.phoneconnect.agent.ManagementChannel
 import com.phoneconnect.agent.ManagementChannelState
 import com.phoneconnect.agent.control.CommandDispatcher
+import com.phoneconnect.agent.control.CommandReasons
 import com.phoneconnect.agent.control.CommandFailure
 import com.phoneconnect.agent.control.DeviceInfoHandler
 import com.phoneconnect.agent.telemetry.TelemetrySampler
@@ -211,7 +212,7 @@ class DeviceControlChannel(
                     requestId,
                     Result.failure(
                         CommandFailure(
-                            "timeout",
+                            CommandReasons.TIMEOUT,
                             "$name was queued past its deadline and was not executed",
                         ),
                     ),
@@ -227,7 +228,7 @@ class DeviceControlChannel(
         val result = withTimeoutOrNull(budgetMs) {
             withContext(Dispatchers.Default) { dispatcher.dispatch(name, args, budgetMs) }
         } ?: Result.failure(
-            CommandFailure("timeout", "$name did not finish within ${budgetMs}ms"),
+            CommandFailure(CommandReasons.TIMEOUT, "$name did not finish within ${budgetMs}ms"),
         )
         socket.send(resultFrame(requestId, result).toString())
     }

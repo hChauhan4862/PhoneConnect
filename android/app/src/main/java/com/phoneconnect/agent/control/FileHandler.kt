@@ -36,7 +36,7 @@ class FileHandler(private val guard: PathGuard) {
         val path = path(args)
         if (!Files.exists(path)) throw notFound(path)
         if (!Files.isDirectory(path)) {
-            throw CommandFailure("not_a_directory", "${display(path)} is not a directory")
+            throw CommandFailure(CommandReasons.NOT_A_DIRECTORY, "${display(path)} is not a directory")
         }
 
         val entries = ArrayList<JSONObject>()
@@ -80,7 +80,7 @@ class FileHandler(private val guard: PathGuard) {
         if (length < 0) throw CommandFailure.invalid("length must not be negative")
         if (!Files.exists(path)) throw notFound(path)
         if (Files.isDirectory(path)) {
-            throw CommandFailure("not_a_file", "${display(path)} is a directory")
+            throw CommandFailure(CommandReasons.NOT_A_FILE, "${display(path)} is a directory")
         }
 
         val size = try {
@@ -121,7 +121,7 @@ class FileHandler(private val guard: PathGuard) {
         if (bytes.size > MAX_WRITE_BYTES) throw tooLarge()
         requireNotRoot(path)
         if (Files.isDirectory(path)) {
-            throw CommandFailure("is_directory", "${display(path)} is a directory")
+            throw CommandFailure(CommandReasons.IS_DIRECTORY, "${display(path)} is a directory")
         }
         requireParent(path)
         try {
@@ -145,7 +145,7 @@ class FileHandler(private val guard: PathGuard) {
         val path = path(args)
         requireNotRoot(path)
         if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            throw CommandFailure("already_exists", "${display(path)} already exists")
+            throw CommandFailure(CommandReasons.ALREADY_EXISTS, "${display(path)} already exists")
         }
         requireParent(path)
         try {
@@ -166,7 +166,7 @@ class FileHandler(private val guard: PathGuard) {
                     !children.iterator().hasNext()
                 }
                 if (!empty) {
-                    throw CommandFailure("dir_not_empty", "${display(path)} is not empty")
+                    throw CommandFailure(CommandReasons.DIR_NOT_EMPTY, "${display(path)} is not empty")
                 }
             }
             Files.delete(path)
@@ -183,7 +183,7 @@ class FileHandler(private val guard: PathGuard) {
         requireNotRoot(to)
         if (!Files.exists(from, LinkOption.NOFOLLOW_LINKS)) throw notFound(from)
         if (Files.exists(to, LinkOption.NOFOLLOW_LINKS)) {
-            throw CommandFailure("already_exists", "${display(to)} already exists")
+            throw CommandFailure(CommandReasons.ALREADY_EXISTS, "${display(to)} already exists")
         }
         requireParent(to)
         try {
@@ -234,12 +234,12 @@ class FileHandler(private val guard: PathGuard) {
     private fun requireParent(path: Path) {
         val parent = path.parent
         if (parent == null || !Files.isDirectory(parent)) {
-            throw CommandFailure("not_found", "the parent directory does not exist")
+            throw CommandFailure(CommandReasons.NOT_FOUND, "the parent directory does not exist")
         }
     }
 
     private fun notFound(path: Path) =
-        CommandFailure("not_found", "${display(path)} does not exist")
+        CommandFailure(CommandReasons.NOT_FOUND, "${display(path)} does not exist")
 
     /** A path as the caller wrote it, relative to the shared root: never a device path. */
     private fun display(path: Path): String {
@@ -248,12 +248,12 @@ class FileHandler(private val guard: PathGuard) {
     }
 
     private fun tooLarge() = CommandFailure(
-        "too_large",
+        CommandReasons.TOO_LARGE,
         "a write may carry at most $MAX_WRITE_BYTES decoded bytes",
     )
 
     private fun listingTooLarge(path: Path) = CommandFailure(
-        "listing_too_large",
+        CommandReasons.LISTING_TOO_LARGE,
         "${display(path)} has more entries than one listing may carry " +
             "(limit $MAX_LIST_ENTRIES entries or $MAX_LIST_BYTES bytes)",
     )
@@ -276,7 +276,7 @@ class FileHandler(private val guard: PathGuard) {
         // The platform message can name absolute device paths; the caller gets the operation
         // and the request instead.
         return CommandFailure(
-            "io_error",
+            CommandReasons.IO_ERROR,
             "$operation failed for ${display(path)} (${error.javaClass.simpleName})",
         )
     }
