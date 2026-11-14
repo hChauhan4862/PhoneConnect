@@ -10,6 +10,7 @@ import { AccessGateRoute } from "./routes/AccessGateRoute";
 import { CommandsRoute } from "./routes/CommandsRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
 import { DeviceStatusRoute } from "./routes/DeviceStatusRoute";
+import { FilesRoute } from "./routes/FilesRoute";
 import { TelemetryRoute } from "./routes/TelemetryRoute";
 import { NotFoundRoute } from "./routes/NotFoundRoute";
 import { createHostAdapter, HostAdapterContext } from "./host/HostAdapter";
@@ -110,6 +111,9 @@ function AuthenticatedShell({
           deviceId={route.deviceId}
           userId={session.userId}
         />
+      ) : null}
+      {route.name === "files" ? (
+        <FilesRoute api={api} deviceId={route.deviceId} userId={session.userId} />
       ) : null}
       {route.name === "devices" ? (
         <DeviceListRoute api={api} userId={session.userId} />

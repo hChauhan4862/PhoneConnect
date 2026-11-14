@@ -7,7 +7,7 @@ import { LeasePanel } from "../components/LeasePanel";
 import { RouteLink } from "../components/RouteLink";
 import { SessionPanel } from "../components/SessionPanel";
 import { TelemetryPanel } from "../components/TelemetryPanel";
-import { commandsPath } from "../routing";
+import { commandsPath, filesPath } from "../routing";
 
 export function DeviceStatusRoute({
   api,
@@ -65,6 +65,9 @@ export function DeviceStatusRoute({
         <RouteLink to={commandsPath(status.device.device_id)}>
           Open the command console
         </RouteLink>
+      </p>
+      <p>
+        <RouteLink to={filesPath(status.device.device_id)}>Browse files</RouteLink>
       </p>
       <HostActions deviceId={status.device.device_id} />
     </>

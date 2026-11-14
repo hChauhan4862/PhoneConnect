@@ -27,19 +27,22 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/App.tsx` — the shell: selects one host adapter, holds the session, and renders the
   current route. It contains no screen logic.
 - `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
-  `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry), and
-  `/devices/:id/commands` (the command console). The server's SPA fallback serves the same
-  document for each, so a reload or deep link works.
+  `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry),
+  `/devices/:id/commands` (the command console), and `/devices/:id/files` (the file browser).
+  The server's SPA fallback serves the same document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
   fallback and no second domain model. The client is same-origin, so the native shell's
   embedded page makes exactly the calls a browser makes.
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
-  `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `NotFoundRoute`.
+  `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `NotFoundRoute`.
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
-  `TelemetryPanel` (bounded aggregates and explicit freshness), and `CommandPanel` (dispatch
-  and poll). `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
+  `TelemetryPanel` (bounded aggregates and explicit freshness), `CommandPanel` (dispatch
+  and poll), and `FileList` (one directory's entries). `FileList` is presentational: `FilesRoute`
+  owns navigation and every operation, clears the listing the moment the path changes, refuses
+  a success whose output is not a listing, and requires a second confirmation before a write or
+  a delete. `CommandPanel` renders `pending`, `ok`, `error`, and `timeout` distinctly: only
   `ok` shows output, and a refused dispatch (`device_offline`, `device_revoked`,
   `lease_read_only`) is an alert, never a pending row that looks like it is working. `LeasePanel` offers revoke and
   handoff to the owner *or* the holder, because the server lets the owner revoke a lease they

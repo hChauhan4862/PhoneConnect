@@ -124,6 +124,33 @@ export interface CommandAccepted {
   command_id: string;
 }
 
+/// One entry of a directory listing, exactly as the device reported it. [path] is relative to
+/// the device's shared root and is what the next file command takes.
+export interface FileEntryView {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+  modified_ms: number;
+}
+
+/// `files.list` output: one directory's entries.
+export interface FileListOutput {
+  entries: FileEntryView[];
+}
+
+/// `files.read` output: one chunk of decoded bytes, and whether more remain.
+export interface FileReadOutput {
+  data_base64: string;
+  truncated: boolean;
+  name: string;
+}
+
+/// `files.write` output: how many bytes the device wrote.
+export interface FileWriteOutput {
+  bytes_written: number;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -158,6 +185,34 @@ export interface ApiClient {
     timeoutMs?: number | null,
   ): Promise<CommandAccepted>;
   command(commandId: string, userId: string): Promise<CommandView>;
+  /// The file commands. Each returns the accepted command id, which is polled like any other
+  /// command: the device's own answer is the only result, and no content is stored here.
+  listFiles(deviceId: string, userId: string, path: string): Promise<CommandAccepted>;
+  readFile(
+    deviceId: string,
+    userId: string,
+    path: string,
+    offset?: number,
+  ): Promise<CommandAccepted>;
+  writeFile(
+    deviceId: string,
+    userId: string,
+    path: string,
+    dataBase64: string,
+    append?: boolean,
+  ): Promise<CommandAccepted>;
+  createDirectory(
+    deviceId: string,
+    userId: string,
+    path: string,
+  ): Promise<CommandAccepted>;
+  deleteEntry(deviceId: string, userId: string, path: string): Promise<CommandAccepted>;
+  renameEntry(
+    deviceId: string,
+    userId: string,
+    from: string,
+    to: string,
+  ): Promise<CommandAccepted>;
 }
 
 /// A refusal that names the status and stable machine code the server returned. A transport
@@ -244,7 +299,36 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
         "GET",
         `/api/commands/${encodeURIComponent(commandId)}?user_id=${encodeURIComponent(userId)}`,
       ),
+    listFiles: (deviceId, userId, path) =>
+      filesRequest(deviceId, userId, "list", { path }),
+    readFile: (deviceId, userId, path, offset) =>
+      filesRequest(deviceId, userId, "read", offset === undefined ? { path } : { path, offset }),
+    writeFile: (deviceId, userId, path, dataBase64, append) =>
+      filesRequest(deviceId, userId, "write", {
+        path,
+        data_base64: dataBase64,
+        append: append ?? false,
+      }),
+    createDirectory: (deviceId, userId, path) =>
+      filesRequest(deviceId, userId, "mkdir", { path }),
+    deleteEntry: (deviceId, userId, path) =>
+      filesRequest(deviceId, userId, "delete", { path }),
+    renameEntry: (deviceId, userId, from, to) =>
+      filesRequest(deviceId, userId, "rename", { from, to }),
   };
+
+  function filesRequest(
+    deviceId: string,
+    userId: string,
+    operation: string,
+    body: unknown,
+  ): Promise<CommandAccepted> {
+    return request<CommandAccepted>(
+      "POST",
+      `/api/devices/${encodeURIComponent(deviceId)}/files/${operation}?user_id=${encodeURIComponent(userId)}`,
+      body,
+    );
+  }
 }
 
 async function errorCode(response: Response): Promise<string> {

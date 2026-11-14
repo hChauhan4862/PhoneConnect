@@ -111,6 +111,12 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
       invalidated_sessions: [],
     })),
     dispatchCommand: vi.fn(async () => ({ command_id: "cmd_1" })),
+    listFiles: vi.fn(async () => ({ command_id: "cmd_1" })),
+    readFile: vi.fn(async () => ({ command_id: "cmd_1" })),
+    writeFile: vi.fn(async () => ({ command_id: "cmd_1" })),
+    createDirectory: vi.fn(async () => ({ command_id: "cmd_1" })),
+    deleteEntry: vi.fn(async () => ({ command_id: "cmd_1" })),
+    renameEntry: vi.fn(async () => ({ command_id: "cmd_1" })),
     command: vi.fn(async () => ({
       command_id: "cmd_1",
       device_id: "dev_1",
@@ -542,6 +548,20 @@ describe("the command console route", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /run command/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /back to status/i }),
+    ).toHaveAttribute("href", "/devices/dev_1");
+  });
+});
+
+describe("the file browser route", () => {
+  it("renders the file browser at the device's files path", async () => {
+    installHost("browser");
+    renderApp(createFakeApi(statusFixture()), "/devices/dev_1/files");
+
+    expect(
+      await screen.findByRole("heading", { name: /^files$/i }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /back to status/i }),
