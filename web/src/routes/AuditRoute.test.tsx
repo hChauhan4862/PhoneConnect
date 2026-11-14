@@ -43,6 +43,24 @@ function deferred<T>() {
 }
 
 describe("the audit screen", () => {
+  it("says in visible text that the actor is asserted and accepted is not executed", async () => {
+    const api = fakeApi([entry()]);
+
+    renderRoute(api);
+
+    const note = await screen.findByRole("note");
+    expect(note).toBeVisible();
+    expect(note).toHaveTextContent(
+      /actor is asserted by the token holder and is not verified by the server/i,
+    );
+    expect(note).toHaveTextContent(
+      /delivered to the device's channel, not that the device executed it/i,
+    );
+    // Not a tooltip: the caveat is text in the page, present even before any row is read.
+    expect(note).toHaveAttribute("role", "note");
+    expect(note).not.toHaveAttribute("title");
+  });
+
   it("renders the newest row first and names accepted and refused outcomes", async () => {
     const api = fakeApi([
       entry({ at_ms: NOW + 2, actor: "owner-1" }),

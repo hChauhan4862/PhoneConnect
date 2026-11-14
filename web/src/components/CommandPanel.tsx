@@ -6,17 +6,27 @@
 /// device has not answered yet. A refusal from the server (`device_offline`,
 /// `device_revoked`, ...) is an alert too, never a pending row that appears to be working.
 ///
+/// A refusal and an accepted-but-unanswered command are different facts. A POST the server
+/// refused means nothing was dispatched; a code that arrives after the 202 — or a poll that
+/// failed — may describe a command the device executed, so the alert uses the shared rule in
+/// `data/failures` instead of claiming the device refused.
+///
 /// Polling is bounded: the server converts a command past its deadline into `timeout`, so a
 /// long-running poll gives up at the longest deadline and asks the user to check again.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { ApiClient, CommandAccepted, CommandView } from "../api";
 import {
-  asApiError,
-  type ApiClient,
-  type CommandView,
-} from "../api";
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type Failure,
+  type FailureOutcome,
+} from "../data/failures";
 import { ErrorNotice } from "./ErrorNotice";
+import { FailureNotice } from "./FailureNotice";
 
 /// Names this build's agent answers. The field stays free-text: the device owns the
 /// vocabulary, and a later feature adds names without changing this screen.
@@ -53,7 +63,10 @@ export function CommandPanel({
   const [name, setName] = useState<string>(SUGGESTED_COMMANDS[0]);
   const [argsText, setArgsText] = useState("");
   const [command, setCommand] = useState<CommandView | null>(null);
+  // A refusal of the POST itself: nothing was dispatched.
   const [submitError, setSubmitError] = useState<unknown>(null);
+  // A failure after acceptance, which may describe a command the device executed.
+  const [failure, setFailure] = useState<FailureOutcome | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
   const mounted = useRef(true);
@@ -67,6 +80,7 @@ export function CommandPanel({
 
   const submit = useCallback(async () => {
     setSubmitError(null);
+    setFailure(null);
     setInputError(null);
 
     const commandName = name.trim();
@@ -85,29 +99,38 @@ export function CommandPanel({
       }
     }
 
+    let accepted: CommandAccepted;
     try {
-      const accepted = await api.dispatchCommand(
+      accepted = await api.dispatchCommand(
         deviceId,
         userId,
         commandName,
         args,
         null,
       );
+    } catch (refusal) {
       if (!mounted.current) return;
-      // The POST only proves the command was queued. The device has not answered, so the
-      // first state on screen is explicitly pending.
-      setCommand({
-        command_id: accepted.command_id,
-        device_id: deviceId,
-        name: commandName,
-        status: "pending",
-        output: null,
-        error: null,
-        message: null,
-        created_at_ms: Date.now(),
-        completed_at_ms: null,
-      });
-      setPolling(true);
+      // Nothing was dispatched, so this is the ordinary refusal it looks like.
+      setCommand(null);
+      setSubmitError(refusal);
+      setPolling(false);
+      return;
+    }
+    // The POST only proves the command was queued. The device has not answered, so the
+    // first state on screen is explicitly pending.
+    setCommand({
+      command_id: accepted.command_id,
+      device_id: deviceId,
+      name: commandName,
+      status: "pending",
+      output: null,
+      error: null,
+      message: null,
+      created_at_ms: Date.now(),
+      completed_at_ms: null,
+    });
+    setPolling(true);
+    try {
       for (let attempt = 0; attempt < MAX_POLLS; attempt += 1) {
         await sleep(pollIntervalMs);
         if (!mounted.current) return;
@@ -121,10 +144,11 @@ export function CommandPanel({
       }
       if (!mounted.current) return;
       setPolling(false);
-    } catch (failure) {
+    } catch (pollFailure) {
       if (!mounted.current) return;
+      // The command was accepted, so the poll's failure is not evidence that nothing happened.
       setCommand(null);
-      setSubmitError(failure);
+      setFailure(unknownOutcome(failureOfError(pollFailure)));
       setPolling(false);
     }
   }, [api, argsText, deviceId, name, pollIntervalMs, userId]);
@@ -167,6 +191,9 @@ export function CommandPanel({
         </p>
       ) : null}
       {submitError ? <DispatchFailure error={submitError} /> : null}
+      {failure ? (
+        <FailureNotice failure={failure.failure} lead={failure.lead} />
+      ) : null}
       {command ? <CommandResult command={command} polling={polling} /> : null}
     </section>
   );
@@ -179,6 +206,12 @@ function CommandResult({
   command: CommandView;
   polling: boolean;
 }) {
+  // Only a terminal answer that is not `ok` is a failure; it came from an accepted command, so
+  // the shared rule decides what the alert may claim about the device.
+  const outcome =
+    command.status === "ok" || command.status === "pending"
+      ? null
+      : outcomeOf(failureOfCommand(command), true);
   return (
     <div className="command-result" data-status={command.status}>
       <h3>Command result</h3>
@@ -194,38 +227,33 @@ function CommandResult({
       {command.status === "ok" ? (
         <pre data-testid="command-output">{formatOutput(command.output)}</pre>
       ) : null}
-      {command.status === "error" ? (
-        <div role="alert" className="notice notice-error">
-          <p>
-            <strong>Command failed</strong> <code>{command.error ?? "device_error"}</code>
-          </p>
-          {command.message ? <p>{command.message}</p> : null}
-        </div>
-      ) : null}
-      {command.status === "timeout" ? (
-        <div role="alert" className="notice notice-error">
-          <p>
-            <strong>Timed out</strong>: the device did not answer before the deadline.
-          </p>
-        </div>
+      {outcome ? (
+        <FailureNotice
+          failure={outcome.failure}
+          lead={outcome.lead}
+          note={outcomeNote(outcome.failure)}
+        />
       ) : null}
     </div>
   );
 }
 
+/// The POST was refused: nothing was dispatched, so the refusal lead is true and the reason is
+/// the device's or server's own explanation.
 function DispatchFailure({ error }: { error: unknown }) {
-  const api = asApiError(error);
-  const explanation = REFUSAL_MESSAGES[api.code];
+  const failure = failureOfError(error);
+  const explanation = REFUSAL_MESSAGES[failure.code];
   if (!explanation) {
     return <ErrorNotice error={error} />;
   }
-  return (
-    <div role="alert" className="notice notice-error">
-      <p>
-        <strong>{explanation}</strong> <code>{api.code}</code>
-      </p>
-    </div>
-  );
+  return <FailureNotice failure={failure} note={explanation} />;
+}
+
+/// A `timeout` carries no message of its own: the deadline is the whole story.
+function outcomeNote(failure: Failure): string | undefined {
+  return failure.code === "timeout"
+    ? "the device did not answer before the deadline"
+    : undefined;
 }
 
 function formatOutput(output: unknown): string {

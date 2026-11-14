@@ -17,7 +17,13 @@ import { FailureNotice } from "../components/FailureNotice";
 import { FileList } from "../components/FileList";
 import { RouteLink } from "../components/RouteLink";
 import { pollCommand } from "../data/commands";
-import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
+import {
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type FailureOutcome,
+} from "../data/failures";
 import { devicePath } from "../routing";
 
 interface StagedWrite {
@@ -66,12 +72,12 @@ export function FilesRoute({
 }: FilesRouteProps) {
   const [path, setPath] = useState("");
   const [entries, setEntries] = useState<FileEntryView[] | null>(null);
-  const [listingFailure, setListingFailure] = useState<Failure | null>(null);
+  const [listingFailure, setListingFailure] = useState<FailureOutcome | null>(null);
   const [listingLoading, setListingLoading] = useState(true);
   const [reloadNonce, setReloadNonce] = useState(0);
 
   const [busy, setBusy] = useState(false);
-  const [actionFailure, setActionFailure] = useState<Failure | null>(null);
+  const [actionFailure, setActionFailure] = useState<FailureOutcome | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
@@ -97,28 +103,42 @@ export function FilesRoute({
     setListingFailure(null);
     setListingLoading(true);
     (async () => {
+      let accepted: CommandAccepted;
       try {
-        const accepted = await api.listFiles(deviceId, userId, path);
+        accepted = await api.listFiles(deviceId, userId, path);
+      } catch (failure) {
+        // Nothing was dispatched: this listing really was refused.
+        if (!cancelled) {
+          setListingFailure(outcomeOf(failureOfError(failure), false));
+          setListingLoading(false);
+        }
+        return;
+      }
+      try {
         const command = await pollCommand(api, userId, accepted.command_id, {
           pollIntervalMs,
           isActive: () => !cancelled,
         });
         if (cancelled) return;
         if (command.status !== "ok") {
-          setListingFailure(failureOfCommand(command));
+          // Accepted, so a code that is not the device's answer leaves the listing unknown.
+          setListingFailure(outcomeOf(failureOfCommand(command), true));
           return;
         }
         const listing = readListing(command.output);
         if (!listing) {
-          setListingFailure({
-            code: "invalid_result",
-            message: "the device's answer is not a directory listing",
-          });
+          setListingFailure(
+            unknownOutcome({
+              code: "invalid_result",
+              message: "the device's answer is not a directory listing",
+            }),
+          );
           return;
         }
         setEntries(listing);
       } catch (failure) {
-        if (!cancelled) setListingFailure(failureOfError(failure));
+        // Accepted, then the poll itself failed: the answer was lost, not refused.
+        if (!cancelled) setListingFailure(unknownOutcome(failureOfError(failure)));
       } finally {
         if (!cancelled) setListingLoading(false);
       }
@@ -132,31 +152,50 @@ export function FilesRoute({
 
   /// Dispatches one command and waits for the device's answer. A non-`ok` answer becomes the
   /// action's failure and `null` is returned: no caller can mistake a refusal for success.
+  ///
+  /// Acceptance and the answer are separate facts. A refusal before the command is accepted is
+  /// the ordinary "the device did not do that"; an outcome after acceptance that may have reached
+  /// the device re-reads the listing, so a change that landed cannot sit under a stale one.
   const run = useCallback(
     async (operation: () => Promise<CommandAccepted>): Promise<CommandView | null> => {
       setBusy(true);
       setActionFailure(null);
       setNotice(null);
       try {
-        const accepted = await operation();
-        const command = await pollCommand(api, userId, accepted.command_id, {
-          pollIntervalMs,
-          isActive: () => mounted.current,
-        });
-        if (!mounted.current) return null;
-        if (command.status !== "ok") {
-          setActionFailure(failureOfCommand(command));
+        let accepted: CommandAccepted;
+        try {
+          accepted = await operation();
+        } catch (failure) {
+          // Nothing was dispatched, so this is the ordinary refusal it looks like.
+          if (mounted.current) setActionFailure(outcomeOf(failureOfError(failure), false));
           return null;
         }
-        return command;
-      } catch (failure) {
-        if (mounted.current) setActionFailure(failureOfError(failure));
-        return null;
+        try {
+          const command = await pollCommand(api, userId, accepted.command_id, {
+            pollIntervalMs,
+            isActive: () => mounted.current,
+          });
+          if (!mounted.current) return null;
+          if (command.status !== "ok") {
+            const outcome = outcomeOf(failureOfCommand(command), true);
+            setActionFailure(outcome);
+            if (outcome.unknown) reload();
+            return null;
+          }
+          return command;
+        } catch (failure) {
+          // Accepted, then the poll failed: the answer was lost, never refused.
+          if (mounted.current) {
+            setActionFailure(unknownOutcome(failureOfError(failure)));
+            reload();
+          }
+          return null;
+        }
       } finally {
         if (mounted.current) setBusy(false);
       }
     },
-    [api, userId, pollIntervalMs],
+    [api, userId, pollIntervalMs, reload],
   );
 
   async function loadChunk(
@@ -168,20 +207,25 @@ export function FilesRoute({
     if (!command) return;
     const chunk = readChunk(command.output);
     if (!chunk) {
-      setActionFailure({
-        code: "invalid_result",
-        message: "the device's read answer is not a chunk",
-      });
+      // The device answered `ok`, so it read something; its answer just cannot be read here.
+      setActionFailure(
+        unknownOutcome({
+          code: "invalid_result",
+          message: "the device's read answer is not a chunk",
+        }),
+      );
       return;
     }
     let bytes: Uint8Array;
     try {
       bytes = decodeBase64(chunk.data_base64);
     } catch {
-      setActionFailure({
-        code: "invalid_result",
-        message: "the device's chunk is not valid base64",
-      });
+      setActionFailure(
+        unknownOutcome({
+          code: "invalid_result",
+          message: "the device's chunk is not valid base64",
+        }),
+      );
       return;
     }
     setOpenFile({
@@ -215,10 +259,13 @@ export function FilesRoute({
     setNotice(null);
     setOpenFile(null);
     if (file.size > MAX_WRITE_BYTES) {
-      setActionFailure({
-        code: "too_large",
-        message: `a write may carry at most ${MAX_WRITE_BYTES} bytes`,
-      });
+      // Refused here, before anything is dispatched.
+      setActionFailure(
+        outcomeOf(
+          { code: "too_large", message: `a write may carry at most ${MAX_WRITE_BYTES} bytes` },
+          false,
+        ),
+      );
       return;
     }
     const dataBase64 = bytesToBase64(new Uint8Array(await file.arrayBuffer()));
@@ -259,7 +306,9 @@ export function FilesRoute({
   async function createFolder(): Promise<void> {
     const name = folderName.trim();
     if (name.length === 0) {
-      setActionFailure({ code: "invalid_args", message: "a folder name is required" });
+      setActionFailure(
+        outcomeOf({ code: "invalid_args", message: "a folder name is required" }, false),
+      );
       return;
     }
     const target = joinPath(path, name);
@@ -274,7 +323,9 @@ export function FilesRoute({
     if (!rename) return;
     const target = rename.path.trim();
     if (target.length === 0) {
-      setActionFailure({ code: "invalid_args", message: "a new path is required" });
+      setActionFailure(
+        outcomeOf({ code: "invalid_args", message: "a new path is required" }, false),
+      );
       return;
     }
     const command = await run(() =>
@@ -314,7 +365,9 @@ export function FilesRoute({
           </button>
         </div>
 
-        {listingFailure ? <FailureNotice failure={listingFailure} /> : null}
+        {listingFailure ? (
+          <FailureNotice failure={listingFailure.failure} lead={listingFailure.lead} />
+        ) : null}
         {listingLoading && !listingFailure ? <p>Loading files…</p> : null}
         {!listingLoading && !listingFailure && entries?.length === 0 ? (
           <p>This folder is empty.</p>
@@ -332,7 +385,9 @@ export function FilesRoute({
         ) : null}
       </section>
 
-      {actionFailure ? <FailureNotice failure={actionFailure} /> : null}
+      {actionFailure ? (
+        <FailureNotice failure={actionFailure.failure} lead={actionFailure.lead} />
+      ) : null}
       {notice ? (
         <p role="status" className="notice">
           {notice}

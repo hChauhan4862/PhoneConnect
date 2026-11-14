@@ -20,7 +20,14 @@ import type {
 } from "../api";
 import { pollCommand } from "../data/commands";
 import { REASON_TEXT, reasonText } from "../data/controlReasons";
-import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
+import {
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type Failure,
+  type FailureOutcome,
+} from "../data/failures";
 import { FailureNotice } from "./FailureNotice";
 
 type ReadingKey = Exclude<keyof ControlReadingsOutput, "unavailable">;
@@ -58,12 +65,6 @@ const DND_OPTIONS = [
   { value: "4", label: "Alarms only" },
 ];
 
-/// A rendered failure: the device's answer, plus the lead sentence this screen knows is true.
-interface ActionFailure {
-  failure: Failure;
-  lead?: string;
-}
-
 export interface ControlPanelProps {
   api: ApiClient;
   deviceId: string;
@@ -79,7 +80,7 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
   const [reloadNonce, setReloadNonce] = useState(0);
 
   const [busy, setBusy] = useState(false);
-  const [actionFailure, setActionFailure] = useState<ActionFailure | null>(null);
+  const [actionFailure, setActionFailure] = useState<FailureOutcome | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const [brightness, setBrightness] = useState("");
@@ -165,7 +166,7 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         accepted = await api.setControl(deviceId, userId, key, value);
       } catch (error) {
         // Nothing was dispatched, so this is the ordinary refusal it looks like.
-        if (mounted.current) setActionFailure({ failure: failureOfError(error) });
+        if (mounted.current) setActionFailure(outcomeOf(failureOfError(error), false));
         return;
       }
       try {
@@ -175,19 +176,21 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         });
         if (!mounted.current) return;
         if (command.status !== "ok") {
-          const failure = actionFailureOf(command);
-          // Not every terminal code is the device's answer: the server's deadline can expire or
-          // the channel can drop after dispatch, and either way the device may have acted.
-          const unknown = UNKNOWN_OUTCOME_CODES.has(failure.code);
-          setActionFailure({
-            failure,
-            lead: unknown ? UNKNOWN_OUTCOME_LEAD : failureLead(failure),
-          });
+          // Not every terminal code is the device's answer: the server's deadline can expire,
+          // the channel can drop, or the record can be trimmed after dispatch, and each way the
+          // device may have acted. The shared rule says which codes those are and what the alert
+          // may claim.
+          const outcome = outcomeOf(actionFailureOf(command), true);
+          setActionFailure(outcome);
           // Anything that may have reached the device must not leave the previous map looking
           // current: an unknown outcome may have moved the value either way, `unconfirmed`
           // says the same from the device's side, and a brightness change turns automatic mode
           // off before it can fail.
-          if (unknown || failure.code === "unconfirmed" || key === "brightness") {
+          if (
+            outcome.unknown ||
+            outcome.failure.code === "unconfirmed" ||
+            key === "brightness"
+          ) {
             await read(() => mounted.current);
           }
           return;
@@ -195,13 +198,12 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         const result = readApplied(command.output);
         if (!result) {
           // The device answered `ok`: it acted, but its answer does not say what happened.
-          setActionFailure({
-            failure: {
+          setActionFailure(
+            unknownOutcome({
               code: "invalid_result",
               message: "the device's answer does not confirm the change",
-            },
-            lead: UNKNOWN_OUTCOME_LEAD,
-          });
+            }),
+          );
           await read(() => mounted.current);
           return;
         }
@@ -211,7 +213,7 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
         // The command was accepted, so it may have reached the device: the poll's failure is
         // not evidence that nothing happened.
         if (mounted.current) {
-          setActionFailure({ failure: failureOfError(error), lead: UNKNOWN_OUTCOME_LEAD });
+          setActionFailure(unknownOutcome(failureOfError(error)));
           await read(() => mounted.current);
         }
       }
@@ -442,22 +444,6 @@ function actionFailureOf(command: CommandView): Failure {
     code: failure.code,
     message: message !== null && REASON_TEXT[message] !== undefined ? reasonText(message) : message,
   };
-}
-
-/// What an alert says when the command was accepted and the answer never came back, or came
-/// back `ok` in a shape the panel cannot read. The device may well have done it.
-const UNKNOWN_OUTCOME_LEAD = "The device may not have completed that";
-
-/// Terminal command codes that are not the device's answer: the server stopped waiting
-/// (`timeout`) or lost the channel and failed the still-pending command (`device_offline`).
-/// Both happen after dispatch, so the device may have acted before the answer was lost.
-const UNKNOWN_OUTCOME_CODES = new Set(["timeout", "device_offline"]);
-
-/// The lead a terminal answer earns: the device said it could not confirm the change, so the
-/// default "did not do that" would contradict the note below it. Every other refusal keeps the
-/// default.
-function failureLead(failure: Failure): string | undefined {
-  return failure.code === "unconfirmed" ? "The device could not confirm that" : undefined;
 }
 
 /// The one code whose meaning needs a sentence of its own: the change was accepted but nothing

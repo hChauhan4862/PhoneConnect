@@ -7,11 +7,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { ApiClient, ScreenSnapshotOutput } from "../api";
+import type { ApiClient, CommandAccepted, ScreenSnapshotOutput } from "../api";
 import { FailureNotice } from "../components/FailureNotice";
 import { RouteLink } from "../components/RouteLink";
 import { pollCommand } from "../data/commands";
-import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
+import {
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type FailureOutcome,
+} from "../data/failures";
 import { formatTime } from "../format";
 import { devicePath } from "../routing";
 
@@ -25,7 +31,7 @@ export interface ScreenRouteProps {
 
 export function ScreenRoute({ api, deviceId, userId, pollIntervalMs }: ScreenRouteProps) {
   const [snapshot, setSnapshot] = useState<ScreenSnapshotOutput | null>(null);
-  const [failure, setFailure] = useState<Failure | null>(null);
+  const [failure, setFailure] = useState<FailureOutcome | null>(null);
   const [capturing, setCapturing] = useState(false);
 
   const mounted = useRef(true);
@@ -43,27 +49,41 @@ export function ScreenRoute({ api, deviceId, userId, pollIntervalMs }: ScreenRou
     setSnapshot(null);
     setFailure(null);
     try {
-      const accepted = await api.captureScreen(deviceId, userId);
-      const command = await pollCommand(api, userId, accepted.command_id, {
-        pollIntervalMs,
-        isActive: () => mounted.current,
-      });
-      if (!mounted.current) return;
-      if (command.status !== "ok") {
-        setFailure(failureOfCommand(command));
+      let accepted: CommandAccepted;
+      try {
+        accepted = await api.captureScreen(deviceId, userId);
+      } catch (error) {
+        // Nothing was dispatched, so this is the ordinary refusal it looks like.
+        if (mounted.current) setFailure(outcomeOf(failureOfError(error), false));
         return;
       }
-      const frame = readSnapshot(command.output);
-      if (!frame) {
-        setFailure({
-          code: "invalid_result",
-          message: "the device's answer is not a screen frame",
+      try {
+        const command = await pollCommand(api, userId, accepted.command_id, {
+          pollIntervalMs,
+          isActive: () => mounted.current,
         });
-        return;
+        if (!mounted.current) return;
+        if (command.status !== "ok") {
+          // Accepted, so a code that is not the device's answer leaves the capture unknown.
+          setFailure(outcomeOf(failureOfCommand(command), true));
+          return;
+        }
+        const frame = readSnapshot(command.output);
+        if (!frame) {
+          // The device answered `ok`, so it captured something; its answer just cannot be read.
+          setFailure(
+            unknownOutcome({
+              code: "invalid_result",
+              message: "the device's answer is not a screen frame",
+            }),
+          );
+          return;
+        }
+        setSnapshot(frame);
+      } catch (error) {
+        // Accepted, then the poll failed: the answer was lost, never refused.
+        if (mounted.current) setFailure(unknownOutcome(failureOfError(error)));
       }
-      setSnapshot(frame);
-    } catch (error) {
-      if (mounted.current) setFailure(failureOfError(error));
     } finally {
       if (mounted.current) setCapturing(false);
     }
@@ -94,7 +114,9 @@ export function ScreenRoute({ api, deviceId, userId, pollIntervalMs }: ScreenRou
           </button>
         </div>
 
-        {failure ? <FailureNotice failure={failure} /> : null}
+        {failure ? (
+          <FailureNotice failure={failure.failure} lead={failure.lead} />
+        ) : null}
         {capturing && !snapshot ? <p>Capturing one frame…</p> : null}
         {snapshot ? (
           <figure className="snapshot">

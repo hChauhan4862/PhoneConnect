@@ -286,6 +286,60 @@ describe("the file browser", () => {
     expect(alert).toHaveTextContent("dir_not_empty");
   });
 
+  it("treats a terminal device_offline after acceptance as unknown, and re-reads", async () => {
+    const user = userEvent.setup();
+    const { api, accept } = fakeApi();
+    api.listFiles = vi.fn(async () =>
+      accept("files.list", { output: { entries: [file("notes.txt")] } }),
+    ) as never;
+    api.deleteEntry = vi.fn(async () =>
+      accept("files.delete", {
+        status: "error",
+        output: null,
+        error: "device_offline",
+        message: "the management channel closed before the device answered",
+      }),
+    ) as never;
+
+    renderRoute(api);
+    await screen.findByText("notes.txt");
+    await user.click(screen.getByRole("button", { name: /delete notes\.txt/i }));
+    await user.click(screen.getByRole("button", { name: /confirm delete/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The delete was accepted, so the delete may have landed: never "did not do that".
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    // The listing is read again, so a delete that landed cannot sit under the old entries.
+    await waitFor(() => expect(api.listFiles).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps the refusal lead when the delete is refused before acceptance", async () => {
+    const user = userEvent.setup();
+    const { api, accept } = fakeApi();
+    api.listFiles = vi.fn(async () =>
+      accept("files.list", { output: { entries: [file("notes.txt")] } }),
+    ) as never;
+    api.deleteEntry = vi.fn(async () => {
+      throw new ApiError(403, "lease_read_only");
+    }) as never;
+
+    renderRoute(api);
+    await screen.findByText("notes.txt");
+    await user.click(screen.getByRole("button", { name: /delete notes\.txt/i }));
+    await user.click(screen.getByRole("button", { name: /confirm delete/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("lease_read_only");
+    // Nothing was dispatched, so this really is "did not do that".
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+    expect(api.listFiles, "nothing landed, so the listing is not re-read").toHaveBeenCalledTimes(
+      1,
+    );
+  });
+
   it("creates a folder and renames an entry through the same command surface", async () => {
     const user = userEvent.setup();
     const { api, accept } = fakeApi();

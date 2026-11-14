@@ -216,6 +216,11 @@ form {
   color: var(--muted);
 }
 
+.caveat {
+  border-left: 0.25rem solid var(--border);
+  padding-left: 0.75rem;
+}
+
 .notice {
   border-radius: 0.5rem;
   padding: 0.75rem 1rem;

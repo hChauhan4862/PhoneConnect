@@ -143,6 +143,31 @@ describe("the screen route", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("device_offline");
+    // Nothing was dispatched, so the refusal lead is true.
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("treats a terminal device_offline after acceptance as an unknown outcome", async () => {
+    const { api, accept } = fakeApi();
+    api.captureScreen = vi.fn(async () =>
+      accept("screen.snapshot", {
+        status: "error",
+        output: null,
+        error: "device_offline",
+        message: "the management channel closed before the device answered",
+      }),
+    );
+    renderRoute(api);
+
+    await userEvent.click(screen.getByRole("button", { name: /capture screen/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The capture was accepted, so the device may have taken the frame: never "did not do that".
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 

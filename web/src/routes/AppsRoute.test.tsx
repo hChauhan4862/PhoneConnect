@@ -253,6 +253,58 @@ describe("the apps screen", () => {
     expect(screen.queryByText("Beta")).toBeNull();
   });
 
+  it("treats a terminal device_offline after acceptance as unknown, and re-reads", async () => {
+    const user = userEvent.setup();
+    const { api, accept } = fakeApi();
+    api.listApps = vi.fn(async () =>
+      accept("apps.list", { output: { apps: [app("com.example.zeta", "Zeta")] } }),
+    ) as never;
+    api.launchApp = vi.fn(async () =>
+      accept("apps.launch", {
+        status: "error",
+        output: null,
+        error: "device_offline",
+        message: "the management channel closed before the device answered",
+      }),
+    ) as never;
+
+    renderRoute(api);
+    const list = await screen.findByRole("list", { name: /installed apps/i });
+    await user.click(within(list).getByRole("button", { name: /launch zeta/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The launch was accepted, so it may have happened: never "did not do that".
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    // The inventory is read again rather than left as it was before the attempt.
+    await waitFor(() => expect(api.listApps).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps the refusal lead when the launch is refused before acceptance", async () => {
+    const user = userEvent.setup();
+    const { api, accept } = fakeApi();
+    api.listApps = vi.fn(async () =>
+      accept("apps.list", { output: { apps: [app("com.example.zeta", "Zeta")] } }),
+    ) as never;
+    api.launchApp = vi.fn(async () => {
+      throw new ApiError(403, "lease_read_only");
+    }) as never;
+
+    renderRoute(api);
+    const list = await screen.findByRole("list", { name: /installed apps/i });
+    await user.click(within(list).getByRole("button", { name: /launch zeta/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("lease_read_only");
+    // Nothing was dispatched, so this really is "did not do that".
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+    expect(api.listApps, "nothing landed, so the inventory is not re-read").toHaveBeenCalledTimes(
+      1,
+    );
+  });
+
   it("says an empty listing is empty, not that the device has no apps it cannot see", async () => {
     const { api, accept } = fakeApi();
     api.listApps = vi.fn(async () => accept("apps.list", { output: { apps: [] } })) as never;

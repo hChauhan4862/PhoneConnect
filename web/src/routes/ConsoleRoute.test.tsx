@@ -143,6 +143,29 @@ describe("the console route", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("device_offline");
+    // Nothing was dispatched, so the refusal lead is true.
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+  });
+
+  it("treats a terminal device_offline after acceptance as an unknown outcome", async () => {
+    const { api, accept } = fakeApi();
+    api.systemProperties = vi.fn(async () =>
+      accept("system.props", {
+        status: "error",
+        output: null,
+        error: "device_offline",
+        message: "the management channel closed before the device answered",
+      }),
+    );
+    renderRoute(api);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The read was accepted, so the device may have answered after the channel dropped.
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    expect(screen.queryByText("sdk")).not.toBeInTheDocument();
   });
 
   it("refuses an answer that is not a property map as invalid_result", async () => {

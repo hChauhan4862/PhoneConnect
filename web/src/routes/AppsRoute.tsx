@@ -18,7 +18,13 @@ import { AppList } from "../components/AppList";
 import { FailureNotice } from "../components/FailureNotice";
 import { RouteLink } from "../components/RouteLink";
 import { pollCommand } from "../data/commands";
-import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
+import {
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type FailureOutcome,
+} from "../data/failures";
 import { devicePath } from "../routing";
 
 export interface AppsRouteProps {
@@ -31,12 +37,12 @@ export interface AppsRouteProps {
 
 export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRouteProps) {
   const [apps, setApps] = useState<AppEntryView[] | null>(null);
-  const [listingFailure, setListingFailure] = useState<Failure | null>(null);
+  const [listingFailure, setListingFailure] = useState<FailureOutcome | null>(null);
   const [listingLoading, setListingLoading] = useState(true);
   const [reloadNonce, setReloadNonce] = useState(0);
 
   const [busy, setBusy] = useState(false);
-  const [actionFailure, setActionFailure] = useState<Failure | null>(null);
+  const [actionFailure, setActionFailure] = useState<FailureOutcome | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const mounted = useRef(true);
@@ -56,28 +62,42 @@ export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRoutePr
     setListingFailure(null);
     setListingLoading(true);
     (async () => {
+      let accepted: CommandAccepted;
       try {
-        const accepted = await api.listApps(deviceId, userId);
+        accepted = await api.listApps(deviceId, userId);
+      } catch (failure) {
+        // Nothing was dispatched: this listing really was refused.
+        if (!cancelled) {
+          setListingFailure(outcomeOf(failureOfError(failure), false));
+          setListingLoading(false);
+        }
+        return;
+      }
+      try {
         const command = await pollCommand(api, userId, accepted.command_id, {
           pollIntervalMs,
           isActive: () => !cancelled,
         });
         if (cancelled) return;
         if (command.status !== "ok") {
-          setListingFailure(failureOfCommand(command));
+          // Accepted, so a code that is not the device's answer leaves the listing unknown.
+          setListingFailure(outcomeOf(failureOfCommand(command), true));
           return;
         }
         const listing = readApps(command.output);
         if (!listing) {
-          setListingFailure({
-            code: "invalid_result",
-            message: "the device's answer is not an app listing",
-          });
+          setListingFailure(
+            unknownOutcome({
+              code: "invalid_result",
+              message: "the device's answer is not an app listing",
+            }),
+          );
           return;
         }
         setApps(listing);
       } catch (failure) {
-        if (!cancelled) setListingFailure(failureOfError(failure));
+        // Accepted, then the poll itself failed: the answer was lost, not refused.
+        if (!cancelled) setListingFailure(unknownOutcome(failureOfError(failure)));
       } finally {
         if (!cancelled) setListingLoading(false);
       }
@@ -91,41 +111,64 @@ export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRoutePr
 
   /// Dispatches one command and waits for the device's answer. A non-`ok` answer becomes the
   /// action's failure and `null` is returned, so no caller can mistake a refusal for success.
+  ///
+  /// Acceptance and the answer are separate facts. A refusal before the command is accepted is
+  /// the ordinary "the device did not do that"; an outcome after acceptance that may have reached
+  /// the device re-reads the inventory, so a change that landed cannot sit under a stale list.
   const run = useCallback(
     async (operation: () => Promise<CommandAccepted>): Promise<CommandView | null> => {
       setBusy(true);
       setActionFailure(null);
       setNotice(null);
       try {
-        const accepted = await operation();
-        const command = await pollCommand(api, userId, accepted.command_id, {
-          pollIntervalMs,
-          isActive: () => mounted.current,
-        });
-        if (!mounted.current) return null;
-        if (command.status !== "ok") {
-          setActionFailure(failureOfCommand(command));
+        let accepted: CommandAccepted;
+        try {
+          accepted = await operation();
+        } catch (failure) {
+          // Nothing was dispatched, so this is the ordinary refusal it looks like.
+          if (mounted.current) setActionFailure(outcomeOf(failureOfError(failure), false));
           return null;
         }
-        return command;
-      } catch (failure) {
-        if (mounted.current) setActionFailure(failureOfError(failure));
-        return null;
+        try {
+          const command = await pollCommand(api, userId, accepted.command_id, {
+            pollIntervalMs,
+            isActive: () => mounted.current,
+          });
+          if (!mounted.current) return null;
+          if (command.status !== "ok") {
+            const outcome = outcomeOf(failureOfCommand(command), true);
+            setActionFailure(outcome);
+            if (outcome.unknown) reload();
+            return null;
+          }
+          return command;
+        } catch (failure) {
+          // Accepted, then the poll failed: the answer was lost, never refused.
+          if (mounted.current) {
+            setActionFailure(unknownOutcome(failureOfError(failure)));
+            reload();
+          }
+          return null;
+        }
       } finally {
         if (mounted.current) setBusy(false);
       }
     },
-    [api, userId, pollIntervalMs],
+    [api, userId, pollIntervalMs, reload],
   );
 
   async function launch(app: AppEntryView): Promise<void> {
     const command = await run(() => api.launchApp(deviceId, userId, app.package));
     if (!command) return;
     if (!readLaunched(command.output)) {
-      setActionFailure({
-        code: "invalid_result",
-        message: "the device's answer does not confirm the app launch",
-      });
+      // The device answered `ok`, so it acted; its answer just cannot be read here.
+      setActionFailure(
+        unknownOutcome({
+          code: "invalid_result",
+          message: "the device's answer does not confirm the app launch",
+        }),
+      );
+      reload();
       return;
     }
     setNotice(`Asked Android to launch ${app.label}.`);
@@ -135,10 +178,13 @@ export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRoutePr
     const command = await run(() => api.stopApp(deviceId, userId, app.package));
     if (!command) return;
     if (!readKillRequested(command.output)) {
-      setActionFailure({
-        code: "invalid_result",
-        message: "the device's answer does not confirm the kill request",
-      });
+      setActionFailure(
+        unknownOutcome({
+          code: "invalid_result",
+          message: "the device's answer does not confirm the kill request",
+        }),
+      );
+      reload();
       return;
     }
     // Not "stopped": Android never confirms that a background process died.
@@ -164,7 +210,9 @@ export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRoutePr
           </button>
         </div>
 
-        {listingFailure ? <FailureNotice failure={listingFailure} /> : null}
+        {listingFailure ? (
+          <FailureNotice failure={listingFailure.failure} lead={listingFailure.lead} />
+        ) : null}
         {listingLoading && !listingFailure ? <p>Loading apps…</p> : null}
         {!listingLoading && !listingFailure && apps?.length === 0 ? (
           <p>The device reported no installed apps.</p>
@@ -179,7 +227,9 @@ export function AppsRoute({ api, deviceId, userId, pollIntervalMs }: AppsRoutePr
         ) : null}
       </section>
 
-      {actionFailure ? <FailureNotice failure={actionFailure} /> : null}
+      {actionFailure ? (
+        <FailureNotice failure={actionFailure.failure} lead={actionFailure.lead} />
+      ) : null}
       {notice ? (
         <p role="status" className="notice">
           {notice}

@@ -3,6 +3,11 @@
 /// The filter is the server's: an exact device id, and an unknown id is an empty answer, not
 /// another device's history. A failed read is an alert carrying its machine code — never an
 /// empty list that reads as "nothing happened". A refusal always shows the stored code.
+///
+/// The rows are not attribution and not proof of execution: the actor is the `user_id` the
+/// caller asserted with its token, which the server cannot verify until accounts land, and
+/// `accepted` means the command reached the device's channel, not that the device ran it. The
+/// page says both in visible text, because a table headed "Actor" reads as verified fact.
 
 import { useEffect, useState, type FormEvent } from "react";
 
@@ -71,6 +76,11 @@ export function AuditRoute({ api }: { api: ApiClient }) {
       <p className="muted">
         Every command attempt and revocation the server recorded. Newest first. Not live:
         refresh to read the newest rows.
+      </p>
+      <p role="note" className="caveat">
+        The actor is asserted by the token holder and is not verified by the server. An{" "}
+        <code>accepted</code> outcome means the command was delivered to the device&apos;s
+        channel, not that the device executed it.
       </p>
 
       <form onSubmit={applyFilter}>

@@ -89,6 +89,54 @@ describe("the command panel", () => {
     expect(screen.queryByTestId("command-output")).toBeNull();
     expect(document.querySelector('[data-status="ok"]')).toBeNull();
     expect(api.command, "the command was refused, so nothing is polled").not.toHaveBeenCalled();
+    // Nothing was dispatched, so the refusal lead is true and no unknown outcome is claimed.
+    expect(alert).toHaveTextContent(/did not do that/i);
+    expect(alert).not.toHaveTextContent(/may not have completed that/i);
+  });
+
+  it("treats a terminal device_offline after acceptance as an unknown outcome", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({
+      dispatchCommand: vi.fn(async () => ({ command_id: "cmd_1" })),
+      command: vi.fn(async () =>
+        commandView({
+          status: "error",
+          output: null,
+          error: "device_offline",
+          message: "the management channel closed before the device answered",
+        }),
+      ),
+    });
+
+    renderPanel(api);
+    await user.click(screen.getByRole("button", { name: /run command/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("device_offline");
+    // The command was accepted: the channel dropped, so the device may have run it.
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    expect(alert).toHaveTextContent(/management channel closed/i);
+    expect(screen.queryByTestId("command-output")).toBeNull();
+  });
+
+  it("treats a poll failure after acceptance as an unknown outcome", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({
+      dispatchCommand: vi.fn(async () => ({ command_id: "cmd_1" })),
+      command: vi.fn(async () => {
+        throw new ApiError(404, "command_unknown");
+      }),
+    });
+
+    renderPanel(api);
+    await user.click(screen.getByRole("button", { name: /run command/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("command_unknown");
+    expect(alert).toHaveTextContent(/may not have completed that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
+    expect(document.querySelector('[data-status="ok"]')).toBeNull();
   });
 
   it("never renders a pending command as success", async () => {
@@ -126,7 +174,7 @@ describe("the command panel", () => {
       },
       {
         view: commandView({ status: "timeout" }),
-        pattern: /timed out/i,
+        pattern: /did not answer before the deadline/i,
       },
     ];
 

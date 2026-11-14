@@ -12,11 +12,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { ApiClient } from "../api";
+import type { ApiClient, CommandAccepted } from "../api";
 import { FailureNotice } from "../components/FailureNotice";
 import { RouteLink } from "../components/RouteLink";
 import { pollCommand } from "../data/commands";
-import { failureOfCommand, failureOfError, type Failure } from "../data/failures";
+import {
+  failureOfCommand,
+  failureOfError,
+  outcomeOf,
+  unknownOutcome,
+  type FailureOutcome,
+} from "../data/failures";
 import { devicePath } from "../routing";
 
 /// The device's own constant refusals, so the disabled controls and the command cannot drift.
@@ -38,7 +44,7 @@ export interface ConsoleRouteProps {
 
 export function ConsoleRoute({ api, deviceId, userId, pollIntervalMs }: ConsoleRouteProps) {
   const [selected, setSelected] = useState<Record<string, string | null> | null>(null);
-  const [failure, setFailure] = useState<Failure | null>(null);
+  const [failure, setFailure] = useState<FailureOutcome | null>(null);
   const [loading, setLoading] = useState(true);
   const [reloadNonce, setReloadNonce] = useState(0);
 
@@ -56,28 +62,43 @@ export function ConsoleRoute({ api, deviceId, userId, pollIntervalMs }: ConsoleR
     setFailure(null);
     setLoading(true);
     (async () => {
+      let accepted: CommandAccepted;
       try {
-        const accepted = await api.systemProperties(deviceId, userId);
+        accepted = await api.systemProperties(deviceId, userId);
+      } catch (error) {
+        // Nothing was dispatched: this read really was refused.
+        if (!cancelled) {
+          setFailure(outcomeOf(failureOfError(error), false));
+          setLoading(false);
+        }
+        return;
+      }
+      try {
         const command = await pollCommand(api, userId, accepted.command_id, {
           pollIntervalMs,
           isActive: () => !cancelled,
         });
         if (cancelled) return;
         if (command.status !== "ok") {
-          setFailure(failureOfCommand(command));
+          // Accepted, so a code that is not the device's answer leaves the read unknown.
+          setFailure(outcomeOf(failureOfCommand(command), true));
           return;
         }
         const properties = readSelected(command.output);
         if (!properties) {
-          setFailure({
-            code: "invalid_result",
-            message: "the device's answer is not a property map",
-          });
+          // The device answered `ok`, so it read something; its answer just cannot be read.
+          setFailure(
+            unknownOutcome({
+              code: "invalid_result",
+              message: "the device's answer is not a property map",
+            }),
+          );
           return;
         }
         setSelected(properties);
       } catch (error) {
-        if (!cancelled) setFailure(failureOfError(error));
+        // Accepted, then the poll failed: the answer was lost, never refused.
+        if (!cancelled) setFailure(unknownOutcome(failureOfError(error)));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -108,7 +129,9 @@ export function ConsoleRoute({ api, deviceId, userId, pollIntervalMs }: ConsoleR
           </button>
         </div>
 
-        {failure ? <FailureNotice failure={failure} /> : null}
+        {failure ? (
+          <FailureNotice failure={failure.failure} lead={failure.lead} />
+        ) : null}
         {loading && !failure ? <p>Loading system properties…</p> : null}
         {!loading && !failure && selected && Object.keys(selected).length === 0 ? (
           <p>The device reported no system properties.</p>

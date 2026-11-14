@@ -119,7 +119,10 @@ emulator, by a unit test only, or not at all.
   them against a live device in a real desktop browser. The audit screen
   (newest-first rows, a server-side device filter, and explicit empty and error states) is
   covered by Vitest only; it was not driven against a live server in a browser. There is no
-  server-to-client push, so every screen renders the snapshot it last read.
+  server-to-client push, so every screen renders the snapshot it last read. The audit page
+  says in visible text what its rows can and cannot mean: the actor is asserted by the token
+  holder and is not verified by the server. An `accepted` outcome means the command was
+  delivered to the device's channel, not that the device executed it.
 - **Native shell.** Builds on macOS and runs its headless `--print-context` path. The GUI path
   was not exercised here.
 
@@ -140,7 +143,10 @@ not assume.
 - **Agent OTA.** No self-update, no signed manifest, and no release channel.
 - **Accounts, login, and MFA.** Access uses the admin bearer token, so control leases constrain
   an already accepted user but are not an authorization boundary. There are no device
-  assignments or per-user visibility.
+  assignments or per-user visibility. The audit log inherits that gap and cannot close it: the
+  actor is asserted by the token holder and is not verified by the server. An `accepted`
+  outcome means the command was delivered to the device's channel, not that the device
+  executed it.
 - **The Android TCP proxy bridge.** The native shell's loopback proxy has no Android peer, so it
   reaches no phone. No screen creates a session until local login and MFA land.
 - **Direct hole-punched paths on Android.** The Rust transport implements and tests them; the
