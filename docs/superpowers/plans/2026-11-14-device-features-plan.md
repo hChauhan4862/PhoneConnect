@@ -147,11 +147,29 @@ size cap), then Android (including the setup-screen consent action), server, web
 - Create: `android/.../control/ControlHandler.kt` + test, `server/src/controls.rs`, `web/src/components/ControlPanel.tsx` + test
 - Modify: `CommandDispatcher.kt`, `server/src/lib.rs`, `web/src/api.ts`, `web/src/routes/DeviceStatusRoute.tsx`
 
-**Interfaces:**
-- `control.get {}` → `{brightness,volume_music,rotation,dnd,dark_mode,wifi,bluetooth,mobile_data,battery_saver}` with `null` for anything the app cannot read.
-- `control.set {key,value}` and `control.reboot {mode:"system"|"recovery"}`. Each key maps to a documented platform API; keys the app cannot change return `error: not_permitted` rather than silently doing nothing. Reboot requires `can_control` and is confirmed in the UI.
+**Ruling — same honesty rule as Task 4.** An ordinary app can read most of these and change
+only some. Each key reports what the platform actually allows, with the reason, and never a
+silent no-op.
 
-Steps: tests first (per-key mapping, not_permitted, reboot confirmation), then Android, server, web, verify, commit.
+**Interfaces:**
+- `control.get {}` → `{brightness, brightness_mode, volume_music, volume_max, rotation,
+  dnd_filter, night_mode, wifi_enabled, bluetooth_enabled, mobile_data_enabled,
+  battery_saver, battery_percent}` — each `null` when the platform refuses the read, and a
+  companion `unavailable: {key: reason}` map so the UI can say *why* rather than implying zero.
+- `control.set {key,value}`:
+  - `brightness` — real on API 23+ only with the user-granted `WRITE_SETTINGS`; without it
+    `not_permitted: write_settings_required`, with a setup-screen action to request it.
+  - `volume_music` — real via `AudioManager.setStreamVolume` (no permission).
+  - `dnd_filter` — real only with user-granted notification-policy access
+    (`ACCESS_NOTIFICATION_POLICY`); otherwise `not_permitted: policy_access_required`.
+  - `wifi`, `bluetooth`, `mobile_data`, `night_mode`, `rotation` — `not_permitted` with a
+    constant reason (platform removed or signature-gated the setter), documented in
+    `android/README.md` and rendered unavailable-with-reason.
+- `control.reboot` → constant `not_permitted: reboot_requires_privilege` (REBOOT is
+  signature-level; a device-owner build could add it later). It exists so callers get a
+  machine code, and the UI shows it as unavailable.
+
+Steps: tests first (per-key mapping, each refusal code, grant-gated paths, no silent success), then Android (including the two setup-screen grant actions), server, web, verify, commit.
 
 ### Task 6: Command audit surface and web polish
 
