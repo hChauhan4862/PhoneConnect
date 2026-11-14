@@ -127,6 +127,7 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
     controlReadings: vi.fn(async () => ({ command_id: "cmd_1" })),
     setControl: vi.fn(async () => ({ command_id: "cmd_1" })),
     rebootDevice: vi.fn(async () => ({ command_id: "cmd_1" })),
+    listAudit: vi.fn(async () => []),
     command: vi.fn(async () => ({
       command_id: "cmd_1",
       device_id: "dev_1",
@@ -664,6 +665,32 @@ describe("the screen and console routes", () => {
     expect(
       screen.getByRole("link", { name: /system properties and console/i }),
     ).toHaveAttribute("href", "/devices/dev_1/console");
+  });
+});
+
+describe("the audit route", () => {
+  it("renders the audit log at /audit", async () => {
+    installHost("browser");
+    const api = createFakeApi(statusFixture());
+    renderApp(api, "/audit");
+
+    expect(
+      await screen.findByRole("heading", { name: /^audit log$/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /^devices$/i })).toHaveAttribute(
+      "href",
+      "/",
+    );
+    expect(api.listAudit).toHaveBeenCalled();
+  });
+
+  it("links to the audit log from the shell", async () => {
+    installHost("browser");
+    renderApp(createFakeApi(statusFixture()));
+
+    expect(
+      await screen.findByRole("link", { name: /audit log/i }),
+    ).toHaveAttribute("href", "/audit");
   });
 });
 

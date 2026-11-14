@@ -12,6 +12,7 @@ export type Route =
   | { name: "apps"; deviceId: string }
   | { name: "screen"; deviceId: string }
   | { name: "console"; deviceId: string }
+  | { name: "audit" }
   | { name: "unknown"; path: string };
 
 export function devicePath(deviceId: string): string {
@@ -42,6 +43,10 @@ export function consolePath(deviceId: string): string {
   return `${devicePath(deviceId)}/console`;
 }
 
+export function auditPath(): string {
+  return "/audit";
+}
+
 function decodeSegment(segment: string): string | null {
   try {
     return decodeURIComponent(segment);
@@ -53,6 +58,7 @@ function decodeSegment(segment: string): string | null {
 export function matchRoute(pathname: string): Route {
   const segments = pathname.split("/").filter((segment) => segment.length > 0);
   if (segments.length === 0) return { name: "devices" };
+  if (segments.length === 1 && segments[0] === "audit") return { name: "audit" };
   if (segments[0] !== "devices") return { name: "unknown", path: pathname };
   if (segments.length === 1) return { name: "devices" };
 

@@ -231,6 +231,18 @@ export interface ControlSetOutput {
   mode_changed?: boolean;
 }
 
+/// One durable audit row: who attempted what, on which device, and how it ended. It carries
+/// identity, the action, the outcome, and a machine error code only — never a command
+/// argument, a file path, a file byte, or an image.
+export interface AuditEntryView {
+  at_ms: number;
+  actor: string;
+  action: string;
+  device_id: string;
+  outcome: "accepted" | "refused";
+  error: string | null;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -265,6 +277,9 @@ export interface ApiClient {
     timeoutMs?: number | null,
   ): Promise<CommandAccepted>;
   command(commandId: string, userId: string): Promise<CommandView>;
+  /// The durable audit log, newest first. The device filter is the server's exact match: an
+  /// unknown device is an empty list, never another device's rows.
+  listAudit(query?: { deviceId?: string; limit?: number }): Promise<AuditEntryView[]>;
   /// The file commands. Each returns the accepted command id, which is polled like any other
   /// command: the device's own answer is the only result, and no content is stored here.
   listFiles(deviceId: string, userId: string, path: string): Promise<CommandAccepted>;
@@ -426,6 +441,16 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
         "GET",
         `/api/commands/${encodeURIComponent(commandId)}?user_id=${encodeURIComponent(userId)}`,
       ),
+    listAudit: (query) => {
+      const params = new URLSearchParams();
+      if (query?.deviceId) params.set("device_id", query.deviceId);
+      if (query?.limit !== undefined) params.set("limit", String(query.limit));
+      const search = params.toString();
+      return request<AuditEntryView[]>(
+        "GET",
+        search.length > 0 ? `/api/audit?${search}` : "/api/audit",
+      );
+    },
     listFiles: (deviceId, userId, path) =>
       filesRequest(deviceId, userId, "list", { path }),
     readFile: (deviceId, userId, path, offset) =>

@@ -9,6 +9,8 @@
   --muted: #5f6673;
   --error-bg: #fdecec;
   --error-border: #e4a3a3;
+  --ok-text: #1a6b3c;
+  --error-text: #9b2c2c;
 }
 
 body {
@@ -180,6 +182,36 @@ form {
   overflow-wrap: anywhere;
 }
 
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.audit-table th,
+.audit-table td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.audit-table code {
+  overflow-wrap: anywhere;
+}
+
+.outcome {
+  font-weight: 600;
+}
+
+.outcome-accepted {
+  color: var(--ok-text);
+}
+
+.outcome-refused {
+  color: var(--error-text);
+}
+
 .muted {
   color: var(--muted);
 }
@@ -205,5 +237,7 @@ nav {
     --muted: #a5acb8;
     --error-bg: #3a1f1f;
     --error-border: #7a3b3b;
+    --ok-text: #7ad39b;
+    --error-text: #f0a0a0;
   }
 }

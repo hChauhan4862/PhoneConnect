@@ -8,6 +8,7 @@ import { useCallback, useMemo, useState } from "react";
 import { createHttpApi, type ApiClient } from "./api";
 import { AccessGateRoute } from "./routes/AccessGateRoute";
 import { AppsRoute } from "./routes/AppsRoute";
+import { AuditRoute } from "./routes/AuditRoute";
 import { CommandsRoute } from "./routes/CommandsRoute";
 import { ConsoleRoute } from "./routes/ConsoleRoute";
 import { DeviceListRoute } from "./routes/DeviceListRoute";
@@ -16,9 +17,10 @@ import { FilesRoute } from "./routes/FilesRoute";
 import { ScreenRoute } from "./routes/ScreenRoute";
 import { TelemetryRoute } from "./routes/TelemetryRoute";
 import { NotFoundRoute } from "./routes/NotFoundRoute";
+import { RouteLink } from "./components/RouteLink";
 import { createHostAdapter, HostAdapterContext } from "./host/HostAdapter";
 import { readHostContext } from "./host/hostContext";
-import { useRoute } from "./routing";
+import { auditPath, useRoute } from "./routing";
 import {
   clearSession,
   readSession,
@@ -90,6 +92,7 @@ function AuthenticatedShell({
       <header className="shell-header">
         <strong>PhoneConnect</strong>
         <span className="muted">{session.userId}</span>
+        <RouteLink to={auditPath()}>Audit log</RouteLink>
         <button type="button" onClick={onSignOut}>
           Sign out
         </button>
@@ -127,6 +130,7 @@ function AuthenticatedShell({
       {route.name === "console" ? (
         <ConsoleRoute api={api} deviceId={route.deviceId} userId={session.userId} />
       ) : null}
+      {route.name === "audit" ? <AuditRoute api={api} /> : null}
       {route.name === "devices" ? (
         <DeviceListRoute api={api} userId={session.userId} />
       ) : null}

@@ -19,3 +19,8 @@ export function formatTime(timestampMs: number | null): string {
   if (timestampMs === null) return "not reported";
   return new Date(timestampMs).toLocaleTimeString();
 }
+
+/// A full date and time. An audit row is read days later, so the time alone is not enough.
+export function formatDateTime(timestampMs: number): string {
+  return new Date(timestampMs).toLocaleString();
+}
