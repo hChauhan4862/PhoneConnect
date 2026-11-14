@@ -22,12 +22,16 @@ This is the foundation milestone, not a finished product.
 - Each enrolled device keeps a second, authenticated management connection to the server
   carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, the
   `files.*` commands, the `apps.*` commands, `screen.snapshot` (one frame, only with the
-  `MediaProjection` consent the user granted on the setup screen), and `system.props` (a
-  documented allowlist) work end to end from the one web UI. An ordinary app cannot hold the
-  signature-level permissions `apps.clear` and `apps.set_enabled` need, cannot run `adb shell`,
-  and cannot read logcat (`READ_LOGS` is signature-level), so those are explicit refusals with
-  a machine code and a stated reason, documented and rendered as unavailable. The sealed peer
-  relay is unchanged and the server still cannot read it.
+  `MediaProjection` consent the user granted on the setup screen), `system.props` (a
+  documented allowlist), and the `control.*` commands work end to end from the one web UI.
+  Device control reports every reading it can produce and changes three keys — screen
+  brightness (with the user-granted `WRITE_SETTINGS`), music volume, and the Do Not Disturb
+  filter (with notification-policy access) — while Wi-Fi, Bluetooth, mobile data, night mode,
+  rotation, and a reboot are explicit `not_permitted` refusals with a machine reason. An
+  ordinary app cannot hold the signature-level permissions `apps.clear` and
+  `apps.set_enabled` need, cannot run `adb shell`, and cannot read logcat (`READ_LOGS` is
+  signature-level), so those are explicit refusals too — documented and rendered as
+  unavailable. The sealed peer relay is unchanged and the server still cannot read it.
 - Direct hole-punched paths are implemented and tested in the transport, but both shipped
   clients use the relay. Production connectivity is relay-only.
 - Telemetry aggregates are bounded and kept in memory.
@@ -80,10 +84,12 @@ The component READMEs are the source of truth for what does and does not work:
 
 - `android/README.md` — no direct-path port, no ticket-signature verification, and a small
   management vocabulary (`device.info`, `device.ping`, `telemetry.now`, the `files.*` commands
-  inside one app-private directory, the `apps.*` commands, one-frame `screen.snapshot`, and the
-  `system.props` allowlist). Package listing depends on `QUERY_ALL_PACKAGES`; a background
-  activity start is usually blocked (`launch_blocked`); `apps.clear`/`apps.set_enabled`,
-  `shell.exec`, and `logcat.tail` are refused because an installed app cannot hold the
+  inside one app-private directory, the `apps.*` commands, one-frame `screen.snapshot`, the
+  `system.props` allowlist, and the `control.*` commands that change only brightness, music
+  volume, and the Do Not Disturb filter). Package listing depends on `QUERY_ALL_PACKAGES`; a
+  background activity start is usually blocked (`launch_blocked`); `apps.clear`/
+  `apps.set_enabled`, `shell.exec`, `logcat.tail`, the Wi-Fi/Bluetooth/mobile-data/night-mode/
+  rotation setters, and `control.reboot` are refused because an installed app cannot hold the
   signature-level permissions or the ADB/root UID. Screen *mirroring*, input injection, audio,
   and continuous capture are not implemented, and the phone is not remotely controllable.
 - `native/README.md` — there is no Android-side TCP bridge, so the loopback proxy does not

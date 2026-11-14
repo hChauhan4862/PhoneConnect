@@ -12,7 +12,10 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 1. **Setup.** `SetupActivity` takes the hub URL and a one-time enrollment token, requests
    `POST_NOTIFICATIONS`, generates an X25519 identity, calls `POST /api/devices/enroll`, and
    stores the credential and private key sealed by the Android Keystore. It then starts the
-   service. The screen also shows the enrollment state and what to do after a stop.
+   service. The screen also shows the enrollment state and what to do after a stop, plus the
+   two optional grants device control uses ("Allow brightness changes" opens
+   `ACTION_MANAGE_WRITE_SETTINGS` for this package, "Allow Do Not Disturb changes" opens
+   `ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS`) and what Android currently reports for each.
 2. **Session discovery.** A user or client authorizes a session for this device
    (`POST /api/sessions`); the device credential reads it from
    `GET /api/devices/{id}/sessions/next` with a device-role ticket. The device never creates
@@ -117,6 +120,53 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
     restriction: a shell needs the ADB/root UID, and `READ_LOGS` is signature-level. They exist
     so a caller receives a machine code instead of `unknown_command`; the web console renders
     both as unavailable-with-reason, never as controls that fail silently.
+11. **Device control.** `control.get` reports one reading per key: screen `brightness`, the
+    `brightness_mode`, `volume_music` and its stream `volume_max`, `rotation` (the auto-rotate
+    setting, 0 off / 1 on), the Do Not Disturb `dnd_filter`, `night_mode`, `wifi_enabled`,
+    `bluetooth_enabled`, `mobile_data_enabled`, `battery_saver`, and `battery_percent`. A value
+    the platform will not read is `null` — never a fabricated 0 — and `unavailable` maps the
+    key to a constant machine reason (`platform_read_failed` for a throwing read or a setting
+    the device does not keep, `no_bluetooth_adapter`, `no_telephony_data`,
+    `battery_not_reported`). A read can never throw out of the handler and never becomes an
+    `internal_error` carrying platform text.
+
+    `control.set` changes three keys and refuses the rest. Every refusal is `not_permitted`
+    with the reason as its message, and every reason is a stable token:
+
+    | Key | Result |
+    | --- | --- |
+    | `brightness` (0–255) | real, through `Settings.System.SCREEN_BRIGHTNESS`, only with the user-granted `WRITE_SETTINGS`; otherwise `not_permitted` / `write_settings_required` |
+    | `volume_music` (0 to the reported `volume_max`) | real, `AudioManager.setStreamVolume` on `STREAM_MUSIC`; no permission. A change that would toggle Do Not Disturb is `not_permitted` / `policy_access_required` |
+    | `dnd_filter` (1 All, 2 Priority, 3 None, 4 Alarms) | real, `NotificationManager.setInterruptionFilter`, only with notification-policy access; otherwise `not_permitted` / `policy_access_required` |
+    | `wifi` | `not_permitted` / `wifi_setter_removed` — `WifiManager.setWifiEnabled` returns false for an app targeting Android 10+ |
+    | `bluetooth` | `not_permitted` / `bluetooth_setter_removed` — `BluetoothAdapter.enable` is a no-op for an app targeting Android 13+ |
+    | `mobile_data` | `not_permitted` / `mobile_data_setter_signature_gated` — `TelephonyManager.setDataEnabled` needs `MODIFY_PHONE_STATE` |
+    | `night_mode` | `not_permitted` / `night_mode_setter_signature_gated` — `UiModeManager.setNightMode` needs `MODIFY_DAY_NIGHT_MODE` |
+    | `rotation` | `not_permitted` / `rotation_requires_system_ui` — the rotation lock belongs to the system UI; an installed app has no setter for it |
+
+    `control.reboot` is always `not_permitted` / `reboot_requires_privilege`: `REBOOT` is
+    signature-level, and a device-owner build could add it later. It exists so a caller gets a
+    machine code instead of `unknown_command`; there is no reboot path that cannot work.
+
+    Values are validated before the platform is touched: a brightness outside 0–255, a volume
+    outside 0 to the reported max, a filter outside 1–4, or a value of the wrong type is
+    `invalid_args`; a key this build does not implement is `invalid_args` too. A key Android has
+    no setter for is `not_permitted` whatever value it is given — the refusal is about the
+    platform, not the value. A write is confirmed by reading the value back: if the settings
+    provider accepted the brightness but the setting did not stick, the audio service accepted
+    the volume but the stream reports another index, or the interruption filter did not change,
+    the answer is `not_applied` (`brightness_not_applied`, `volume_not_applied`,
+    `dnd_not_applied`), never `ok`. A volume whose stream max cannot be read is
+    `platform_read_failed` with `volume_max_unreadable`. `control.get` names every refused key
+    in `unavailable` — including `reboot` — so the web panel renders a disabled control with
+    the reason as visible text.
+
+    Both grants are given in Android's own settings, never by this app: the setup screen opens
+    them and reports what Android says. `WRITE_SETTINGS` and `ACCESS_NOTIFICATION_POLICY` are
+    declared for that; neither grants the signature-level authority Wi-Fi, Bluetooth, mobile
+    data, night mode, rotation, or a reboot would need. Nothing here is a silent no-op, and
+    there is still one foreground service and one notification: control reads and writes run
+    inside the same service.
 
 ## Layout
 
@@ -151,6 +201,8 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `control/ScreenTeardown.kt` | The one process-wide worker every capture's teardown runs on, shut down by the service's `onDestroy`. |
 | `control/SystemPropsHandler.kt` | `system.props`: the allowlist and the reflective `android.os.SystemProperties` reader. |
 | `control/ShellHandler.kt` / `control/LogcatHandler.kt` | The two constant `not_permitted` refusals that name the platform restriction. |
+| `control/ControlHandler.kt` | The three `control.*` commands, the `ControlPlatform` contract, the reading/reason vocabulary, and the validate-then-read-back rules. |
+| `control/AndroidControlPlatform.kt` | The only `ControlPlatform`: the settings, audio, notification, UI-mode, Wi-Fi, Bluetooth, telephony, power, and battery services, with a constant reason for everything they refuse. |
 | `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
 | `RecoveryReceiver.kt` | Boot and post-update recovery with `goAsync`, refusing gracefully when the OS refuses. |
 | `AgentSettings.kt` / `AgentDiagnostics.kt` | Hub URL and the last background-start refusal. |
@@ -243,12 +295,15 @@ still stop the agent. The notification and setup screen say so and show recovery
   not checked; TLS authenticity to the hub is the trust anchor, exactly as the Rust transport
   documents for trust-on-first-use. Porting Ed25519 verification is follow-up work.
 - **The management vocabulary is small.** `device.info`, `device.ping`, `telemetry.now`, the
-  `files.*` commands, the `apps.*` commands, `screen.snapshot`, `system.props`, and the two
-  documented refusals (`shell.exec`, `logcat.tail`) are implemented; toggles are a follow-up
-  task that adds handler files to the same dispatcher. File transfers stay inside the app's
-  own external files directory: shared storage at large needs a scoped-storage design of its
-  own and is not offered. CPU percentage is reported as `null`: Android does not expose per-app
-  CPU counters to an ordinary app.
+  `files.*` commands, the `apps.*` commands, `screen.snapshot`, `system.props`, the
+  `control.*` commands, and the three documented refusals (`shell.exec`, `logcat.tail`,
+  `control.reboot`) are implemented; another feature adds a handler file and a branch to the
+  same dispatcher. Device control changes three keys (brightness with `WRITE_SETTINGS`, music
+  volume, and the Do Not Disturb filter with policy access) and refuses the rest; Wi-Fi,
+  Bluetooth, mobile data, night mode, and the rotation lock stay with the system UI. File
+  transfers stay inside the app's own external files directory: shared storage at large needs
+  a scoped-storage design of its own and is not offered. CPU percentage is reported as `null`:
+  Android does not expose per-app CPU counters to an ordinary app.
 - **Screen capture is one frame, not a stream.** There is no mirroring, no continuous encoder,
   and no input injection. A capture needs the grant the user made from the setup screen; the
   grant does not survive a process restart, and the setup screen says so.

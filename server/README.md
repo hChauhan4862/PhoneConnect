@@ -73,6 +73,9 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `POST` | `/api/devices/{id}/console/props?user_id=` | admin | Forwards `system.props`; body is `{}` or `{keys:[...]}` (at most 32 names of at most 64 bytes). The device reports its documented allowlist and answers `not_permitted` for a name outside it; a platform reader failure is `props_unavailable`. |
 | `POST` | `/api/devices/{id}/console/shell?user_id=` | admin | Forwards `shell.exec`; the body must be an object or `null`. The device always answers `not_permitted`: a shell needs the ADB/root UID. |
 | `POST` | `/api/devices/{id}/console/logcat?user_id=` | admin | Forwards `logcat.tail`; the body must be an object or `null`. The device always answers `not_permitted`: `READ_LOGS` is signature-level. |
+| `POST` | `/api/devices/{id}/control/get?user_id=` | admin | Forwards `control.get` with no arguments; the body must be an object or `null`. The device reports each reading or `null` plus its constant reason in `unavailable`, and names every key it refuses to change. |
+| `POST` | `/api/devices/{id}/control/set?user_id=` | admin | Forwards `control.set`; body is `{key, value}` where `value` is an integer or a boolean (at most 32 bytes of key; no NUL). The device owns the ranges and answers `invalid_args`, `not_permitted` with a machine reason, or `not_applied`; a `not_permitted` message is the reason token, kept verbatim. |
+| `POST` | `/api/devices/{id}/control/reboot?user_id=` | admin | Forwards `control.reboot`; the body must be an object or `null`. The device always answers `not_permitted` / `reboot_requires_privilege`: `REBOOT` is signature-level. |
 
 The file routes are commands with a typed front door: the same authorization, capacity,
 deadline, and audit row as `POST /commands`, and the same refusals (`403 lease_read_only`,
@@ -102,6 +105,23 @@ The screen and console routes are the same pattern, and the honest half of this 
   `not_permitted` (with its reason) instead of `unknown_command`. Neither can succeed for an
   ordinary installed app, and the server never fabricates output for them. There is no
   streaming endpoint: one answer per accepted command.
+
+The control routes follow the same pattern and keep the same honesty:
+
+- `control/get` forwards `{}` and passes the device's reading map through untouched. A reading
+  the platform refuses is `null` with a reason in `unavailable`; the server never fills a
+  missing value in.
+- `control/set` checks only what it could not forward — a missing, non-string, blank,
+  NUL-containing, or over-32-byte key, or a value that is neither an integer nor a boolean
+  (`400 invalid_request`) — and forwards `{key, value}` verbatim. The device decides the range
+  (`invalid_args`), whether a grant is missing (`not_permitted` with `write_settings_required`
+  or `policy_access_required`), and whether a write stuck (`not_applied`). Every code and
+  reason message arrives verbatim.
+- `control/reboot` is forwarded so the device's constant `not_permitted` /
+  `reboot_requires_privilege` reaches the caller instead of `unknown_command`. The server has no
+  reboot path of its own.
+- Nothing about a reading or a control value is persisted: the bounded in-memory command record
+  keeps the device's answer and nothing else.
 | `GET` | `/` and any non-API route | none | The built web app, with SPA fallback for its routes. |
 
 An unknown `/api/...` path is always a JSON 404 (`api_not_found`); it never returns the SPA
