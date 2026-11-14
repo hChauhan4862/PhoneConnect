@@ -23,6 +23,7 @@ import com.phoneconnect.agent.control.LogcatHandler
 import com.phoneconnect.agent.control.MediaProjectionScreenCapture
 import com.phoneconnect.agent.control.PathGuard
 import com.phoneconnect.agent.control.ScreenCapture
+import com.phoneconnect.agent.control.ScreenTeardown
 import com.phoneconnect.agent.control.ScreenHandler
 import com.phoneconnect.agent.control.ShellHandler
 import com.phoneconnect.agent.control.SystemPropertiesHandler
@@ -167,6 +168,8 @@ open class ConnectionService : Service() {
         // declared the type it runs under.
         screenCapture.release()
         captureEnded()
+        // The teardown worker is process-wide; the service that queued its work shuts it down.
+        ScreenTeardown.dispose()
         serviceScope.cancel()
         // A terminal status is deliberately left visible after the service stops.
         if (!detachedStatus) {

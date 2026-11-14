@@ -23,7 +23,7 @@ internal class MirrorFrame(val bitmap: Bitmap, val capturedAtMs: Long)
  * produced — never a size assumed from the current display metrics.
  */
 internal interface ScreenMirror {
-    /** The surface size this mirror was created with. */
+    /** The surface size the mirror is currently capturing. */
     val width: Int
     val height: Int
 
@@ -33,6 +33,13 @@ internal interface ScreenMirror {
     /** A copy of the newest frame, or `null` while none has arrived. */
     fun newestFrame(): MirrorFrame?
 
+    /**
+     * Captures [screen] instead of the current size: a new reader at that size becomes the
+     * display's surface and the existing display is resized. False when the platform refuses,
+     * in which case the mirror is unusable and the caller retires the grant.
+     */
+    fun resize(screen: ScreenMetrics): Boolean
+
     /** Releases the display, the reader, the frame thread, and the cached frame. */
     fun close()
 }
@@ -40,15 +47,18 @@ internal interface ScreenMirror {
 /**
  * The projection a capture draws from, so the lifecycle is testable without a real
  * `MediaProjection`.
- *
- * [onEnded] is invoked when the projection ends without the app asking (the user stopped
- * sharing, the screen was locked, or the system ended the session).
  */
 internal interface MirrorSource {
     fun open(screen: ScreenMetrics): ScreenMirror
 
     /** Ends the projection, if it is still alive. Idempotent. */
     fun stop()
+
+    /** Called when the projection ends without the app asking (the user stopped sharing, …). */
+    fun onEnded(listener: () -> Unit)
+
+    /** Called when the captured content changes size (Android 14+, `onCapturedContentResize`). */
+    fun onContentResized(listener: (width: Int, height: Int) -> Unit)
 }
 
 /**
@@ -58,19 +68,55 @@ internal interface MirrorSource {
  * frame the platform delivers while `createVirtualDisplay` is still running is kept rather than
  * being treated as stale. The copy uses the image's own dimensions, so a display at a previous
  * size or orientation can never produce a negative row padding or a silently cropped frame.
+ *
+ * A size change keeps the grant: a token cannot create a second display, but the one it already
+ * owns can be resized ([VirtualDisplay.resize]) and pointed at a new surface
+ * ([VirtualDisplay.setSurface]). That is what [resize] does.
  */
 internal class MediaProjectionMirror(
     private val projection: MediaProjection,
-    override val width: Int,
-    override val height: Int,
-    private val densityDpi: Int,
+    initial: ScreenMetrics,
     private val clock: () -> Long = System::currentTimeMillis,
 ) : ScreenMirror {
     private val lock = Any()
-    private val frames: ImageReader =
-        ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, MAX_IMAGES)
     private val thread = HandlerThread(FRAME_THREAD_NAME).also { it.start() }
 
+    @Volatile
+    override var width: Int = initial.widthPixels
+        private set
+
+    @Volatile
+    override var height: Int = initial.heightPixels
+        private set
+
+    @Volatile
+    private var densityDpi: Int = initial.densityDpi
+
+    private val frameListener = ImageReader.OnImageAvailableListener { reader ->
+        val next = try {
+            reader.acquireLatestImage()
+        } catch (_: RuntimeException) {
+            null
+        } ?: return@OnImageAvailableListener
+        var previous: Image? = null
+        val stale = synchronized(lock) {
+            if (!open || frames !== reader) {
+                true
+            } else {
+                previous = latest
+                latest = next
+                latestAtMs = clock()
+                false
+            }
+        }
+        if (stale) {
+            next.close()
+        } else {
+            previous?.close()
+        }
+    }
+
+    private var frames: ImageReader = newReader(initial)
     private var display: VirtualDisplay? = null
     private var latest: Image? = null
     private var latestAtMs: Long = 0L
@@ -83,7 +129,6 @@ internal class MediaProjectionMirror(
     fun start(): ScreenMirror {
         // The listener exists before the display does, so a frame delivered while
         // `createVirtualDisplay` is still running is cached rather than treated as stale.
-        frames.setOnImageAvailableListener(frameListener, Handler(thread.looper))
         val created = try {
             projection.createVirtualDisplay(
                 VIRTUAL_DISPLAY_NAME,
@@ -107,7 +152,54 @@ internal class MediaProjectionMirror(
         return this
     }
 
+    override fun resize(screen: ScreenMetrics): Boolean {
+        if (screen.widthPixels == width &&
+            screen.heightPixels == height &&
+            screen.densityDpi == densityDpi
+        ) {
+            return true
+        }
+        val surface = synchronized(lock) { if (open) display else null } ?: return false
+        val replacement = try {
+            newReader(screen)
+        } catch (_: RuntimeException) {
+            return false
+        }
+        // The new reader becomes the one whose frames are kept before the display is pointed at
+        // it: a frame arriving right after `setSurface` must not be dropped as stale.
+        val previous = synchronized(lock) {
+            val held = frames
+            frames = replacement
+            held
+        }
+        try {
+            surface.setSurface(replacement.surface)
+            surface.resize(screen.widthPixels, screen.heightPixels, screen.densityDpi)
+        } catch (_: RuntimeException) {
+            // The display may already point at the replacement surface, so this mirror cannot be
+            // trusted; the caller retires the grant and closes everything.
+            synchronized(lock) { if (frames === replacement) frames = previous }
+            replacement.setOnImageAvailableListener(null, null)
+            replacement.close()
+            return false
+        }
+        val cached = synchronized(lock) {
+            width = screen.widthPixels
+            height = screen.heightPixels
+            densityDpi = screen.densityDpi
+            val held = latest
+            latest = null
+            latestAtMs = 0
+            held
+        }
+        cached?.close()
+        previous.setOnImageAvailableListener(null, null)
+        previous.close()
+        return true
+    }
+
     override fun newestFrame(): MirrorFrame? = synchronized(lock) {
+        if (!open) return null
         val image = latest ?: return null
         MirrorFrame(image.toBitmap(), latestAtMs)
     }
@@ -141,29 +233,15 @@ internal class MediaProjectionMirror(
         thread.quitSafely()
     }
 
-    private val frameListener = ImageReader.OnImageAvailableListener { reader ->
-        val next = try {
-            reader.acquireLatestImage()
-        } catch (_: RuntimeException) {
-            null
-        } ?: return@OnImageAvailableListener
-        var previous: Image? = null
-        val stale = synchronized(lock) {
-            if (open) {
-                previous = latest
-                latest = next
-                latestAtMs = clock()
-                false
-            } else {
-                true
-            }
+    private fun newReader(screen: ScreenMetrics): ImageReader =
+        ImageReader.newInstance(
+            screen.widthPixels,
+            screen.heightPixels,
+            PixelFormat.RGBA_8888,
+            MAX_IMAGES,
+        ).also { reader ->
+            reader.setOnImageAvailableListener(frameListener, Handler(thread.looper))
         }
-        if (stale) {
-            next.close()
-        } else {
-            previous?.close()
-        }
-    }
 
     /** The image's own size is the frame's size; nothing is assumed from current metrics. */
     private fun Image.toBitmap(): Bitmap {
@@ -193,18 +271,33 @@ internal class MediaProjectionMirror(
 }
 
 /**
- * The projection behind a mirror: registered with an end callback before any display is
- * created (required from Android 14), and stopped exactly once when the grant is released.
+ * The projection behind a mirror: registered with its end and size callbacks before any display
+ * is created (the callback is required from Android 14), and stopped exactly once when the grant
+ * is released.
  */
 internal class MediaProjectionMirrorSource(
     private val projection: MediaProjection,
     private val clock: () -> Long,
-    private val onEnded: () -> Unit,
 ) : MirrorSource {
-    private val callback = object : MediaProjection.Callback() {
-        override fun onStop() = onEnded()
-    }
+    @Volatile
+    private var ended: (() -> Unit)? = null
+
+    @Volatile
+    private var resized: ((width: Int, height: Int) -> Unit)? = null
+
+    @Volatile
     private var stopped = false
+
+    private val callback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            ended?.invoke()
+        }
+
+        // Android 14+: the captured content changed size (rotation, fold, resolution change).
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            resized?.invoke(width, height)
+        }
+    }
 
     init {
         try {
@@ -215,13 +308,7 @@ internal class MediaProjectionMirrorSource(
     }
 
     override fun open(screen: ScreenMetrics): ScreenMirror =
-        MediaProjectionMirror(
-            projection = projection,
-            width = screen.widthPixels,
-            height = screen.heightPixels,
-            densityDpi = screen.densityDpi,
-            clock = clock,
-        ).start()
+        MediaProjectionMirror(projection = projection, initial = screen, clock = clock).start()
 
     override fun stop() {
         if (stopped) return
@@ -236,5 +323,13 @@ internal class MediaProjectionMirrorSource(
         } catch (_: RuntimeException) {
             // Already stopped.
         }
+    }
+
+    override fun onEnded(listener: () -> Unit) {
+        ended = listener
+    }
+
+    override fun onContentResized(listener: (width: Int, height: Int) -> Unit) {
+        resized = listener
     }
 }

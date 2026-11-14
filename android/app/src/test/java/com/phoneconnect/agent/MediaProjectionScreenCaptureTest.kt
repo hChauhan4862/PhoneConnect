@@ -27,9 +27,9 @@ import java.util.ArrayDeque
 import java.util.concurrent.Executor
 
 /**
- * The platform side of screen capture: no grant means no capture, a capture reports the size the
- * mirror really produced, nothing blocks the caller while a stop is cleaned up, and every stop
- * path releases the mirror.
+ * The platform side of screen capture: no grant means no capture, a size change resizes the
+ * display the grant already owns, nothing blocks the caller while a stop is cleaned up, a stale
+ * callback cannot retire a newer grant, and every stop path releases the mirror.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -38,8 +38,8 @@ class MediaProjectionScreenCaptureTest {
 
     /** A mirror with no framework behind it: the size and the frame are exactly what it says. */
     private class FakeMirror(
-        override val width: Int,
-        override val height: Int,
+        override var width: Int,
+        override var height: Int,
         var frame: MirrorFrame? = null,
     ) : ScreenMirror {
         @Volatile
@@ -47,8 +47,20 @@ class MediaProjectionScreenCaptureTest {
             private set
         var closed = false
             private set
+        var resizeSucceeds = true
+        var resizes = 0
+            private set
 
         override fun newestFrame(): MirrorFrame? = if (open) frame else null
+
+        override fun resize(screen: ScreenMetrics): Boolean {
+            resizes += 1
+            if (!resizeSucceeds) return false
+            width = screen.widthPixels
+            height = screen.heightPixels
+            frame = MirrorFrame(createBitmap(width, height), capturedAtMs = NOW + 1)
+            return true
+        }
 
         override fun close() {
             open = false
@@ -64,6 +76,8 @@ class MediaProjectionScreenCaptureTest {
         var lastScreen: ScreenMetrics? = null
         var mirror: FakeMirror? = null
             private set
+        private var ended: (() -> Unit)? = null
+        private var resized: ((Int, Int) -> Unit)? = null
 
         override fun open(screen: ScreenMetrics): ScreenMirror {
             opened += 1
@@ -80,6 +94,24 @@ class MediaProjectionScreenCaptureTest {
 
         override fun stop() {
             stopped = true
+        }
+
+        override fun onEnded(listener: () -> Unit) {
+            ended = listener
+        }
+
+        override fun onContentResized(listener: (width: Int, height: Int) -> Unit) {
+            resized = listener
+        }
+
+        /** What the platform does on "Stop sharing": the registered callback fires. */
+        fun end() {
+            ended?.invoke()
+        }
+
+        /** What Android 14+ does on rotation: `onCapturedContentResize` fires. */
+        fun reportContentSize(width: Int, height: Int) {
+            resized?.invoke(width, height)
         }
     }
 
@@ -100,16 +132,12 @@ class MediaProjectionScreenCaptureTest {
         source: FakeSource = FakeSource(),
         metrics: ScreenMetrics = DEFAULT_METRICS,
         teardown: Executor = Executor(Runnable::run),
-        endings: MutableList<() -> Unit> = mutableListOf(),
     ): MediaProjectionScreenCapture = MediaProjectionScreenCapture(
         context = context,
         metrics = { metrics },
         clock = { NOW },
         teardown = teardown,
-        openSource = { _, _, onEnded ->
-            endings += onEnded
-            source
-        },
+        openSource = { _, _ -> source },
     )
 
     @Test
@@ -142,36 +170,59 @@ class MediaProjectionScreenCaptureTest {
         val capture = captureWith(FakeSource(frameSize = 100 to 200))
         capture.accept(Activity.RESULT_OK, Intent("capture")) { }
 
-        val frame = capture.capture(1_000_000, 100)
+        val frame = capture.capture(Int.MAX_VALUE, 100)
 
         assertEquals(100, frame.width)
         assertEquals(200, frame.height)
     }
 
     @Test
-    fun `a size change retires the grant instead of cropping a frame`() {
+    fun `a size change resizes the mirror and keeps the grant`() {
         var metrics = DEFAULT_METRICS
         val source = FakeSource()
-        val endings = mutableListOf<() -> Unit>()
-        val ownerEnded = mutableListOf<Boolean>()
+        var ended = 0
         val capture = MediaProjectionScreenCapture(
             context = context,
             metrics = { metrics },
             clock = { NOW },
             teardown = Executor(Runnable::run),
-            openSource = { _, _, onEnded ->
-                endings += onEnded
-                source
-            },
+            openSource = { _, _ -> source },
         )
-        capture.accept(Activity.RESULT_OK, Intent("capture")) { ownerEnded += true }
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
         assertEquals(1080, capture.capture(Int.MAX_VALUE, 100).width)
+        val mirror = source.mirror!!
 
-        // Rotation: the display the grant created cannot answer for this shape, and the token
-        // cannot create a second one.
+        // Rotation: the same display is resized, so the user does not grant again.
+        metrics = ScreenMetrics(2400, 1080, 420)
+        val frame = capture.capture(Int.MAX_VALUE, 100)
+
+        assertEquals(1, mirror.resizes)
+        assertEquals(2400, frame.width)
+        assertEquals(1080, frame.height)
+        assertTrue("the grant must survive a resize", capture.available())
+        assertFalse("the projection must not be stopped", source.stopped)
+        assertEquals("the owner must not be told capture ended", 0, ended)
+    }
+
+    @Test
+    fun `a resize failure retires the grant with the size-changed message`() {
+        var metrics = DEFAULT_METRICS
+        val source = FakeSource()
+        var ended = 0
+        val capture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { metrics },
+            clock = { NOW },
+            teardown = Executor(Runnable::run),
+            openSource = { _, _ -> source },
+        )
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
+        capture.capture(Int.MAX_VALUE, 100)
+        source.mirror!!.resizeSucceeds = false
+
         metrics = ScreenMetrics(2400, 1080, 420)
         val failure = assertThrows(CommandFailure::class.java) {
-            capture.capture(1_000_000, 100)
+            capture.capture(Int.MAX_VALUE, 100)
         }
 
         assertEquals("consent_required", failure.code)
@@ -179,7 +230,70 @@ class MediaProjectionScreenCaptureTest {
         assertFalse("the unusable grant must be dropped", capture.available())
         assertTrue("the projection must be stopped", source.stopped)
         assertTrue(source.mirror!!.closed)
-        assertEquals("the owner must learn capture is off", 1, ownerEnded.size)
+        assertEquals("the owner must learn capture is off", 1, ended)
+    }
+
+    @Test
+    fun `the content resize callback resizes on the teardown worker`() {
+        var metrics = DEFAULT_METRICS
+        val teardown = DeferredExecutor()
+        val source = FakeSource()
+        val capture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { metrics },
+            clock = { NOW },
+            teardown = teardown,
+            openSource = { _, _ -> source },
+        )
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { }
+        capture.capture(Int.MAX_VALUE, 100)
+        val mirror = source.mirror!!
+
+        // Android 14+ reports the new captured-content size before the next command arrives.
+        metrics = ScreenMetrics(2400, 1080, 420)
+        source.reportContentSize(2400, 1080)
+        assertEquals("the platform callback must not block", 0, mirror.resizes)
+
+        teardown.runQueued()
+
+        assertEquals(1, mirror.resizes)
+        assertEquals(2400, mirror.width)
+        assertEquals(1080, mirror.height)
+        assertTrue("a resize keeps the grant", capture.available())
+        assertFalse(source.stopped)
+        assertEquals(2400, capture.capture(Int.MAX_VALUE, 100).width)
+        assertEquals("a resized mirror is not resized again", 1, mirror.resizes)
+    }
+
+    @Test
+    fun `a stale end from an old grant does not retire the new one`() {
+        val first = FakeSource()
+        val second = FakeSource()
+        var next: FakeSource = first
+        var ended = 0
+        val capture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { DEFAULT_METRICS },
+            clock = { NOW },
+            teardown = Executor(Runnable::run),
+            openSource = { _, _ -> next },
+        )
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
+        capture.capture(Int.MAX_VALUE, 100)
+
+        next = second
+        capture.accept(Activity.RESULT_OK, Intent("capture")) { ended += 1 }
+
+        // The platform's onStop for the first grant arrives only now.
+        first.end()
+
+        assertTrue("the newer grant must survive a stale end", capture.available())
+        assertEquals("the newer grant's owner must not be told capture ended", 0, ended)
+        assertTrue("the replaced projection must be stopped", first.stopped)
+
+        val frame = capture.capture(Int.MAX_VALUE, 100)
+        assertEquals("the newer grant must be the one used", 1, second.opened)
+        assertEquals(1080, frame.width)
     }
 
     @Test
@@ -193,7 +307,7 @@ class MediaProjectionScreenCaptureTest {
             metrics = { metrics },
             clock = { NOW },
             teardown = Executor(Runnable::run),
-            openSource = { _, _, _ -> next },
+            openSource = { _, _ -> next },
         )
 
         capture.accept(Activity.RESULT_OK, Intent("capture")) { }
@@ -252,7 +366,7 @@ class MediaProjectionScreenCaptureTest {
         val source = FakeSource()
         val capture = captureWith(source, teardown = teardown)
         capture.accept(Activity.RESULT_OK, Intent("capture")) { }
-        capture.capture(1_000_000, 100)
+        capture.capture(Int.MAX_VALUE, 100)
 
         capture.release()
 
@@ -276,9 +390,8 @@ class MediaProjectionScreenCaptureTest {
             // The next capture has nothing to return, so it sits in the wait.
             source.mirror!!.frame = null
 
-            var failure: Throwable? = null
             val waiting = Thread {
-                failure = assertThrows(CommandFailure::class.java) {
+                assertThrows(CommandFailure::class.java) {
                     capture.capture(Int.MAX_VALUE, 5_000)
                 }
             }
@@ -303,23 +416,18 @@ class MediaProjectionScreenCaptureTest {
     fun `a system stop clears the grant, releases the mirror, and tells the owner`() {
         val teardown = DeferredExecutor()
         val source = FakeSource()
-        val endings = mutableListOf<() -> Unit>()
         var ownerEnded = 0
         val capture = MediaProjectionScreenCapture(
             context = context,
             metrics = { DEFAULT_METRICS },
             clock = { NOW },
             teardown = teardown,
-            openSource = { _, _, onEnded ->
-                endings += onEnded
-                source
-            },
+            openSource = { _, _ -> source },
         )
         capture.accept(Activity.RESULT_OK, Intent("capture")) { ownerEnded += 1 }
-        capture.capture(1_000_000, 100)
+        capture.capture(Int.MAX_VALUE, 100)
 
-        // What the platform does on "Stop sharing": the registered callback fires.
-        endings.single().invoke()
+        source.end()
 
         assertFalse(capture.available())
         assertEquals("the owner must learn capture is off", 1, ownerEnded)
@@ -327,7 +435,7 @@ class MediaProjectionScreenCaptureTest {
         teardown.runQueued()
         assertTrue(source.mirror!!.closed)
 
-        val failure = assertThrows(CommandFailure::class.java) { capture.capture(1_000_000, 100) }
+        val failure = assertThrows(CommandFailure::class.java) { capture.capture(Int.MAX_VALUE, 100) }
         assertEquals("consent_required", failure.code)
     }
 
@@ -342,7 +450,7 @@ class MediaProjectionScreenCaptureTest {
             metrics = { DEFAULT_METRICS },
             clock = { NOW },
             teardown = teardown,
-            openSource = { _, _, _ -> next },
+            openSource = { _, _ -> next },
         )
         capture.accept(Activity.RESULT_OK, Intent("capture")) { }
         capture.capture(Int.MAX_VALUE, 100)

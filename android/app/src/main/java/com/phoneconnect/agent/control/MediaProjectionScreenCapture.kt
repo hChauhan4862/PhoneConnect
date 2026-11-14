@@ -71,18 +71,20 @@ internal fun encodeWithinLimit(
  * One mirror serves the whole grant. That is a platform requirement, not a shortcut: from
  * Android 14 a token may create one virtual display, and calling `createVirtualDisplay` again
  * after the display was released logs `Reusing token: Throw exception due to invalid
- * projection` and stops the projection. A size change (rotation, fold, resolution change) ends
- * the grant instead of reusing a mirror at the wrong size or cropping a frame to fit: the
- * command answers `consent_required` with a message saying the screen size changed, and the user
- * enables capture again. Everything is released on every stop path — user stop, service stop,
- * system stop — on a teardown worker, never on the caller's thread.
+ * projection` and stops the projection. A size change (rotation, fold, resolution change) keeps
+ * the grant: the display the token already owns is resized and pointed at a `ImageReader` of the
+ * new size, which is exactly what `VirtualDisplay.resize`/`setSurface` are for. The platform's
+ * `onCapturedContentResize` callback triggers the same path, and the next capture compares the
+ * mirror against the current metrics as a fallback. The grant is retired only if the resize
+ * genuinely fails. Everything is released on every stop path — user stop, service stop, system
+ * stop — on one process-wide teardown worker, never on the caller's thread.
  */
 internal class MediaProjectionScreenCapture(
     private val context: Context,
     private val metrics: () -> ScreenMetrics = { ScreenMetrics.from(context) },
     private val clock: () -> Long = System::currentTimeMillis,
     private val teardown: Executor = defaultTeardown(),
-    private val openSource: ((resultCode: Int, data: Intent, onEnded: () -> Unit) -> MirrorSource?)? = null,
+    private val openSource: ((resultCode: Int, data: Intent) -> MirrorSource?)? = null,
 ) : ScreenCapture {
     private val lock = Any()
 
@@ -93,25 +95,36 @@ internal class MediaProjectionScreenCapture(
     private var mirror: ScreenMirror? = null
     private var endedCallback: (() -> Unit)? = null
 
+    /**
+     * Identifies the grant the callbacks belong to. A platform end or resize from a grant that
+     * has since been replaced must not touch the newer grant.
+     */
+    private var generation: Long = 0
+
     override fun available(): Boolean = synchronized(lock) { source != null }
 
     override fun accept(resultCode: Int, data: Intent?, onEnded: () -> Unit) {
         if (resultCode != Activity.RESULT_OK || data == null) return
         val opened = try {
-            (openSource ?: ::openProductionSource)(resultCode, data, ::handleEnded)
+            (openSource ?: ::openProductionSource)(resultCode, data)
         } catch (_: RuntimeException) {
             // A refused or already-consumed token installs nothing; the command says so.
             null
         } ?: return
         // A new grant replaces the old one completely: its mirror and cached frame must not
         // survive, or the new grant would return frozen frames.
-        val previous = synchronized(lock) {
-            val held = source to mirror
+        val grant: Long
+        val previous: Pair<MirrorSource?, ScreenMirror?>
+        synchronized(lock) {
+            generation += 1
+            grant = generation
+            previous = source to mirror
             source = opened
             mirror = null
             endedCallback = onEnded
-            held
         }
+        opened.onEnded { handleEnded(grant) }
+        opened.onContentResized { width, height -> handleContentResized(grant, width, height) }
         releaseLater(previous.first, previous.second)
     }
 
@@ -147,7 +160,7 @@ internal class MediaProjectionScreenCapture(
         // An explicit release is not a system stop: every caller already reports the new state
         // (`ConnectionService` clears the mirror on stop, revoke, and destroy), so only the
         // resources are released here.
-        val (previousSource, previousMirror, _) = detach()
+        val (previousSource, previousMirror) = detach()
         releaseLater(previousSource, previousMirror)
     }
 
@@ -165,6 +178,11 @@ internal class MediaProjectionScreenCapture(
                 throw CommandFailure(ScreenHandler.CONSENT_REQUIRED, ScreenHandler.CONSENT_MESSAGE)
             }
             if (existing.width == screen.widthPixels && existing.height == screen.heightPixels) {
+                return existing
+            }
+            // The token cannot create a second display, but the one it owns can be resized: a
+            // rotation must not cost the user another system consent dialog.
+            if (existing.resize(screen)) {
                 return existing
             }
             discardGrant()
@@ -211,31 +229,74 @@ internal class MediaProjectionScreenCapture(
     }
 
     /** The projection ended without the app asking: forget the grant and tell the owner. */
-    private fun handleEnded() {
-        val (held, ended) = synchronized(lock) {
-            val held = mirror
-            val ended = endedCallback
+    private fun handleEnded(grant: Long) {
+        var endedSource: MirrorSource? = null
+        var held: ScreenMirror? = null
+        var ended: (() -> Unit)? = null
+        synchronized(lock) {
+            // A late end from a grant that has already been replaced must not retire the new
+            // one — the new grant is still live, and the old source was stopped when replaced.
+            if (generation != grant) return
+            generation += 1
+            endedSource = source
+            held = mirror
+            ended = endedCallback
             source = null
             mirror = null
             endedCallback = null
-            held to ended
         }
         // Not the caller's thread: `onStop` arrives on the main looper, and closing a mirror can
-        // wait on a capture that is already running.
-        releaseLater(null, held)
+        // wait on a capture that is already running. Stopping is idempotent, so a projection the
+        // system already ended is unregistered and stopped again without effect.
+        releaseLater(endedSource, held)
         ended?.invoke()
+    }
+
+    /**
+     * The platform reported the captured content's new size. Resizing happens on the teardown
+     * worker so the platform callback thread is never blocked, and a capture in flight finishes
+     * before the surface is swapped.
+     */
+    private fun handleContentResized(grant: Long, width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        val current = synchronized(lock) {
+            if (generation != grant) return
+            mirror
+        } ?: return
+        if (current.width == width && current.height == height) return
+        teardown.execute {
+            synchronized(captureLock) {
+                if (!current.open) return@synchronized
+                if (!current.resize(ScreenMetrics(width, height, metrics().densityDpi))) {
+                    discardGrant()
+                    return@synchronized
+                }
+            }
+        }
     }
 
     /** Drops the current grant because its mirror can no longer answer for this screen. */
     private fun discardGrant() {
-        val (previousSource, previousMirror, ended) = detach()
+        var previousSource: MirrorSource? = null
+        var previousMirror: ScreenMirror? = null
+        var ended: (() -> Unit)? = null
+        synchronized(lock) {
+            // Any callback still in flight from this grant is now stale.
+            generation += 1
+            previousSource = source
+            previousMirror = mirror
+            ended = endedCallback
+            source = null
+            mirror = null
+            endedCallback = null
+        }
         releaseLater(previousSource, previousMirror)
         ended?.invoke()
     }
 
-    private fun detach(): Triple<MirrorSource?, ScreenMirror?, (() -> Unit)?> =
+    private fun detach(): Pair<MirrorSource?, ScreenMirror?> =
         synchronized(lock) {
-            val held = Triple(source, mirror, endedCallback)
+            val held = source to mirror
             source = null
             mirror = null
             endedCallback = null
@@ -250,22 +311,14 @@ internal class MediaProjectionScreenCapture(
         }
     }
 
-    private fun openProductionSource(
-        resultCode: Int,
-        data: Intent,
-        onEnded: () -> Unit,
-    ): MirrorSource? {
+    private fun openProductionSource(resultCode: Int, data: Intent): MirrorSource? {
         val manager = context.getSystemService(MediaProjectionManager::class.java) ?: return null
         val projection = try {
             manager.getMediaProjection(resultCode, data)
         } catch (_: RuntimeException) {
             null
         } ?: return null
-        return MediaProjectionMirrorSource(
-            projection = projection,
-            clock = clock,
-            onEnded = onEnded,
-        )
+        return MediaProjectionMirrorSource(projection = projection, clock = clock)
     }
 
     private fun Bitmap.toPng(): ByteArray {
@@ -287,10 +340,7 @@ internal class MediaProjectionScreenCapture(
         /** How long a capture waits between checks for the first frame. */
         const val FRAME_POLL_MS: Long = 20
 
-        private fun defaultTeardown(): Executor =
-            Executors.newSingleThreadExecutor { runnable ->
-                Thread(runnable, "pc-screen-teardown").apply { isDaemon = true }
-            }
+        private fun defaultTeardown(): Executor = ScreenTeardown
     }
 }
 

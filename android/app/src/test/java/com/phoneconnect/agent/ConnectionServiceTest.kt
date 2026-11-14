@@ -11,7 +11,13 @@ import android.content.pm.ServiceInfo
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import com.phoneconnect.agent.control.CapturedFrame
+import com.phoneconnect.agent.control.MediaProjectionScreenCapture
+import com.phoneconnect.agent.control.MirrorFrame
+import com.phoneconnect.agent.control.MirrorSource
 import com.phoneconnect.agent.control.ScreenCapture
+import com.phoneconnect.agent.control.ScreenMetrics
+import com.phoneconnect.agent.control.ScreenMirror
+import com.phoneconnect.agent.control.ScreenTeardown
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
@@ -32,6 +38,9 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 
 @OptIn(IdentityBoundary::class, kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
@@ -55,6 +64,7 @@ class ConnectionServiceTest {
         Dispatchers.resetMain()
         TestConnectionService.clear()
         ConnectionService.captureEnded()
+        ScreenTeardown.dispose()
         context.getSharedPreferences(AgentDiagnostics.PREFERENCES_NAME, Context.MODE_PRIVATE)
             .edit().clear().commit()
     }
@@ -340,6 +350,76 @@ class ConnectionServiceTest {
     }
 
     @Test
+    fun `a stale system end cannot retire a newer grant`() {
+        val first = ServiceMirrorSource()
+        val second = ServiceMirrorSource()
+        var next: MirrorSource = first
+        TestConnectionService.screenCapture = MediaProjectionScreenCapture(
+            context = context,
+            metrics = { ScreenMetrics(1080, 2400, 420) },
+            clock = { 1_760_000_000_000 },
+            teardown = Executor(Runnable::run),
+            openSource = { _, _ -> next },
+        )
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        next = second
+        controller.get().onStartCommand(grantIntent(), 0, 2)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            controller.get().foregroundServiceType,
+        )
+
+        // The platform's onStop for the first grant arrives only after the second is installed.
+        first.end()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(
+            "the newer grant must survive a stale end",
+            ConnectionService.screenCaptureEnabled(),
+        )
+        assertEquals(
+            "the newer grant must stay a mediaProjection foreground service",
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            controller.get().foregroundServiceType,
+        )
+        assertTrue("the replaced projection must be stopped", first.stopped)
+        assertEquals("the newer projection must not be stopped", false, second.stopped)
+    }
+
+    @Test
+    fun `destroy shuts the screen teardown worker down`() {
+        val ran = CountDownLatch(1)
+        ScreenTeardown.execute { ran.countDown() }
+        assertTrue("the teardown worker must run work", ran.await(5, TimeUnit.SECONDS))
+        assertTrue(ScreenTeardown.threadName() in threadNames())
+
+        val controller = Robolectric.buildService(
+            TestConnectionService::class.java,
+            ConnectionService.startIntent(context),
+        )
+        controller.create().startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+        controller.destroy()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline && ScreenTeardown.threadName() in threadNames()) {
+            Thread.sleep(20)
+        }
+        assertFalse(
+            "the teardown worker must not outlive the service",
+            ScreenTeardown.threadName() in threadNames(),
+        )
+    }
+
+    @Test
     fun `a system-stopped projection clears the state the setup screen shows`() {
         val capture = RecordingScreenCapture()
         TestConnectionService.screenCapture = capture
@@ -430,6 +510,56 @@ class ConnectionServiceTest {
         .setAction(ConnectionService.ACTION_GRANT_CAPTURE)
         .putExtra(ConnectionService.EXTRA_CAPTURE_RESULT_CODE, android.app.Activity.RESULT_OK)
         .putExtra(ConnectionService.EXTRA_CAPTURE_RESULT_DATA, Intent("com.phoneconnect.test.CAPTURE"))
+
+    private fun threadNames(): Set<String> =
+        Thread.getAllStackTraces().keys.map { it.name }.toSet()
+
+    /** A projection whose mirror has no framework behind it, for the grant lifecycle. */
+    private class ServiceMirrorSource : MirrorSource {
+        var stopped = false
+            private set
+        private var ended: (() -> Unit)? = null
+
+        override fun open(screen: ScreenMetrics): ScreenMirror = ServiceMirror(screen)
+
+        override fun stop() {
+            stopped = true
+        }
+
+        override fun onEnded(listener: () -> Unit) {
+            ended = listener
+        }
+
+        override fun onContentResized(listener: (width: Int, height: Int) -> Unit) = Unit
+
+        fun end() {
+            ended?.invoke()
+        }
+    }
+
+    private class ServiceMirror(private val screen: ScreenMetrics) : ScreenMirror {
+        @Volatile
+        override var open: Boolean = true
+            private set
+
+        override var width: Int = screen.widthPixels
+            private set
+
+        override var height: Int = screen.heightPixels
+            private set
+
+        override fun newestFrame(): MirrorFrame? = null
+
+        override fun resize(screen: ScreenMetrics): Boolean {
+            width = screen.widthPixels
+            height = screen.heightPixels
+            return true
+        }
+
+        override fun close() {
+            open = false
+        }
+    }
 
     private fun notificationText(): String? = shadowOf(manager)
         .getNotification(NotificationController.NOTIFICATION_ID)

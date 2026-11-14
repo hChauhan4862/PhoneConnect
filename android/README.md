@@ -90,14 +90,18 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    for a change that will never come). The pair **cannot** be re-created per frame: on Android
    14/15 a token may create one virtual display, and a second `createVirtualDisplay` logs
    `Reusing token: Throw exception due to invalid projection` and stops the projection (observed
-   on the `pc35` emulator). A screen-size change (rotation, fold, resolution change) therefore
-   ends the grant instead of reusing a display at the wrong size or cropping a frame: the command
-   answers `consent_required` with a message saying the size changed, and the user enables
-   capture again. Everything — the display, the reader, the cached frame, and the projection — is
-   released on **every** stop path (user stop, service stop, system stop), on a teardown worker,
-   never on the caller's thread, so nothing outlives the grant and a stop during a capture cannot
-   block the main thread. A capture waits for the first frame bounded by the command's remaining
-   budget (and at most 5 s) and never runs on the command receive loop. The encoded frame is downscaled by whole factors
+   on the `pc35` emulator). A screen-size change (rotation, fold, resolution change) does **not**
+   cost the user another grant: the display the token already owns is resized
+   (`VirtualDisplay.resize`) and pointed at a fresh `ImageReader` of the new size
+   (`VirtualDisplay.setSurface`), triggered by the platform's `onCapturedContentResize` callback
+   and also checked against the current display metrics by every capture. The grant is retired
+   with `consent_required` and a size-changed message only if the resize genuinely fails.
+   Everything — the display, the readers, the cached frame, and the projection — is released on
+   **every** stop path (user stop, service stop, system stop), on one process-wide teardown
+   worker that `onDestroy` shuts down, never on the caller's thread, so nothing outlives the
+   service and a stop during a capture cannot block the main thread. A capture waits for the
+   first frame bounded by the command's remaining budget (and at most 5 s) and never runs on the
+   command receive loop. The encoded frame is downscaled by whole factors
    until its base64 is under 2 MiB minus an envelope allowance, and `width`/`height` report the
    size actually captured; a frame that cannot get under the budget is `result_too_large`,
    never truncated.
@@ -142,8 +146,9 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `control/AppsHandler.kt` | The five `apps.*` commands, the `AppPlatform` contract, and the honest refusals a non-privileged app must give. |
 | `control/AndroidAppPlatform.kt` | The only `AppPlatform`: `PackageManager` inventory and launch intent, `ActivityManager` kill and background-start check. |
 | `control/ScreenHandler.kt` | `screen.snapshot`: the `consent_required` refusal, the result budget, and the `ScreenCapture` contract. |
-| `control/MediaProjectionScreenCapture.kt` | The only `ScreenCapture`: the consent token, one mirror per grant, the size-change refusal, and teardown on a worker for every stop path. |
-| `control/ScreenMirror.kt` | The mirrored surface: `MediaProjection` + `VirtualDisplay` + `ImageReader`, the newest frame, and PNG-safe copying at the frame's own size. |
+| `control/MediaProjectionScreenCapture.kt` | The only `ScreenCapture`: the consent token, one mirror per grant (resized on rotation), grant-scoped callbacks, and teardown on a worker for every stop path. |
+| `control/ScreenMirror.kt` | The mirrored surface: `MediaProjection` + `VirtualDisplay` + `ImageReader`, the newest frame, PNG-safe copying at the frame's own size, and `resize`/`setSurface` for a new screen size. |
+| `control/ScreenTeardown.kt` | The one process-wide worker every capture's teardown runs on, shut down by the service's `onDestroy`. |
 | `control/SystemPropsHandler.kt` | `system.props`: the allowlist and the reflective `android.os.SystemProperties` reader. |
 | `control/ShellHandler.kt` / `control/LogcatHandler.kt` | The two constant `not_permitted` refusals that name the platform restriction. |
 | `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
