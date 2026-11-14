@@ -232,11 +232,12 @@ pub struct RetentionCounts {
     pub sessions_deleted: usize,
     pub leases_deleted: usize,
     pub lease_links_deleted: usize,
+    pub audit_deleted: usize,
 }
 
 impl RetentionCounts {
     pub fn total(&self) -> usize {
-        self.sessions_deleted + self.leases_deleted + self.lease_links_deleted
+        self.sessions_deleted + self.leases_deleted + self.lease_links_deleted + self.audit_deleted
     }
 }
 
@@ -398,8 +399,9 @@ pub trait DeviceStore: Send + Sync {
         now_ms: UnixMs,
     ) -> Result<Vec<String>, StoreError>;
 
-    /// Deletes session records, leases, and lease links that ended before `cutoff_ms`.
-    /// This is the retention primitive; it decides nothing about the retention window.
+    /// Deletes session records, leases, and lease links that ended before `cutoff_ms`, and
+    /// audit rows written before it. This is the retention primitive; it decides nothing
+    /// about the retention window.
     async fn delete_records_older_than(
         &self,
         cutoff_ms: UnixMs,
@@ -1101,11 +1103,18 @@ impl DeviceStore for SqliteStore {
                     params![cutoff_ms],
                 )
                 .map_err(backend_error)?;
+            let audit_deleted = transaction
+                .execute(
+                    "DELETE FROM audit_log WHERE at_ms < ?1",
+                    params![cutoff_ms],
+                )
+                .map_err(backend_error)?;
             transaction.commit().map_err(backend_error)?;
             Ok(RetentionCounts {
                 sessions_deleted,
                 leases_deleted,
                 lease_links_deleted,
+                audit_deleted,
             })
         })
     }

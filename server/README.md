@@ -22,6 +22,9 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
   device, the in-memory command table, deadlines, and bounded results.
 - `src/commands.rs` — the command HTTP surface: authorization, dispatch, polling, and the
   audit row written for every attempt.
+- `src/audit.rs` — the read-only audit surface (`GET /api/audit`) and the revocation rows
+  the admin and lease routes append. A row carries identity, action, outcome, and an error
+  code; never an argument, a path, a file byte, or an image.
 - `src/telemetry.rs` — bounded per-device telemetry aggregation, explicit freshness, and
   30-day aggregate deletion.
 - `src/status.rs` — the status surface the web UI renders: device, session, path evidence,
@@ -58,6 +61,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 | `GET` (upgrade) | `/api/devices/{id}/control` | device credential matching `{id}` | The management channel: a WebSocket carrying JSON telemetry and commands. A new connection replaces the old one with a `replaced` close. |
 | `POST` | `/api/devices/{id}/commands?user_id=` | admin | Dispatches one command; body is `{name, args?, timeout_ms?}` and the response is `202 {command_id}`. Refusals are `403 lease_read_only`, `409 device_offline`, `409 device_revoked`, `429 command_capacity`, `400 invalid_timeout`. |
 | `GET` | `/api/commands/{id}?user_id=` | admin | One command's state: `pending`, `ok`, `error`, or `timeout`, with `output`, `error`, `message`, and timestamps. |
+| `GET` | `/api/audit?device_id=&limit=` | admin | Newest-first durable audit rows (`at_ms`, `actor`, `action`, `device_id`, `outcome`, `error`). `device_id` is an exact filter; an unknown device is an empty list. `limit` defaults to 50 and is capped at 200. Read-only: no endpoint changes a row. |
 | `POST` | `/api/devices/{id}/files/list?user_id=` | admin | Forwards `files.list`; body is `{path}`. Responds `202 {command_id}`, polled like any command. |
 | `POST` | `/api/devices/{id}/files/read?user_id=` | admin | Forwards `files.read`; body is `{path, offset?, length?}`. |
 | `POST` | `/api/devices/{id}/files/write?user_id=` | admin | Forwards `files.write`; body is `{path, data_base64, append?}`. A write whose body decodes past 1 MiB is refused with `413 too_large` before it is dispatched; `400 invalid_base64` otherwise. |
@@ -347,6 +351,25 @@ active lease holder); the actor is the `user_id` query parameter because the adm
 carries no identity. Every attempt writes one `audit_log` row with actor, action, device,
 outcome, and error code — that row is the durable trace, not the command itself.
 
+## Audit
+
+Every dispatch attempt — accepted, refused, or timed out — writes one durable `audit_log` row:
+`at_ms`, `actor`, `action` (`command.dispatch`), `device_id`, `outcome` (`accepted` or
+`refused`), and the machine `error` code when there is one. Every accepted revocation writes
+its own row: `device.revoke`, `session.revoke`, `lease.revoke`, and `lease.handoff` (when a
+handoff replaces a live lease). A session revocation is keyed by the session's device; the
+actor of a device or session revocation is `admin` because the bootstrap token carries no user
+identity. An enrollment-token revocation precedes any device, has no `device_id`, and is
+therefore not an audit row.
+
+`GET /api/audit` is read-only and admin-authenticated: there is no endpoint that writes,
+changes, or deletes a row. Rows carry no command arguments, file path, file bytes, or image
+data — a refused `files.write` records that it was refused and its code (`device_offline`,
+`too_large`), not the path or the content. The `device_id` filter is an exact match, so an
+unknown device id is an empty list rather than another device's history. `limit` defaults to
+50 and is capped at 200; `0`, a negative number, or a non-number is `400 invalid_request`
+rather than a silently widened page.
+
 ## Telemetry
 
 `POST /api/devices/{id}/telemetry` and the management channel's `telemetry` frames each
@@ -365,15 +388,14 @@ it knows; a stale reading keeps its value and is labelled stale.
 ## Retention
 
 `RetentionJob::run(now_ms)` is deterministic and deletes session records, control leases, and
-lease links that ended more than 30 days earlier. `main` runs it once at startup and then
-every six hours through `spawn_interval`; there is no separate scheduler daemon. A failed run
-is logged and retried on the next tick.
+lease links that ended more than 30 days earlier, and audit rows written more than 30 days
+earlier. `main` runs it once at startup and then every six hours through `spawn_interval`;
+there is no separate scheduler daemon. A failed run is logged and retried on the next tick.
 
-The 30-day window applies to leases and session records (and to audit events once they exist).
-Telemetry aggregates are in-memory and not part of that history: the job's aggregate purge
-only bounds memory, and a restart clears them regardless of age. Device records and
-enrollment tokens are not aged out, because deleting an enrolled device would orphan a live
-device.
+The 30-day window applies to leases, session records, and the audit log. Telemetry aggregates
+are a separate, in-memory concern: they are not persisted at all, the job's aggregate purge
+only bounds memory, and a restart clears them regardless of age. Device records and enrollment
+tokens are not aged out, because deleting an enrolled device would orphan a live device.
 
 ## Configuration
 
@@ -402,10 +424,11 @@ Terminate TLS at a reverse proxy; all public endpoints require TLS in production
 
 ## Persistence and retention
 
-The store keeps enrollment tokens, devices, sessions, control leases, and the lease-to-session
-links: identifiers, credential hashes, expiry, revocation, and who may control what. Stream
-payloads, files, and media are never persisted and never queued beyond the bounded relay
-limits. Relay state is dropped as sessions expire, so memory stays proportional to live
+The store keeps enrollment tokens, devices, sessions, control leases, the lease-to-session
+links, and the audit log: identifiers, credential hashes, expiry, revocation, who may control
+what, and one trace row per command attempt. Stream payloads, files, and media are never
+persisted and never queued beyond the bounded relay limits; a command's arguments are not
+persisted either. Relay state is dropped as sessions expire, so memory stays proportional to live
 sessions. Telemetry aggregates are bounded in memory, not stored per sample.
 
 The SQLite adapter serializes writes on one connection. That concurrency limit is

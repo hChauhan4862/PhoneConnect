@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::AppState;
+use crate::audit;
 use crate::auth::{AuthError, hash_secret};
 use crate::relay::RelayClose;
 use crate::store::{StoreError, UnixMs};
@@ -69,6 +70,13 @@ pub async fn revoke_device(
             device_id: device_id.clone(),
         },
     );
+    audit::record_revocation(
+        &state,
+        audit::ADMIN_ACTOR,
+        audit::ACTION_DEVICE_REVOKE,
+        &device_id,
+    )
+    .await;
     Ok(Json(Revocation {
         revoked: true,
         revoked_at,
@@ -82,6 +90,8 @@ pub async fn revoke_session(
     headers: HeaderMap,
 ) -> Result<Json<Revocation>, RevocationError> {
     state.auth.require_admin(&headers)?;
+    // The row is keyed by device, so read the session's device before ending it.
+    let session = state.store.session(&session_id).await?;
     let revoked_at = state
         .store
         .revoke_session(&session_id, state.now_ms())
@@ -89,6 +99,13 @@ pub async fn revoke_session(
     state
         .relay
         .close_session(&session_id, RelayClose::SessionRevoked);
+    audit::record_revocation(
+        &state,
+        audit::ADMIN_ACTOR,
+        audit::ACTION_SESSION_REVOKE,
+        &session.device_id,
+    )
+    .await;
     Ok(Json(Revocation {
         revoked: true,
         revoked_at,

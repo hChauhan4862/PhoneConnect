@@ -1,9 +1,11 @@
-//! 30-day retention. One callable job deletes session records, control leases, and
-//! telemetry aggregates older than the window.
+//! 30-day retention. One callable job deletes session records, control leases, audit rows,
+//! and telemetry aggregates older than the window.
 //!
 //! There is no scheduler daemon: [`RetentionJob::run`] is deterministic and takes the
 //! clock reading as an argument, and [`RetentionJob::spawn_interval`] is the startup hook a
-//! deployment uses to call it periodically.
+//! deployment uses to call it periodically. The job deletes by age only; device records and
+//! enrollment tokens are never aged out, because that would orphan an enrolled device. The
+//! telemetry purge is an in-memory bound, not persisted history.
 
 use std::sync::Arc;
 use std::time::Duration;

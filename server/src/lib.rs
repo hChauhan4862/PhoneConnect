@@ -8,6 +8,7 @@
 
 pub mod admin;
 pub mod apps;
+pub mod audit;
 pub mod auth;
 pub mod commands;
 pub mod config;
@@ -216,6 +217,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(commands::dispatch_command),
         )
         .route("/api/commands/{command_id}", get(commands::command_state))
+        // The audit trace: every dispatch attempt and every revocation. Read-only; there is
+        // no endpoint that changes or deletes a row (retention deletes by age).
+        .route("/api/audit", get(audit::list_audit))
         // File operations are commands with a typed front door: the server authorizes,
         // bounds, and forwards, and the device's path guard is the safety authority.
         .route(
