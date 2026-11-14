@@ -20,12 +20,14 @@ This is the foundation milestone, not a finished product.
 - The web UI is a static admin surface. It renders the snapshot it last read and polls a
   command until the device answers; there is no server-to-client push channel.
 - Each enrolled device keeps a second, authenticated management connection to the server
-  carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, and the
-  `files.*` commands work end to end from the one web UI (the command console, the file
-  browser, and the app inventory); every later device feature plugs into the same channel. An
-  ordinary app cannot hold the signature-level permissions `apps.clear` and `apps.set_enabled`
-  need, so those are explicit refusals pointing at ADB. The sealed peer relay is unchanged and
-  the server still cannot read it.
+  carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, the
+  `files.*` commands, the `apps.*` commands, `screen.snapshot` (one frame, only with the
+  `MediaProjection` consent the user granted on the setup screen), and `system.props` (a
+  documented allowlist) work end to end from the one web UI. An ordinary app cannot hold the
+  signature-level permissions `apps.clear` and `apps.set_enabled` need, cannot run `adb shell`,
+  and cannot read logcat (`READ_LOGS` is signature-level), so those are explicit refusals with
+  a machine code and a stated reason, documented and rendered as unavailable. The sealed peer
+  relay is unchanged and the server still cannot read it.
 - Direct hole-punched paths are implemented and tested in the transport, but both shipped
   clients use the relay. Production connectivity is relay-only.
 - Telemetry aggregates are bounded and kept in memory.
@@ -78,11 +80,12 @@ The component READMEs are the source of truth for what does and does not work:
 
 - `android/README.md` — no direct-path port, no ticket-signature verification, and a small
   management vocabulary (`device.info`, `device.ping`, `telemetry.now`, the `files.*` commands
-  inside one app-private directory, and the `apps.*` commands). Package listing depends on
-  `QUERY_ALL_PACKAGES`; a background activity start is usually blocked (`launch_blocked`), and
-  `apps.clear`/`apps.set_enabled` are refused because an installed app cannot hold the
-  signature-level permissions. ADB, media, input, screen mirroring, and audio are not
-  implemented, and the phone is not remotely controllable.
+  inside one app-private directory, the `apps.*` commands, one-frame `screen.snapshot`, and the
+  `system.props` allowlist). Package listing depends on `QUERY_ALL_PACKAGES`; a background
+  activity start is usually blocked (`launch_blocked`); `apps.clear`/`apps.set_enabled`,
+  `shell.exec`, and `logcat.tail` are refused because an installed app cannot hold the
+  signature-level permissions or the ADB/root UID. Screen *mirroring*, input injection, audio,
+  and continuous capture are not implemented, and the phone is not remotely controllable.
 - `native/README.md` — there is no Android-side TCP bridge, so the loopback proxy does not
   reach a phone yet; no screen creates a session until the server's user login and MFA land.
   Only macOS has been built here; Windows and Linux are untested.
