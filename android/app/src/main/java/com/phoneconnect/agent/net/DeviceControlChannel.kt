@@ -225,7 +225,7 @@ class DeviceControlChannel(
         // with it. Without a server-clock estimate there is nothing to clamp against.
         val budgetMs = remainingBudgetMs(expiresAtMs, nowMs, deadlineMs)
         val result = withTimeoutOrNull(budgetMs) {
-            withContext(Dispatchers.Default) { dispatcher.dispatch(name, args) }
+            withContext(Dispatchers.Default) { dispatcher.dispatch(name, args, budgetMs) }
         } ?: Result.failure(
             CommandFailure("timeout", "$name did not finish within ${budgetMs}ms"),
         )

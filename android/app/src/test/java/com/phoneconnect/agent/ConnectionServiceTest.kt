@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.phoneconnect.agent.control.CapturedFrame
+import com.phoneconnect.agent.control.ScreenCapture
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
@@ -38,6 +40,7 @@ class ConnectionServiceTest {
     private val context = ApplicationProvider.getApplicationContext<Context>()
     private val manager = context.getSystemService(NotificationManager::class.java)
     private lateinit var runner: RecordingRunner
+    private lateinit var serviceUnderTest: ConnectionService
 
     @Before
     fun setUp() {
@@ -221,7 +224,15 @@ class ConnectionServiceTest {
         assertEquals("exactly one service declaration", 1, Regex("<service\\b").findAll(manifest).count())
         assertTrue(
             "the service must be a connectedDevice foreground service",
-            manifest.contains("android:foregroundServiceType=\"connectedDevice\""),
+            manifest.contains("android:foregroundServiceType=\"connectedDevice|mediaProjection\""),
+        )
+        assertTrue(
+            "the service must also be a mediaProjection foreground service for screen capture",
+            manifest.contains("android:foregroundServiceType=\"connectedDevice|mediaProjection\""),
+        )
+        assertTrue(
+            "mediaProjection needs its own foreground-service permission",
+            manifest.contains("android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"),
         )
         assertFalse(
             "dataSync would be capped at six hours",
@@ -293,6 +304,101 @@ class ConnectionServiceTest {
         assertTrue(channel.started)
     }
 
+    @Test
+    fun `a capture grant raises the media projection type before the projection is acquired`() {
+        val capture = RecordingScreenCapture()
+        TestConnectionService.screenCapture = capture
+        var typeWhenAccepted = 0
+        capture.onAccept = {
+            typeWhenAccepted = serviceUnderTest.foregroundServiceType
+        }
+
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("the grant must reach the capture", capture.accepted)
+        assertEquals(
+            "Android 14+ needs the service to carry the mediaProjection type before the token is used",
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+            typeWhenAccepted,
+        )
+        val types = controller.get().foregroundServiceType
+        assertTrue(
+            "the running service must still advertise both types",
+            types and ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION != 0 &&
+                types and ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE != 0,
+        )
+        assertEquals("a grant must not add a notification", 1, shadowOf(manager).size())
+    }
+
+    @Test
+    fun `stopping capture releases the projection and drops the extra type`() {
+        val capture = RecordingScreenCapture()
+        TestConnectionService.screenCapture = capture
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        controller.get().onStartCommand(
+            Intent(context, ConnectionService::class.java).setAction(ConnectionService.ACTION_REVOKE_CAPTURE),
+            0,
+            2,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("the projection must be released", capture.released)
+        assertEquals(
+            "the service keeps only the connectedDevice type",
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            controller.get().foregroundServiceType,
+        )
+        assertEquals("stopping capture must not add a notification", 1, shadowOf(manager).size())
+    }
+
+    @Test
+    fun `destroying the service releases the projection`() {
+        val capture = RecordingScreenCapture()
+        TestConnectionService.screenCapture = capture
+        val controller = Robolectric.buildService(TestConnectionService::class.java, grantIntent()).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        controller.destroy()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("a destroyed service must not leak a projection", capture.released)
+    }
+
+    @Test
+    fun `a capture grant without a valid consent result enables nothing`() {
+        val capture = RecordingScreenCapture()
+        TestConnectionService.screenCapture = capture
+        val intent = Intent(context, ConnectionService::class.java)
+            .setAction(ConnectionService.ACTION_GRANT_CAPTURE)
+            .putExtra(ConnectionService.EXTRA_CAPTURE_RESULT_CODE, -1)
+
+        val controller = Robolectric.buildService(TestConnectionService::class.java, intent).create()
+        serviceUnderTest = controller.get()
+        controller.startCommand(0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("a refused consent must not be installed", false, capture.accepted)
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+            controller.get().foregroundServiceType,
+        )
+    }
+
+    private fun grantIntent(): Intent = Intent(context, ConnectionService::class.java)
+        .setAction(ConnectionService.ACTION_GRANT_CAPTURE)
+        .putExtra(ConnectionService.EXTRA_CAPTURE_RESULT_CODE, android.app.Activity.RESULT_OK)
+        .putExtra(ConnectionService.EXTRA_CAPTURE_RESULT_DATA, Intent("com.phoneconnect.test.CAPTURE"))
+
     private fun notificationText(): String? = shadowOf(manager)
         .getNotification(NotificationController.NOTIFICATION_ID)
         ?.extras
@@ -352,6 +458,8 @@ class ConnectionServiceTest {
 
         override fun managementChannel(): ManagementChannel? = management
 
+        override fun screenCaptureProvider(): ScreenCapture = screenCapture
+
         override fun managementDispatcher() = Dispatchers.Unconfined
 
         override fun enrollmentStore(): EnrollmentStore = store
@@ -362,6 +470,7 @@ class ConnectionServiceTest {
             private var installed: (() -> SessionRunner?)? = null
             private var management: ManagementChannel? = null
             var store: FakeStore = FakeStore(enrolled = true)
+            var screenCapture: ScreenCapture = RecordingScreenCapture()
 
             fun install(provider: () -> SessionRunner?) {
                 installed = provider
@@ -374,7 +483,36 @@ class ConnectionServiceTest {
             fun clear() {
                 installed = null
                 management = null
+                screenCapture = RecordingScreenCapture()
             }
+        }
+    }
+
+    /** Records the projection's lifecycle without creating a real MediaProjection. */
+    private class RecordingScreenCapture : ScreenCapture {
+        var granted = false
+            private set
+        var accepted = false
+            private set
+        var released = false
+            private set
+        var onAccept: () -> Unit = {}
+
+        override fun available(): Boolean = granted
+
+        override fun accept(resultCode: Int, data: Intent?) {
+            if (resultCode != android.app.Activity.RESULT_OK || data == null) return
+            accepted = true
+            granted = true
+            onAccept()
+        }
+
+        override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame =
+            CapturedFrame(byteArrayOf(1, 2, 3), 1, 1, 0)
+
+        override fun release() {
+            granted = false
+            released = true
         }
     }
 

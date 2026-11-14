@@ -38,10 +38,23 @@ open class CommandDispatcher(
     private val deviceInfo: DeviceInfoHandler = DeviceInfoHandler(),
     private val files: FileHandler? = null,
     private val apps: AppsHandler? = null,
+    private val screen: ScreenHandler? = null,
+    private val props: SystemPropertiesHandler? = null,
+    private val shell: ShellHandler? = null,
+    private val logcat: LogcatHandler? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    open suspend fun dispatch(name: String, args: JSONObject? = null): Result<JSONObject> = when (name) {
+    /**
+     * Routes one command. [budgetMs] is what is left of the server's deadline; a handler that
+     * blocks a thread (a frame capture) uses it to bound its own wait, because a coroutine
+     * timeout cannot interrupt a blocking platform call.
+     */
+    open suspend fun dispatch(
+        name: String,
+        args: JSONObject? = null,
+        budgetMs: Long = DEFAULT_BUDGET_MS,
+    ): Result<JSONObject> = when (name) {
         DEVICE_INFO -> runCatching { deviceInfo.describe() }
         DEVICE_PING -> runCatching {
             JSONObject()
@@ -61,6 +74,24 @@ open class CommandDispatcher(
                     ?: return@withContext Result.failure(CommandFailure.unknown(name))
                 runCatching { handler.handle(name, args) }
             }
+        SCREEN_SNAPSHOT ->
+            withContext(ioDispatcher) {
+                val handler = screen
+                    ?: return@withContext Result.failure(CommandFailure.unknown(name))
+                runCatching { handler.snapshot(budgetMs) }
+            }
+        SYSTEM_PROPS -> withContext(ioDispatcher) {
+            val handler = props ?: return@withContext Result.failure(CommandFailure.unknown(name))
+            runCatching { handler.select(args) }
+        }
+        // These two can never succeed for this app; they are here so a caller gets
+        // `not_permitted` with a reason rather than `unknown_command`.
+        SHELL_EXEC -> runCatching {
+            (shell ?: throw CommandFailure.unknown(name)).exec()
+        }
+        LOGCAT_TAIL -> runCatching {
+            (logcat ?: throw CommandFailure.unknown(name)).tail()
+        }
         else -> Result.failure(CommandFailure.unknown(name))
     }
 
@@ -81,5 +112,13 @@ open class CommandDispatcher(
         const val APPS_STOP = "apps.stop"
         const val APPS_CLEAR = "apps.clear"
         const val APPS_SET_ENABLED = "apps.set_enabled"
+
+        const val SCREEN_SNAPSHOT = "screen.snapshot"
+        const val SYSTEM_PROPS = "system.props"
+        const val SHELL_EXEC = "shell.exec"
+        const val LOGCAT_TAIL = "logcat.tail"
+
+        /** The server's default deadline, used when a caller does not supply a budget. */
+        const val DEFAULT_BUDGET_MS: Long = 10_000
     }
 }

@@ -1,12 +1,15 @@
 package com.phoneconnect.agent
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.os.Looper
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
+import androidx.core.content.IntentCompat
 import com.phoneconnect.agent.net.HubClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -124,6 +127,78 @@ class SetupActivityTest {
         }
     }
 
+    @Test
+    fun `enabling screen capture is an explicit action that hands the grant to the service`() {
+        val activity = setupActivity()
+
+        activity.findViewById<Button>(R.id.enable_capture).performClick()
+        val request = shadowOf(activity).nextStartedActivityForResult
+        assertNotNull("the setup screen must ask the system for consent", request)
+        assertEquals(SetupActivity.REQUEST_SCREEN_CAPTURE, request.requestCode)
+
+        val grant = Intent("android.media.projection.test").putExtra("token", "grant")
+        activity.onActivityResult(SetupActivity.REQUEST_SCREEN_CAPTURE, Activity.RESULT_OK, grant)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val started = shadowOf(context as Application).nextStartedService
+        assertEquals(
+            "the grant must reach the one connection service",
+            ConnectionService::class.java.name,
+            started?.component?.className,
+        )
+        assertEquals(ConnectionService.ACTION_GRANT_CAPTURE, started?.action)
+        assertEquals(
+            Activity.RESULT_OK,
+            started?.getIntExtra(ConnectionService.EXTRA_CAPTURE_RESULT_CODE, Int.MIN_VALUE),
+        )
+        assertNotNull(
+            "the consent token must be handed over as the system returned it",
+            IntentCompat.getParcelableExtra(
+                started!!,
+                ConnectionService.EXTRA_CAPTURE_RESULT_DATA,
+                Intent::class.java,
+            ),
+        )
+        val status = activity.findViewById<TextView>(R.id.capture_status).text.toString()
+        assertTrue("the screen must say capture is on, was '$status'", status.contains("enabled", ignoreCase = true))
+        assertTrue("the screen must offer a way to stop it", activity.findViewById<Button>(R.id.disable_capture).isEnabled)
+    }
+
+    @Test
+    fun `a refused or cancelled consent request is reported and enables nothing`() {
+        val activity = setupActivity()
+
+        activity.onActivityResult(SetupActivity.REQUEST_SCREEN_CAPTURE, Activity.RESULT_CANCELED, null)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "a cancelled consent must not touch the service",
+            null,
+            shadowOf(context as Application).nextStartedService,
+        )
+        val status = activity.findViewById<TextView>(R.id.capture_status).text.toString()
+        assertTrue("the screen must say consent was not granted, was '$status'", status.contains("not granted", ignoreCase = true))
+    }
+
+    @Test
+    fun `stopping screen capture sends the revoke action`() {
+        val activity = setupActivity()
+        activity.onActivityResult(
+            SetupActivity.REQUEST_SCREEN_CAPTURE,
+            Activity.RESULT_OK,
+            Intent("android.media.projection.test"),
+        )
+        shadowOf(context as Application).clearStartedServices()
+
+        activity.findViewById<Button>(R.id.disable_capture).performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val started = shadowOf(context as Application).nextStartedService
+        assertEquals(ConnectionService.ACTION_REVOKE_CAPTURE, started?.action)
+        val status = activity.findViewById<TextView>(R.id.capture_status).text.toString()
+        assertTrue("the screen must say capture is off, was '$status'", status.contains("off", ignoreCase = true))
+    }
+
     private fun setupActivity(): SetupActivity {
         TestSetupActivity.storeOverride = store
         return Robolectric.buildActivity(
@@ -152,6 +227,8 @@ class SetupActivityTest {
         override fun enrollmentStore(): EnrollmentStore = storeOverride
 
         override fun hubClient(hubUrl: String): Result<HubClient> = HubClient.create(hubUrl)
+
+        override fun screenCaptureIntent(): Intent = Intent("com.phoneconnect.test.CAPTURE_CONSENT")
 
         companion object {
             lateinit var storeOverride: EnrollmentStore

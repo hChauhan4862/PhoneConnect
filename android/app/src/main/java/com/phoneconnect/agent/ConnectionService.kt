@@ -1,9 +1,11 @@
 package com.phoneconnect.agent
 
+import android.app.Activity
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -12,11 +14,18 @@ import android.os.Build
 import android.os.IBinder
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import com.phoneconnect.agent.control.AndroidAppPlatform
 import com.phoneconnect.agent.control.AppsHandler
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.FileHandler
+import com.phoneconnect.agent.control.LogcatHandler
+import com.phoneconnect.agent.control.MediaProjectionScreenCapture
 import com.phoneconnect.agent.control.PathGuard
+import com.phoneconnect.agent.control.ScreenCapture
+import com.phoneconnect.agent.control.ScreenHandler
+import com.phoneconnect.agent.control.ShellHandler
+import com.phoneconnect.agent.control.SystemPropertiesHandler
 import com.phoneconnect.agent.net.DeviceControlChannel
 import com.phoneconnect.agent.net.HubClient
 import com.phoneconnect.agent.net.TransportSessionRunner
@@ -38,6 +47,9 @@ sealed interface StartResult {
     /** The system refused the start (background-start restrictions); the reason is for the UI. */
     data class Refused(val reason: String) : StartResult
 }
+
+/** The screen-capture consent a user just granted, carried from the setup screen to the service. */
+data class CaptureGrant(val resultCode: Int, val data: Intent)
 
 /**
  * The management connection the service runs beside the sealed session.
@@ -75,6 +87,14 @@ open class ConnectionService : Service() {
     private var detachedStatus = false
     private var lastStatus: ConnectionStatus? = null
 
+    /**
+     * The projection the user granted on the setup screen, held for this service's lifetime.
+     * Android cannot persist the token across process death, so after a restart the command
+     * answers `consent_required` until the user grants it again. Lazy: a service that never
+     * captures never touches `MediaProjection`.
+     */
+    private val screenCapture: ScreenCapture by lazy { screenCaptureProvider() }
+
     /** Written and read on the main thread only. */
     private var managementState = ManagementChannelState.OFFLINE
 
@@ -86,16 +106,35 @@ open class ConnectionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            screenCapture.release()
+            captureEnabled = false
             stopConnection()
             stopSelf()
             return START_NOT_STICKY
         }
 
         val runner = sessionRunner()
+        val grant = captureGrant(intent)
 
-        // The only startForeground call site: the service is foreground from its first
-        // moment and every later state updates this same notification.
-        startForeground(NotificationController.NOTIFICATION_ID, notifications.build(initialStatus(runner)))
+        // The only startForeground call site. The projection type is declared *before* the
+        // grant is used: from Android 14 the service must already be running with
+        // `mediaProjection` when the token is acquired, and the notification stays the same
+        // single id and channel.
+        enterForeground(runner, projection = grant != null || screenCapture.available())
+
+        if (intent?.action == ACTION_REVOKE_CAPTURE) {
+            screenCapture.release()
+            captureEnabled = false
+            enterForeground(runner, projection = false)
+        }
+        if (grant != null) {
+            screenCapture.accept(grant.resultCode, grant.data)
+            captureEnabled = screenCapture.available()
+            // A refused token means the type must not claim a projection we do not hold.
+            if (!captureEnabled) {
+                enterForeground(runner, projection = false)
+            }
+        }
 
         if (loop?.isActive != true) {
             startLoop(runner)
@@ -109,6 +148,10 @@ open class ConnectionService : Service() {
         loop = null
         managementJob?.cancel()
         managementJob = null
+        // A projection is a session, not a preference: it must not outlive the service that
+        // declared the type it runs under.
+        screenCapture.release()
+        captureEnabled = false
         serviceScope.cancel()
         // A terminal status is deliberately left visible after the service stops.
         if (!detachedStatus) {
@@ -151,10 +194,20 @@ open class ConnectionService : Service() {
                 telemetry = sampler,
                 files = FileHandler(PathGuard(filesRoot())),
                 apps = AppsHandler(AndroidAppPlatform(this)),
+                screen = ScreenHandler(screenCapture),
+                props = SystemPropertiesHandler(),
+                shell = ShellHandler(),
+                logcat = LogcatHandler(),
             ),
             telemetry = sampler,
         )
     }
+
+    /**
+     * Composition point for the projection. The only production implementation talks to
+     * `MediaProjection`; tests inject one that records the grant lifecycle.
+     */
+    internal open fun screenCaptureProvider(): ScreenCapture = MediaProjectionScreenCapture(this)
 
     /**
      * The one directory file commands may touch: this app's own external files directory,
@@ -171,6 +224,41 @@ open class ConnectionService : Service() {
 
     /** Dispatcher for storage work; production uses IO, tests override it. */
     internal open fun storageDispatcher(): CoroutineDispatcher = Dispatchers.IO
+
+    /**
+     * The only place the service becomes foreground. [projection] adds the mediaProjection
+     * type; the notification id and channel never change, so there is still exactly one
+     * notification.
+     */
+    private fun enterForeground(runner: SessionRunner?, projection: Boolean) {
+        val status = lastStatus ?: initialStatus(runner)
+        val notification = notifications.build(status)
+        // The typed form is API 29+; API 28 has no foreground-service types to declare.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NotificationController.NOTIFICATION_ID,
+                notification,
+                if (projection) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                } else {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                },
+            )
+        } else {
+            startForeground(NotificationController.NOTIFICATION_ID, notification)
+        }
+    }
+
+    /** The consent result the setup screen handed over, or `null` when it did not grant one. */
+    private fun captureGrant(intent: Intent?): CaptureGrant? {
+        if (intent?.action != ACTION_GRANT_CAPTURE) return null
+        val resultCode = intent.getIntExtra(EXTRA_CAPTURE_RESULT_CODE, Activity.RESULT_CANCELED)
+        val data = IntentCompat.getParcelableExtra(intent, EXTRA_CAPTURE_RESULT_DATA, Intent::class.java)
+            ?: return null
+        if (resultCode != Activity.RESULT_OK) return null
+        return CaptureGrant(resultCode, data)
+    }
 
     private fun initialStatus(runner: SessionRunner?): ConnectionStatus =
         if (runner == null) {
@@ -298,6 +386,15 @@ open class ConnectionService : Service() {
         const val ACTION_START = "com.phoneconnect.agent.action.START"
         const val ACTION_STOP = "com.phoneconnect.agent.action.STOP"
 
+        /** Carries a user's screen-capture consent into the service; never sent by a command. */
+        const val ACTION_GRANT_CAPTURE = "com.phoneconnect.agent.action.GRANT_CAPTURE"
+
+        /** Ends the projection the user enabled; the next snapshot is `consent_required`. */
+        const val ACTION_REVOKE_CAPTURE = "com.phoneconnect.agent.action.REVOKE_CAPTURE"
+
+        const val EXTRA_CAPTURE_RESULT_CODE = "com.phoneconnect.agent.extra.CAPTURE_RESULT_CODE"
+        const val EXTRA_CAPTURE_RESULT_DATA = "com.phoneconnect.agent.extra.CAPTURE_RESULT_DATA"
+
         const val REFUSAL_FOREGROUND_TIMEOUT = "foreground_service_timeout"
         const val REFUSAL_BACKGROUND_START = "foreground_service_start_not_allowed"
         const val REFUSAL_OTHER = "foreground_service_start_refused"
@@ -307,6 +404,27 @@ open class ConnectionService : Service() {
 
         fun stopIntent(context: Context): Intent =
             Intent(context, ConnectionService::class.java).setAction(ACTION_STOP)
+
+        /** Hands the system's consent result to the one service, which holds it until stopped. */
+        fun captureConsentIntent(context: Context, resultCode: Int, data: Intent): Intent =
+            Intent(context, ConnectionService::class.java)
+                .setAction(ACTION_GRANT_CAPTURE)
+                .putExtra(EXTRA_CAPTURE_RESULT_CODE, resultCode)
+                .putExtra(EXTRA_CAPTURE_RESULT_DATA, data)
+
+        fun revokeCaptureIntent(context: Context): Intent =
+            Intent(context, ConnectionService::class.java).setAction(ACTION_REVOKE_CAPTURE)
+
+        /**
+         * Whether this process currently holds a projection. A UI mirror only: the service
+         * updates it when a grant is accepted, revoked, or the service stops. Android cannot
+         * persist the grant, so after a restart this is false and a snapshot is
+         * `consent_required` again.
+         */
+        @Volatile
+        private var captureEnabled = false
+
+        fun screenCaptureEnabled(): Boolean = captureEnabled
 
         /**
          * Asks for the one service and reports a refusal instead of crashing. Android 12+

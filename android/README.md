@@ -77,12 +77,45 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    list.** `KILL_BACKGROUND_PROCESSES` is declared for `apps.stop`. Both are ordinary
    permissions; neither grants the signature-level authority `apps.clear`/`apps.set_enabled`
    would need.
+9. **Screen capture.** `screen.snapshot` returns one real frame from a `MediaProjection` the
+   user granted: `{png_base64, width, height, captured_at_ms}`. Consent is requested only from
+   `SetupActivity` ("Enable screen capture", an explicit user action that opens the system
+   dialog); the result is handed to the one service through `ACTION_GRANT_CAPTURE` and held for
+   the service's lifetime. **Without consent the command is `error: consent_required` and no
+   code path can prompt**: `ScreenHandler` refuses before touching the platform. Android cannot
+   persist a projection token across process death, so after a restart the answer is
+   `consent_required` again rather than a crash. One `VirtualDisplay` + `ImageReader` pair
+   serves the whole grant, and its listener keeps the newest frame (so a capture of an unchanged
+   screen returns that frame, with the `captured_at_ms` when it was produced, instead of waiting
+   for a change that will never come). The pair **cannot** be re-created per frame: on Android
+   14/15 a token may create one virtual display, and a second `createVirtualDisplay` logs
+   `Reusing token: Throw exception due to invalid projection` and stops the projection (observed
+   on the `pc35` emulator). Everything — the display, the reader, the cached frame, and the
+   projection — is released when the user stops capture, the service stops, or the system ends
+   the session (`MediaProjection.Callback.onStop`), so nothing outlives the grant. A capture
+   waits for the first frame bounded by the command's remaining budget (and at most 5 s) and
+   never runs on the command receive loop. The encoded frame is downscaled by whole factors
+   until its base64 is under 2 MiB minus an envelope allowance, and `width`/`height` report the
+   size actually captured; a frame that cannot get under the budget is `result_too_large`,
+   never truncated.
+10. **System properties and the two honest refusals.** `system.props` reports a documented
+    allowlist read through `android.os.SystemProperties` reflection: `sdk`
+    (`ro.build.version.sdk`), `release` (`ro.build.version.release`), `model`
+    (`ro.product.model`), `manufacturer` (`ro.product.manufacturer`), `build_id`
+    (`ro.build.id`), and `security_patch` (`ro.build.version.security_patch`). `{}` returns the
+    whole map; `{keys:[...]}` selects a subset; a name outside the allowlist is
+    `not_permitted` (and is never read); a reflection failure is `props_unavailable`. A
+    property the platform does not report is `null`, never an invented value. `shell.exec` and
+    `logcat.tail` always answer `not_permitted` with a constant message naming the platform
+    restriction: a shell needs the ADB/root UID, and `READ_LOGS` is signature-level. They exist
+    so a caller receives a machine code instead of `unknown_command`; the web console renders
+    both as unavailable-with-reason, never as controls that fail silently.
 
 ## Layout
 
 | File | Responsibility |
 | --- | --- |
-| `SetupActivity.kt` | The only screen: hub URL, token, enrollment, notification permission, status and recovery. |
+| `SetupActivity.kt` | The only screen: hub URL, token, enrollment, notification permission, the screen-capture consent control, status and recovery. |
 | `ConnectionService.kt` | The only foreground service and the only `startForeground` call site; lifecycle, recovery wiring, outcome handling, `onTimeout`. |
 | `NotificationController.kt` | The only notification: one fixed id, one channel, updated in place. |
 | `ConnectionStatus.kt` / `ConnectionStatusBus.kt` | What the notification and setup screen show. |
@@ -105,6 +138,10 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `control/FileHandler.kt` | The six `files.*` commands: chunked reads, capped writes, empty-directory delete. |
 | `control/AppsHandler.kt` | The five `apps.*` commands, the `AppPlatform` contract, and the honest refusals a non-privileged app must give. |
 | `control/AndroidAppPlatform.kt` | The only `AppPlatform`: `PackageManager` inventory and launch intent, `ActivityManager` kill and background-start check. |
+| `control/ScreenHandler.kt` | `screen.snapshot`: the `consent_required` refusal, the result budget, and the `ScreenCapture` contract. |
+| `control/MediaProjectionScreenCapture.kt` | The only `ScreenCapture`: consent token, `MediaProjection` + `VirtualDisplay` + `ImageReader`, PNG downscaling, and per-frame release. |
+| `control/SystemPropsHandler.kt` | `system.props`: the allowlist and the reflective `android.os.SystemProperties` reader. |
+| `control/ShellHandler.kt` / `control/LogcatHandler.kt` | The two constant `not_permitted` refusals that name the platform restriction. |
 | `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
 | `RecoveryReceiver.kt` | Boot and post-update recovery with `goAsync`, refusing gracefully when the OS refuses. |
 | `AgentSettings.kt` / `AgentDiagnostics.kt` | Hub URL and the last background-start refusal. |
@@ -144,17 +181,25 @@ and fails if a non-loopback domain is covered or the base config starts allowing
 
 ## Foreground service type
 
-The service is `connectedDevice` with `FOREGROUND_SERVICE_CONNECTED_DEVICE` and
-`CHANGE_NETWORK_STATE`. `dataSync` is wrong for this product on Android 15: it cannot be
-started from `BOOT_COMPLETED` and it is capped at six hours per day. `onTimeout` stops the
-loop and removes the notification if the system still ends the service, and a refused
-background start is recorded and shown on the setup screen instead of crashing the receiver.
+The service is `connectedDevice|mediaProjection` with `FOREGROUND_SERVICE_CONNECTED_DEVICE`,
+`FOREGROUND_SERVICE_MEDIA_PROJECTION`, and `CHANGE_NETWORK_STATE`. `dataSync` is wrong for this
+product on Android 15: it cannot be started from `BOOT_COMPLETED` and it is capped at six hours
+per day. `onTimeout` stops the loop and removes the notification if the system still ends the
+service, and a refused background start is recorded and shown on the setup screen instead of
+crashing the receiver.
+
+The `mediaProjection` type is added only when a projection is held: the service enters the
+foreground with both types *before* it acquires the token, because Android 14+ requires the
+mediaProjection type to be running when `getMediaProjection` is called. When the user stops
+capture the type drops back to `connectedDevice`. It remains one service, one notification id,
+and one channel; the extra type changes nothing the user sees.
 
 ## Invariants the tests hold
 
-- **One notification.** `NotificationControllerTest` scans the module's own sources: one
-  `startForeground` call site, one `notify` call site, only the single `NOTIFICATION_ID`, one
-  declaration, and no notification APIs outside the controller.
+- **One notification.** `NotificationControllerTest` scans the module's own sources: every
+  `startForeground` call site is in `ConnectionService`, one `notify` call site, only the
+  single `NOTIFICATION_ID`, one declaration, and no notification APIs outside the controller.
+  (The typed and untyped `startForeground` forms are API-gated branches of the one place.)
 - **One service loop.** Two start deliveries open one session; a terminal outcome stops the
   service but leaves the reason visible; a later enrollment starts a fresh instance.
 - **Secrets stay behind the boundary.** No plaintext getter; only the storage, enrollment
@@ -188,11 +233,15 @@ still stop the agent. The notification and setup screen say so and show recovery
 - **Ticket signatures are not verified.** The Ed25519 signature is carried from the hub but
   not checked; TLS authenticity to the hub is the trust anchor, exactly as the Rust transport
   documents for trust-on-first-use. Porting Ed25519 verification is follow-up work.
-- **The management vocabulary is small.** `device.info`, `device.ping`, `telemetry.now`, and
-  the `files.*` commands are implemented; apps, screen capture, console/logcat, and toggles are
-  follow-up tasks that add handler files to the same dispatcher. File transfers stay inside the
-  app's own external files directory: shared storage at large needs a scoped-storage design of
-  its own and is not offered. CPU percentage is reported as `null`: Android does not expose
-  per-app CPU counters to an ordinary app.
+- **The management vocabulary is small.** `device.info`, `device.ping`, `telemetry.now`, the
+  `files.*` commands, the `apps.*` commands, `screen.snapshot`, `system.props`, and the two
+  documented refusals (`shell.exec`, `logcat.tail`) are implemented; toggles are a follow-up
+  task that adds handler files to the same dispatcher. File transfers stay inside the app's
+  own external files directory: shared storage at large needs a scoped-storage design of its
+  own and is not offered. CPU percentage is reported as `null`: Android does not expose per-app
+  CPU counters to an ordinary app.
+- **Screen capture is one frame, not a stream.** There is no mirroring, no continuous encoder,
+  and no input injection. A capture needs the grant the user made from the setup screen; the
+  grant does not survive a process restart, and the setup screen says so.
 - **Instrumentation tests cannot run in this environment** (no AVD, no emulator system
   images), so the emulator smoke test and real-Keystore/OEM behaviour are unverified here.

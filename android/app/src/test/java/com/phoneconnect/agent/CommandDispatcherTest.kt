@@ -2,13 +2,20 @@ package com.phoneconnect.agent
 
 import com.phoneconnect.agent.control.AppPlatform
 import com.phoneconnect.agent.control.AppsHandler
+import com.phoneconnect.agent.control.CapturedFrame
 import com.phoneconnect.agent.control.CommandDispatcher
 import com.phoneconnect.agent.control.CommandFailure
 import com.phoneconnect.agent.control.DeviceDescription
 import com.phoneconnect.agent.control.DeviceInfoHandler
 import com.phoneconnect.agent.control.FileHandler
 import com.phoneconnect.agent.control.InstalledApp
+import com.phoneconnect.agent.control.LogcatHandler
 import com.phoneconnect.agent.control.PathGuard
+import com.phoneconnect.agent.control.ScreenCapture
+import com.phoneconnect.agent.control.ScreenHandler
+import com.phoneconnect.agent.control.ShellHandler
+import com.phoneconnect.agent.control.SystemPropertiesHandler
+import com.phoneconnect.agent.control.SystemPropertySource
 import com.phoneconnect.agent.net.DeviceControlChannel
 import com.phoneconnect.agent.telemetry.BatteryReading
 import com.phoneconnect.agent.telemetry.MemoryReading
@@ -179,6 +186,81 @@ class CommandDispatcherTest {
             DeviceControlChannel.MAX_BACKOFF_MS,
             DeviceControlChannel.backoffMs(Int.MAX_VALUE),
         )
+    }
+
+    @Test
+    fun `the screen snapshot runs off the receive loop and honours the command budget`() = runBlocking {
+        val recording = RecordingDispatcher(Dispatchers.IO)
+        var seenTimeout = 0L
+        val capture = object : ScreenCapture {
+            override fun available() = true
+
+            override fun accept(resultCode: Int, data: android.content.Intent?) = Unit
+
+            override fun capture(maxEncodedBytes: Int, timeoutMs: Long): CapturedFrame {
+                seenTimeout = timeoutMs
+                return CapturedFrame(byteArrayOf(1, 2, 3), width = 10, height = 20, capturedAtMs = 5)
+            }
+
+            override fun release() = Unit
+        }
+        val withScreen = CommandDispatcher(
+            telemetry = telemetry,
+            screen = ScreenHandler(capture),
+            ioDispatcher = recording,
+        )
+
+        val output = withScreen
+            .dispatch(CommandDispatcher.SCREEN_SNAPSHOT, JSONObject(), budgetMs = 750)
+            .getOrThrow()
+
+        assertEquals(750L, seenTimeout)
+        assertEquals(10, output.getInt("width"))
+        assertTrue("a capture must not run on the command receive loop", recording.used.get())
+    }
+
+    @Test
+    fun `a screen snapshot without a configured projection is still answered by name`() = runBlocking {
+        val failure = dispatcher.dispatch(CommandDispatcher.SCREEN_SNAPSHOT).exceptionOrNull()
+
+        assertEquals("unknown_command", (failure as CommandFailure).code)
+    }
+
+    @Test
+    fun `system props report the documented allowlist through the handler`() = runBlocking {
+        val withProps = CommandDispatcher(
+            telemetry = telemetry,
+            props = SystemPropertiesHandler(
+                SystemPropertySource { name -> if (name == "ro.build.version.sdk") "35" else null },
+            ),
+        )
+
+        val selected = withProps.dispatch(CommandDispatcher.SYSTEM_PROPS).getOrThrow().getJSONObject("selected")
+
+        assertEquals("35", selected.getString("sdk"))
+        assertTrue("a property the platform did not report is null", selected.isNull("model"))
+    }
+
+    @Test
+    fun `shell exec and logcat tail are refusals the dispatcher owns`() = runBlocking {
+        val withConsole = CommandDispatcher(
+            telemetry = telemetry,
+            shell = ShellHandler(),
+            logcat = LogcatHandler(),
+        )
+
+        for (name in listOf(CommandDispatcher.SHELL_EXEC, CommandDispatcher.LOGCAT_TAIL)) {
+            val failure = withConsole.dispatch(name).exceptionOrNull()
+            assertTrue("$name must not be unknown", failure is CommandFailure)
+            assertEquals("not_permitted", (failure as CommandFailure).code)
+        }
+    }
+
+    @Test
+    fun `a console refusal without a configured handler is still answered by name`() = runBlocking {
+        val failure = dispatcher.dispatch(CommandDispatcher.SHELL_EXEC).exceptionOrNull()
+
+        assertEquals("unknown_command", (failure as CommandFailure).code)
     }
 
     /** Records that work was dispatched instead of run inline, then delegates to a real pool. */

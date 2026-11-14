@@ -2,7 +2,9 @@ package com.phoneconnect.agent
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
@@ -33,11 +35,21 @@ open class SetupActivity : Activity() {
     private lateinit var tokenField: EditText
     private lateinit var statusView: TextView
     private lateinit var enrollButton: Button
+    private lateinit var enableCaptureButton: Button
+    private lateinit var disableCaptureButton: Button
+    private lateinit var captureStatusView: TextView
+
+    /** What this screen last knew about the projection; the service is the authority. */
+    private var captureOn = false
 
     /** Test seams: the real implementations are the Keystore store and the HTTPS client. */
     internal open fun enrollmentStore(): EnrollmentStore = KeystoreEnrollmentStore(this)
 
     internal open fun hubClient(hubUrl: String): Result<HubClient> = HubClient.create(hubUrl)
+
+    /** The system's screen-capture consent dialog; a user action, never a command. */
+    internal open fun screenCaptureIntent(): Intent =
+        getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,10 +58,17 @@ open class SetupActivity : Activity() {
         tokenField = findViewById(R.id.enrollment_token)
         statusView = findViewById(R.id.status)
         enrollButton = findViewById(R.id.enroll)
+        enableCaptureButton = findViewById(R.id.enable_capture)
+        disableCaptureButton = findViewById(R.id.disable_capture)
+        captureStatusView = findViewById(R.id.capture_status)
 
         hubField.setText(AgentSettings(this).hubUrl().orEmpty())
         enrollButton.setOnClickListener { enroll() }
+        enableCaptureButton.setOnClickListener { requestScreenCapture() }
+        disableCaptureButton.setOnClickListener { stopScreenCapture() }
 
+        captureOn = ConnectionService.screenCaptureEnabled()
+        showCaptureState()
         requestNotificationPermission()
         showInitialState()
 
@@ -60,6 +79,63 @@ open class SetupActivity : Activity() {
                 }
             }
         }
+    }
+
+    /**
+     * The explicit user action screen capture needs. The result is handed to the one service;
+     * no command can reach this path, which is why a snapshot without consent is a refusal
+     * rather than a dialog.
+     */
+    private fun requestScreenCapture() {
+        val intent = try {
+            screenCaptureIntent()
+        } catch (error: RuntimeException) {
+            captureStatusView.text = getString(R.string.setup_capture_not_granted)
+            return
+        }
+        startActivityForResult(intent, REQUEST_SCREEN_CAPTURE)
+    }
+
+    private fun stopScreenCapture() {
+        try {
+            ContextCompat.startForegroundService(this, ConnectionService.revokeCaptureIntent(this))
+        } catch (error: IllegalStateException) {
+            // The service is not startable from here; nothing is held, so nothing is leaked.
+        }
+        captureOn = false
+        showCaptureState()
+    }
+
+    /** The consent result comes back only from the system's own dialog. */
+    public override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode != REQUEST_SCREEN_CAPTURE) {
+            super.onActivityResult(requestCode, resultCode, data)
+            return
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            showCaptureState()
+            captureStatusView.text = getString(R.string.setup_capture_not_granted)
+            return
+        }
+        try {
+            ContextCompat.startForegroundService(
+                this,
+                ConnectionService.captureConsentIntent(this, resultCode, data),
+            )
+        } catch (error: IllegalStateException) {
+            captureStatusView.text = getString(R.string.setup_capture_not_granted)
+            return
+        }
+        captureOn = true
+        showCaptureState()
+    }
+
+    private fun showCaptureState() {
+        captureStatusView.text = getString(
+            if (captureOn) R.string.setup_capture_on else R.string.setup_capture_off,
+        )
+        enableCaptureButton.isEnabled = !captureOn
+        disableCaptureButton.isEnabled = captureOn
     }
 
     override fun onDestroy() {
@@ -148,7 +224,8 @@ open class SetupActivity : Activity() {
         is ConnectionStatus.ActionRequired -> status.message
     }
 
-    private companion object {
+    internal companion object {
         const val REQUEST_NOTIFICATIONS = 1001
+        const val REQUEST_SCREEN_CAPTURE = 1002
     }
 }

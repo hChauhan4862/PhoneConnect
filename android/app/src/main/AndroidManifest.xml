@@ -8,6 +8,9 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Required by android:foregroundServiceType="mediaProjection": screen.snapshot captures
+         only while the user has enabled screen capture on the setup screen, never on its own. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
@@ -46,11 +49,16 @@
              `connectedDevice` is the type for a long-lived authenticated connection: it may
              be started from BOOT_COMPLETED on Android 15 and is not subject to the six-hour
              dataSync cap. It requires FOREGROUND_SERVICE_CONNECTED_DEVICE plus a qualifying
-             runtime permission (CHANGE_NETWORK_STATE here). -->
+             runtime permission (CHANGE_NETWORK_STATE here).
+
+             `mediaProjection` is added because screen.snapshot mirrors the display, and only
+             while the user has enabled screen capture: the service is started with both types
+             before the projection token is used, because Android 14+ requires the type to be
+             running when the token is acquired. It is still one service and one notification. -->
         <service
             android:name=".ConnectionService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice"
+            android:foregroundServiceType="connectedDevice|mediaProjection"
             android:stopWithTask="false" />
 
         <!-- The only screen: hub URL, one-time enrollment token, status and recovery. -->

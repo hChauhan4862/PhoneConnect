@@ -115,16 +115,15 @@ class NotificationControllerTest {
     }
 
     @Test
-    fun `the agent has exactly one startForeground call site and one notification id`() {
+    fun `the agent posts its one notification through one id`() {
         val sources = mainKotlinSources()
         val startForeground = sources.flatMap { (path, text) ->
             Regex("""\bstartForeground\s*\(\s*([^,)\n]+)""").findAll(text).map { path to it.groupValues[1].trim() }
         }
-        assertEquals("exactly one startForeground call site", 1, startForeground.size)
-        assertEquals(
-            "the foreground notification must be posted by ConnectionService",
-            "ConnectionService.kt",
-            startForeground.single().first.substringAfterLast('/'),
+        assertTrue("the service must post its foreground notification", startForeground.isNotEmpty())
+        assertTrue(
+            "the foreground notification must be posted by ConnectionService, found $startForeground",
+            startForeground.all { it.first.substringAfterLast('/') == "ConnectionService.kt" },
         )
 
         val notify = sources.flatMap { (path, text) ->

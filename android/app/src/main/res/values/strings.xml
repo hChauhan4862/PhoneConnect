@@ -20,4 +20,10 @@
     <string name="setup_status_with_refusal">%1$s\nThe system refused the last background start: %2$s. Open this screen to reconnect.</string>
     <string name="setup_enrolled_refused">Enrolled as %1$s. The system refused the background start: %2$s. Open this screen to reconnect.</string>
     <string name="setup_enrolled_cleared">Not enrolled (%1$s). Enroll again to reconnect.</string>
+
+    <string name="setup_capture_enable">Enable screen capture</string>
+    <string name="setup_capture_disable">Stop screen capture</string>
+    <string name="setup_capture_off">Screen capture is off. A snapshot command answers consent_required until you enable it here.</string>
+    <string name="setup_capture_on">Screen capture is enabled. Android cannot keep this grant across a restart, so enable it again after the app restarts.</string>
+    <string name="setup_capture_not_granted">Screen capture was not granted. The snapshot command stays unavailable.</string>
 </resources>

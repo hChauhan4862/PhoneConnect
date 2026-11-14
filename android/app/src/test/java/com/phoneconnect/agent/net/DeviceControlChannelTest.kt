@@ -144,7 +144,7 @@ class DeviceControlChannelTest {
             ),
         )
         val slow = object : CommandDispatcher(telemetry = telemetry) {
-            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+            override suspend fun dispatch(name: String, args: JSONObject?, budgetMs: Long): Result<JSONObject> {
                 delay(5_000)
                 return Result.success(JSONObject())
             }
@@ -197,7 +197,7 @@ class DeviceControlChannelTest {
         val executed = java.util.Collections.synchronizedList(mutableListOf<String>())
         val results = Channel<JSONObject>(Channel.BUFFERED)
         val handlers = object : CommandDispatcher(telemetry = telemetry) {
-            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+            override suspend fun dispatch(name: String, args: JSONObject?, budgetMs: Long): Result<JSONObject> {
                 executed += name
                 return Result.success(JSONObject().put("pong", true))
             }
@@ -282,7 +282,7 @@ class DeviceControlChannelTest {
         val executed = java.util.Collections.synchronizedList(mutableListOf<String>())
         val result = Channel<JSONObject>(Channel.BUFFERED)
         val handlers = object : CommandDispatcher(telemetry = telemetry) {
-            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+            override suspend fun dispatch(name: String, args: JSONObject?, budgetMs: Long): Result<JSONObject> {
                 executed += name
                 return Result.success(JSONObject())
             }
@@ -450,7 +450,7 @@ class DeviceControlChannelTest {
         val results = Channel<JSONObject>(Channel.BUFFERED)
         val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         val slow = object : CommandDispatcher(telemetry = telemetry) {
-            override suspend fun dispatch(name: String, args: JSONObject?): Result<JSONObject> {
+            override suspend fun dispatch(name: String, args: JSONObject?, budgetMs: Long): Result<JSONObject> {
                 if (name == "device.ping") return Result.success(JSONObject().put("pong", true))
                 try {
                     kotlinx.coroutines.delay(30_000)

@@ -56,6 +56,27 @@
             android:layout_marginTop="16dp"
             android:text="@string/setup_status_idle" />
 
+        <Button
+            android:id="@+id/enable_capture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/setup_capture_enable" />
+
+        <Button
+            android:id="@+id/disable_capture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/setup_capture_disable" />
+
+        <TextView
+            android:id="@+id/capture_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/setup_capture_off" />
+
         <TextView
             android:id="@+id/recovery"
             android:layout_width="match_parent"
