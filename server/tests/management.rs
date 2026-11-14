@@ -6,6 +6,7 @@ mod common;
 use common::TestApp;
 use common::control;
 use phoneconnect_server::management;
+use phoneconnect_server::store::DeviceStore;
 use serde_json::json;
 
 #[tokio::test]
@@ -366,6 +367,29 @@ async fn a_closed_channel_fails_pending_commands_as_device_offline() {
     assert_eq!(body["status"], "error");
     assert_eq!(body["error"], "device_offline");
 
+    // The channel ending is a terminal state without a device answer, so it appends the outcome
+    // row the dispatch row needs to be readable as "accepted and never answered".
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = app
+            .store
+            .list_audit(Some(&device_id), 10)
+            .await
+            .expect("audit rows readable");
+        if rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 2, "dispatch plus outcome: {rows:?}");
+    let outcome = rows
+        .iter()
+        .find(|row| row.action == "command.outcome")
+        .expect("a channel that ended mid-command records its outcome");
+    assert_eq!(outcome.outcome, "device_offline");
+    assert_eq!(outcome.actor, "user-a");
+    assert_eq!(outcome.device_id, device_id);
+
     server.abort();
 }
 
@@ -381,6 +405,73 @@ async fn a_malformed_frame_closes_the_channel_with_a_reason() {
     assert_eq!(code, 1008);
     assert_eq!(reason, "malformed_frame");
     control::wait_offline(&app, &device_id).await;
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn revoking_a_device_closes_its_channel_and_stops_telemetry() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    control::send(
+        &mut socket,
+        json!({
+            "type": "telemetry",
+            "sample": { "sampled_at_ms": app.now(), "battery_percent": 55 }
+        }),
+    )
+    .await;
+    let aggregate = wait_for_telemetry(&app, &device_id).await;
+    assert_eq!(aggregate["samples_received"], 1);
+
+    let (status, body) = app
+        .revoke("devices", &device_id, Some(common::ADMIN_TOKEN))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    // The credential is revoked, so its channel cannot stay open: the device is told why and
+    // the registration is gone before the request returns.
+    let (code, reason) = control::next_close(&mut socket).await;
+    assert_eq!(code, 1008);
+    assert_eq!(reason, "device_revoked");
+    assert!(
+        !app.state.management.is_online(&device_id),
+        "a revoked device is not online"
+    );
+
+    // A frame the device sent before it read the close is dropped, not ingested.
+    let _ = control::try_send(
+        &mut socket,
+        json!({
+            "type": "telemetry",
+            "sample": { "sampled_at_ms": app.now(), "battery_percent": 99 }
+        }),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        app.state
+            .telemetry
+            .aggregate(&device_id)
+            .expect("the earlier sample is still shown")
+            .samples_received,
+        1,
+        "no telemetry is ingested after revocation"
+    );
+
+    // Status stops claiming freshness once the last accepted sample ages out: nothing new
+    // arrives to refresh it.
+    app.clock
+        .advance_ms(phoneconnect_server::telemetry::STALE_AFTER_MS + 1);
+    let (status, body) = app.device_status(&device_id, "user-a").await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["device"]["state"], "revoked");
+    assert_eq!(
+        body["telemetry"]["freshness"], "stale",
+        "a revoked device cannot keep its telemetry fresh: {body}"
+    );
 
     server.abort();
 }

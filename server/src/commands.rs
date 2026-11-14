@@ -7,7 +7,10 @@
 //! so a caller never waits on a device that cannot answer.
 //!
 //! The command table itself is in memory and bounded (see [`crate::management`]); only the
-//! audit row is durable. Every dispatch attempt writes one row, accepted or refused.
+//! audit rows are durable. Every dispatch attempt writes one `command.dispatch` row, accepted
+//! or refused, and a command that then ends without a device answer writes one more
+//! `command.outcome` row (`timeout` or `device_offline`). `accepted` means the frame reached
+//! the device's channel, not that the device executed it.
 //!
 //! The actor comes from the `user_id` query parameter, matching the status and lease routes:
 //! the bootstrap admin token carries no user identity of its own.
@@ -29,6 +32,11 @@ use crate::{ApiJson, AppState};
 
 /// The audit action one dispatch attempt records.
 pub const AUDIT_ACTION_DISPATCH: &str = "command.dispatch";
+
+/// The audit action one command's terminal state records when no device answer completed it:
+/// `outcome` is `timeout` or `device_offline`. Written by the registry, which owns the
+/// transition, and paired with the earlier `command.dispatch` row.
+pub const AUDIT_ACTION_OUTCOME: &str = "command.outcome";
 
 /// `POST /api/devices/{id}/commands?user_id=...`
 #[derive(Debug, Deserialize)]
@@ -220,6 +228,25 @@ async fn dispatch_for(
     args: Option<Value>,
     timeout_ms: Option<i64>,
 ) -> Result<Dispatch, CommandError> {
+    authorize_control(state, device_id, actor).await?;
+    Ok(state
+        .management
+        .dispatch(device_id, actor, name, args, timeout_ms)
+        .await?)
+}
+
+/// Authorizes control of [device_id] by [actor]: the device exists and is not revoked, and the
+/// actor is its owner or the holder of the active control lease.
+///
+/// The feature routes call this *before* they audit a refusal of their own, so a refusal row is
+/// only appended for a caller that could have acted on the device it named, and the attempt is
+/// classified by the authorization failure rather than by a request-shape check a stranger can
+/// trigger. [`dispatch_for`] re-checks it, so a revocation between the two calls still refuses.
+pub async fn authorize_control(
+    state: &AppState,
+    device_id: &str,
+    actor: &str,
+) -> Result<(), CommandError> {
     let device = state.store.device(device_id).await?;
     if device.is_revoked() {
         return Err(CommandError::DeviceRevoked {
@@ -235,21 +262,22 @@ async fn dispatch_for(
             user_id: actor.to_owned(),
         }));
     }
-    Ok(state
-        .management
-        .dispatch(&device.device_id, name, args, timeout_ms)?)
+    Ok(())
 }
 
 /// Records a request the server refused before it could reach [`dispatch_for_actor`] (an
-/// oversized write, say), so a refusal is as traceable as an accepted dispatch.
+/// oversized write, say), so a refusal is as traceable as an accepted dispatch. The caller must
+/// have already decided the actor's access to the device: this only writes what it is told.
 pub async fn record_refusal(state: &AppState, device_id: &str, actor: &str, code: &str) {
     record_attempt(state, device_id, actor, "refused", Some(code)).await;
 }
 
 /// Writes the durable trace for one attempt after it is resolved (accepted attempts are
-/// enqueued first; refusals are recorded before the response). This is best-effort: a write
-/// failure increments the counter `/health` reports and is logged, and it never changes the
-/// caller's outcome.
+/// enqueued first; refusals are recorded before the response). `accepted` means the frame
+/// reached the device's channel, not that the device executed it: the registry writes a
+/// separate `command.outcome` row for a command the device never answered. This is best-effort:
+/// a write failure increments the counter `/health` reports and is logged, and it never changes
+/// the caller's outcome.
 async fn record_attempt(
     state: &AppState,
     device_id: &str,
@@ -285,13 +313,11 @@ pub async fn command_state(
 ) -> Result<Json<CommandRecord>, CommandError> {
     state.auth.require_admin(&headers)?;
     let actor = required_user(&query)?;
-    let record =
-        state
-            .management
-            .command(&command_id)
-            .ok_or_else(|| CommandError::CommandUnknown {
-                command_id: command_id.clone(),
-            })?;
+    let record = state.management.command(&command_id).await.ok_or_else(|| {
+        CommandError::CommandUnknown {
+            command_id: command_id.clone(),
+        }
+    })?;
 
     let device = state.store.device(&record.device_id).await?;
     if device.owner_id != actor {

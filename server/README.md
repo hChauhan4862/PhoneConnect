@@ -21,7 +21,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 - `src/management.rs` — the device management channel: one authenticated WebSocket per
   device, the in-memory command table, deadlines, and bounded results.
 - `src/commands.rs` — the command HTTP surface: authorization, dispatch, polling, and the
-  audit row written for every attempt.
+  audit rows written for every attempt and every command that ends without an answer.
 - `src/audit.rs` — the read-only audit surface (`GET /api/audit`) and the revocation rows
   the admin and lease routes append. A row carries identity, action, outcome, and an error
   code; never an argument, a path, a file byte, or an image.
@@ -302,6 +302,13 @@ login or MFA, the admin-token holder asserts `actor_id`/`user_id` in the request
 rules constrain what a client may do once its identity is accepted; they do not authenticate
 that identity. Local accounts and MFA (production-ops plan) turn them into a real boundary.
 
+Revoking a lease stops **new** commands; it does not cancel one already delivered. A lease may
+be granted for as little as a second while a command's deadline may be 60 s, and the management
+channel has no cancel frame, so a command dispatched just before revocation can still run and
+answer after it. The device is the one bound that helps: it refuses to start a frame whose
+absolute `expires_at_ms` has already passed. Treat `lease_read_only` as the guarantee and
+revocation as a gate on future dispatches, not a kill signal.
+
 ## Management channel and commands
 
 Besides the sealed peer relay, every enrolled device keeps a management WebSocket at
@@ -322,9 +329,12 @@ Frames are fixed:
   null; any other type is refused `error: invalid_args`.
 
 One connection per device: a second connection replaces the first, which is closed with the
-`replaced` code and whose in-flight commands complete as `error`/`device_offline`. A frame
-that is not valid JSON closes the channel with `malformed_frame`; an invalid telemetry
-*value* is dropped and surfaces as stale telemetry instead.
+`replaced` code and whose in-flight commands complete as `error`/`device_offline`. Revoking the
+device closes its open channel in the same request with the `device_revoked` code, so it stops
+refreshing telemetry; until the socket observes that close, frames from a revoked device are
+dropped rather than ingested. A frame that is not valid JSON closes the channel with
+`malformed_frame`; an invalid telemetry *value* is dropped and surfaces as stale telemetry
+instead.
 
 Commands live in memory only: at most 64 in flight per device, a 10 s default and 60 s
 maximum deadline, and at most 2 MiB per result (an oversized result refuses the command with
@@ -343,26 +353,49 @@ command, and enough bytes for a full-size result from each of them, so a device 
 behind can always deliver what it owes. The same per-device ingress budget is charged by
 `POST /api/devices/{id}/telemetry`, which feeds the same ingest mutex — a flood through either
 door is refused `429 rate_limited`. Buckets are keyed by device, so reconnecting does not reset
-them. The numbers live in one `management::limits` block. A command whose deadline passes reads as `timeout`; nothing pending is
-ever left looking successful. The device owns the command vocabulary: the server forwards any
+them. The numbers live in one `management::limits` block. A command whose deadline passes reads as `timeout`
+and appends its `command.outcome` row; nothing pending is ever left looking successful. The device owns the command vocabulary: the server forwards any
 name, and an unimplemented one comes back as `unknown_command`.
 
 Dispatch requires the admin token *and* the actor's access to the device (its owner, or the
 active lease holder); the actor is the `user_id` query parameter because the admin token
-carries no identity. Every attempt writes one `audit_log` row with actor, action, device,
-outcome, and error code — that row is the durable trace (written best-effort after
-enqueue; see [Audit](#audit)), not the command itself.
+carries no identity. Every attempt writes one `command.dispatch` row with actor, action,
+device, outcome, and error code — written best-effort after enqueue, and **`accepted` means the
+frame reached the device's channel, not that the device executed it**. A command that then
+ends without a device answer appends a second `command.outcome` row (`timeout` or
+`device_offline`); see [Audit](#audit).
 
 ## Audit
 
-Every dispatch attempt — accepted, refused, or timed out — writes one durable `audit_log` row:
-`at_ms`, `actor`, `action` (`command.dispatch`), `device_id`, `outcome` (`accepted` or
-`refused`), and the machine `error` code when there is one. The row is written **after the
-attempt is resolved**: accepted attempts are enqueued first, and refusals are recorded before
-the response. That write is best-effort: a failed write is logged at error level, counted as
-`audit_write_failures` in `GET /health`, and never changes the caller's outcome. The counter is
-an upper bound on untraced attempts: it counts a missing refusal row too, which is not an
-executed command. A non-zero value means at least one attempt has no durable row.
+Two actions describe a command's life. Every dispatch attempt writes one durable
+`command.dispatch` row: `at_ms`, `actor`, `action`, `device_id`, `outcome` (`accepted` or
+`refused`), and the machine `error` code when there is one. A command that then ends **without
+a device answer** writes one more row with action `command.outcome` and outcome `timeout` (its
+deadline passed) or `device_offline` (the device's channel ended first). Nothing else writes an
+outcome row: an answered command — `ok` or `error`, including `result_too_large` — keeps only
+its `command.dispatch` row and its in-memory record, and a refused dispatch never became a
+command, so it has no outcome row. `accepted` therefore means *delivered to the device's
+channel*, not executed, and the trace separates "accepted and executed" (no `command.outcome`
+row) from "accepted and never answered" (one).
+
+Both rows are written **after the attempt is resolved**: accepted attempts are enqueued first,
+refusals before the response, and outcomes when the registry settles a deadline or a channel.
+The outcome rows are written by the registry itself, from facts copied out of the in-memory
+command table after its lock is released, so a database call never stalls a device's channel.
+Every one of these writes is best-effort: a failed write is logged at error level, counted as
+`audit_write_failures` in `GET /health`, and never changes the caller's outcome or the
+command's state. The counter is an upper bound on untraced events: it counts a missing refusal
+or outcome row too. A non-zero value means at least one event has no durable row.
+
+**The actor is asserted, not authenticated.** `actor` is the `user_id` query parameter (or a
+lease body's `actor_id`), which any admin-token holder can set to any string, because the
+bootstrap token carries no identity of its own. A row is therefore attribution, not
+non-repudiation: it records what the server did for *someone claiming* that identity, not who
+did it. Accounts and MFA turn it into a real boundary. What the server does enforce is the
+device-access decision: a route only appends its own refusal row after it has established that
+the caller may act on the device it named, so a stranger cannot use a malformed request to
+append a row against a device it could not otherwise touch — though it can still name itself
+anything.
 
 Every revocation writes its row **inside the same store transaction** that performs it, so a
 revocation can never commit untraced. If the audit row cannot be written, the whole revocation
@@ -390,8 +423,11 @@ rather than a silently widened page.
 `POST /api/devices/{id}/telemetry` and the management channel's `telemetry` frames each
 accept one report and keep a bounded window per device: at most 16 retained samples and one small aggregate (min/max/mean plus the latest value), for
 at most 200 devices. A 201st device is refused `429 telemetry_capacity` rather than evicting a
-tracked device. A non-finite CPU reading, a battery outside 0-100, or memory usage above the
-reported total is refused `400 invalid_sample`. Aggregates live in memory only: no raw sample
+tracked device. A non-finite CPU reading, a battery outside 0-100, memory usage above the
+reported total, or a `connectivity` value that is not printable ASCII or longer than 64 bytes is
+refused `400 invalid_sample`. The `connectivity` bound matters for memory, not tidiness: 16
+samples are retained per device, so an unbounded string would let one agent pin megabytes of the
+aggregator. Aggregates live in memory only: no raw sample
 log, file, or media byte is persisted, and unknown JSON fields are dropped rather than
 retained. **Telemetry history does not survive a server restart** — the aggregate is rebuilt
 from the reports that arrive after it starts.
@@ -406,6 +442,15 @@ it knows; a stale reading keeps its value and is labelled stale.
 lease links that ended more than 30 days earlier, and audit rows written more than 30 days
 earlier. `main` runs it once at startup and then every six hours through `spawn_interval`;
 there is no separate scheduler daemon. A failed run is logged and retried on the next tick.
+
+Age is the only bound on the audit log, and the documented throttle sets its worst case. Command
+creation is capped at 10/s per device (burst 20), and each attempt writes at most two rows (one
+`command.dispatch`, one `command.outcome`), so one device can append at most **about 1.7 million
+rows a day and 51.8 million rows per 30-day window**; the 200-device ceiling makes that roughly
+**10.4 billion rows** (order 1 TB at ~100 bytes a row) if every device dispatched at full
+throttle, unanswered, for the whole window. Real deployments sit far below it — an outcome row
+appears only for a command no device answered, and a device that answers writes one row — but
+there is no count cap, so size the database for the window you actually retain.
 
 The 30-day window applies to leases, session records, and the audit log. Telemetry aggregates
 are a separate, in-memory concern: they are not persisted at all, the job's aggregate purge

@@ -1,4 +1,5 @@
-//! The audit surface: every command attempt and every revocation, newest first.
+//! The audit surface: every command attempt, every command that ended without an answer, and
+//! every revocation, newest first.
 //!
 //! The log is append-only. A revocation writes its row inside the same store transaction that
 //! changes the record, stamped with the effective revocation time, so an idempotent retry
@@ -6,9 +7,13 @@
 //! revocation rolls back and the request answers `store_failure`. A dispatch attempt is
 //! recorded after it is resolved — accepted attempts are enqueued first, refusals before the
 //! response — and is best-effort: [`crate::commands`] counts a failed write and `/health`
-//! reports it rather than hiding it. This module reads the log back, filtered and bounded. A
-//! row carries identity, the action, the outcome, and a machine error code only: never a
-//! command argument, a file path, a file byte, or an image.
+//! reports it rather than hiding it. A command that then ends without a device answer appends a
+//! second row (`command.outcome`), written by [`crate::management`] from facts copied out of
+//! the registry, through the same counter and the same best-effort rule. This module reads the
+//! log back, filtered and bounded. A row carries identity, the action, the outcome, and a
+//! machine error code only: never a command argument, a file path, a file byte, or an image.
+//! The actor is asserted by the token holder, not authenticated; rows are attribution, not
+//! non-repudiation, until accounts exist.
 
 use std::sync::Arc;
 

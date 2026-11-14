@@ -16,8 +16,9 @@
 //!   `MAX_RETAINED_TEXT_BYTES`; the oldest completed records are dropped (as past the count
 //!   cap) so a device answering large file chunks — or large prose — cannot grow the table
 //!   without bound;
-//! - commands live in memory only; the audit row written by the HTTP surface is the durable
-//!   trace, so there is no commands table;
+//! - commands live in memory only; the audit rows written by the HTTP surface and by this
+//!   registry (`command.dispatch`, then `command.outcome` when no device answer arrives) are the
+//!   durable trace, so there is no commands table;
 //! - one device cannot degrade ingest for the others: its inbound frames and bytes are
 //!   rate-limited (see [`limits`]) and an over-budget channel is closed with
 //!   [`CLOSE_RATE_LIMITED`]; command creation is throttled per device and answers
@@ -30,7 +31,8 @@
 //! `deadline_ms` is a duration the device may spend, not an absolute timestamp: a device
 //! clock is not trusted to agree with the server's.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -44,14 +46,19 @@ use tokio::sync::{mpsc, watch};
 
 use crate::AppState;
 use crate::auth::{AuthError, generate_secret};
-use crate::store::{Clock, UnixMs};
+use crate::commands::AUDIT_ACTION_OUTCOME;
+use crate::store::{AuditEntry, Clock, DeviceStore, UnixMs};
 use crate::telemetry::TelemetrySample;
 
 /// Default time a device has to answer a command.
 pub const DEFAULT_COMMAND_TIMEOUT_MS: i64 = 10_000;
 
-/// Longest deadline an operator may request. A longer one would let a command outlive the
-/// control lease that authorized it.
+/// Longest deadline an operator may request. The bound protects the in-memory command table
+/// and the caller's wait, not the control lease: a lease may last as little as a second, so a
+/// command can outlive the authority that authorized it, and there is no cancel channel that
+/// revocation could use to withdraw an already-delivered frame. The device is the one that
+/// refuses to start a command whose absolute deadline passed; a revocation mid-command
+/// therefore bounds *new* commands, not one already in a device's hands.
 pub const MAX_COMMAND_TIMEOUT_MS: i64 = 60_000;
 
 /// Pending commands one device may hold. The channel queues exactly this many frames, so a
@@ -98,6 +105,13 @@ const POLICY_CLOSE_CODE: u16 = 1008;
 pub const CLOSE_REPLACED: &str = "replaced";
 pub const CLOSE_MALFORMED_FRAME: &str = "malformed_frame";
 pub const CLOSE_RATE_LIMITED: &str = "rate_limited";
+/// A revoked device's open channel is closed with this, so status stops claiming freshness.
+pub const CLOSE_DEVICE_REVOKED: &str = "device_revoked";
+
+/// The `command.outcome` label for a command whose deadline passed unanswered.
+const OUTCOME_TIMEOUT: &str = "timeout";
+/// The `command.outcome` label for a command whose device channel ended first.
+const OUTCOME_DEVICE_OFFLINE: &str = "device_offline";
 
 /// The management channel's rate limits, in one place.
 ///
@@ -165,7 +179,7 @@ pub enum CommandStatus {
     Timeout,
 }
 
-/// One dispatched command. In memory only: the audit row is the durable trace.
+/// One dispatched command. In memory only: the audit rows are the durable trace.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CommandRecord {
     pub command_id: String,
@@ -177,6 +191,10 @@ pub struct CommandRecord {
     pub message: Option<String>,
     pub created_at_ms: UnixMs,
     pub completed_at_ms: Option<UnixMs>,
+    /// The asserted actor that dispatched it, so a command that ends without an answer writes
+    /// an outcome row attributed as its dispatch row was. Not part of the wire record.
+    #[serde(skip)]
+    pub actor: String,
     /// When the command becomes `timeout`. Not part of the wire record.
     #[serde(skip)]
     pub deadline_at_ms: UnixMs,
@@ -308,6 +326,11 @@ struct RegistryInner {
     next_connection_id: u64,
     connections: HashMap<String, Connection>,
     commands: HashMap<String, CommandRecord>,
+    /// Devices revoked in this process. A revoked device never authorizes again, but its
+    /// channel may still have a frame in flight when revocation lands; this refuses those.
+    /// One entry per revoked device, and device records are never deleted, so it is bounded by
+    /// the number of revocations the store itself holds.
+    revoked: HashSet<String>,
     /// Sum of every retained record's `retained_answer_bytes`.
     retained_answer_bytes: usize,
     completed: VecDeque<String>,
@@ -317,25 +340,51 @@ struct RegistryInner {
     creates: HashMap<String, TokenBucket>,
 }
 
+/// A command that reached a terminal state without a device answer. Its fields are copied out
+/// of the registry so the `command.outcome` row is written after the registry mutex is
+/// released — a database call never stalls a device's channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandOutcome {
+    at_ms: UnixMs,
+    actor: String,
+    device_id: String,
+    outcome: &'static str,
+}
+
 impl RegistryInner {
     /// A pending command whose deadline passed is `timeout`; nothing may still be pending
-    /// after its deadline reads as success, and no caller has to poll for it.
-    fn expire(&mut self, now_ms: UnixMs) {
+    /// after its deadline reads as success, and no caller has to poll for it. Each one yields
+    /// the outcome fact its audit row records.
+    fn expire(&mut self, now_ms: UnixMs) -> Vec<CommandOutcome> {
         let mut expired = Vec::new();
+        let mut outcomes = Vec::new();
         for (command_id, record) in self.commands.iter_mut() {
             if record.status == CommandStatus::Pending && record.deadline_at_ms <= now_ms {
                 record.status = CommandStatus::Timeout;
                 record.completed_at_ms = Some(now_ms);
                 expired.push(command_id.clone());
+                outcomes.push(CommandOutcome {
+                    at_ms: now_ms,
+                    actor: record.actor.clone(),
+                    device_id: record.device_id.clone(),
+                    outcome: OUTCOME_TIMEOUT,
+                });
             }
         }
         self.completed.extend(expired);
         self.trim();
+        outcomes
     }
 
     /// Completes every pending command for `device_id` with one terminal `error`.
-    fn fail_pending(&mut self, device_id: &str, error: &str, now_ms: UnixMs) {
+    fn fail_pending(
+        &mut self,
+        device_id: &str,
+        error: &str,
+        now_ms: UnixMs,
+    ) -> Vec<CommandOutcome> {
         let mut failed = Vec::new();
+        let mut outcomes = Vec::new();
         for (command_id, record) in self.commands.iter_mut() {
             if record.device_id == device_id && record.status == CommandStatus::Pending {
                 record.status = CommandStatus::Error;
@@ -345,10 +394,17 @@ impl RegistryInner {
                 ));
                 record.completed_at_ms = Some(now_ms);
                 failed.push(command_id.clone());
+                outcomes.push(CommandOutcome {
+                    at_ms: now_ms,
+                    actor: record.actor.clone(),
+                    device_id: record.device_id.clone(),
+                    outcome: OUTCOME_DEVICE_OFFLINE,
+                });
             }
         }
         self.completed.extend(failed);
         self.trim();
+        outcomes
     }
 
     fn in_flight(&self, device_id: &str) -> usize {
@@ -386,13 +442,24 @@ impl RegistryInner {
 /// The device registry and in-flight command table.
 pub struct DeviceRegistry {
     clock: Arc<dyn Clock>,
+    /// Durable audit path, shared with the HTTP command surface: a command that ends without
+    /// a device answer appends its `command.outcome` row through the same store.
+    store: Arc<dyn DeviceStore>,
+    /// Shared with `AppState`, so a failed outcome write is visible in `/health`.
+    audit_write_failures: Arc<AtomicU64>,
     inner: Mutex<RegistryInner>,
 }
 
 impl DeviceRegistry {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        clock: Arc<dyn Clock>,
+        store: Arc<dyn DeviceStore>,
+        audit_write_failures: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             clock,
+            store,
+            audit_write_failures,
             inner: Mutex::new(RegistryInner::default()),
         }
     }
@@ -405,6 +472,34 @@ impl DeviceRegistry {
         self.inner().connections.contains_key(device_id)
     }
 
+    /// Whether this process revoked the device. A revoked device's frames are dropped even if
+    /// its socket has not observed the close yet.
+    pub fn is_revoked(&self, device_id: &str) -> bool {
+        self.inner().revoked.contains(device_id)
+    }
+
+    /// Writes one `command.outcome` row per terminal fact. Called only after the fact has been
+    /// copied out and the registry mutex released: best-effort, like the dispatch row, so a
+    /// store failure counts in `/health` and never changes a command's state.
+    async fn record_outcomes(&self, outcomes: Vec<CommandOutcome>) {
+        for outcome in outcomes {
+            let entry = AuditEntry {
+                at_ms: outcome.at_ms,
+                actor: outcome.actor,
+                action: AUDIT_ACTION_OUTCOME.to_owned(),
+                device_id: outcome.device_id,
+                outcome: outcome.outcome.to_owned(),
+                error: None,
+            };
+            if let Err(error) = self.store.insert_audit(entry).await {
+                let failures = self.audit_write_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "phoneconnect: error: command outcome audit write failed ({failures} total): {error}"
+                );
+            }
+        }
+    }
+
     /// The description the device sent in its `hello`. `None` until it sends one.
     pub fn hello(&self, device_id: &str) -> Option<DeviceHello> {
         self.inner()
@@ -415,51 +510,89 @@ impl DeviceRegistry {
 
     /// Registers a device channel. A previous channel for the same device is told to close
     /// with [`CLOSE_REPLACED`], and its pending commands complete as `device_offline`.
-    pub fn connect(
+    pub async fn connect(
         &self,
         device_id: &str,
         commands: mpsc::Sender<Value>,
         close: watch::Sender<Option<&'static str>>,
     ) -> ManagementConnection {
-        let mut inner = self.inner();
-        let now = self.now_ms();
-        inner.next_connection_id += 1;
-        let connection_id = inner.next_connection_id;
-        let previous = inner.connections.insert(
-            device_id.to_owned(),
-            Connection {
-                id: connection_id,
-                commands,
-                close,
-                hello: None,
-            },
-        );
-        if let Some(previous) = previous {
-            // The replacement is live before the old one is told to go: a device never
-            // observes a window with no management channel.
-            let _ = previous.close.send(Some(CLOSE_REPLACED));
-            inner.fail_pending(device_id, "device_offline", now);
-        }
-        ManagementConnection {
-            device_id: device_id.to_owned(),
-            connection_id,
-        }
+        let (connection, outcomes) = {
+            let mut inner = self.inner();
+            let now = self.now_ms();
+            inner.next_connection_id += 1;
+            let connection_id = inner.next_connection_id;
+            let previous = inner.connections.insert(
+                device_id.to_owned(),
+                Connection {
+                    id: connection_id,
+                    commands,
+                    close,
+                    hello: None,
+                },
+            );
+            let outcomes = if let Some(previous) = previous {
+                // The replacement is live before the old one is told to go: a device never
+                // observes a window with no management channel.
+                let _ = previous.close.send(Some(CLOSE_REPLACED));
+                inner.fail_pending(device_id, "device_offline", now)
+            } else {
+                Vec::new()
+            };
+            (
+                ManagementConnection {
+                    device_id: device_id.to_owned(),
+                    connection_id,
+                },
+                outcomes,
+            )
+        };
+        self.record_outcomes(outcomes).await;
+        connection
     }
 
     /// Removes the registration only if it is still the current one. A replaced connection
     /// finishing its cleanup must not unregister its successor.
-    pub fn disconnect(&self, connection: &ManagementConnection) {
-        let mut inner = self.inner();
-        let now = self.now_ms();
-        let is_current = inner
-            .connections
-            .get(&connection.device_id)
-            .is_some_and(|current| current.id == connection.connection_id);
-        if !is_current {
-            return;
-        }
-        inner.connections.remove(&connection.device_id);
-        inner.fail_pending(&connection.device_id, "device_offline", now);
+    pub async fn disconnect(&self, connection: &ManagementConnection) {
+        let outcomes = {
+            let mut inner = self.inner();
+            let now = self.now_ms();
+            let is_current = inner
+                .connections
+                .get(&connection.device_id)
+                .is_some_and(|current| current.id == connection.connection_id);
+            if !is_current {
+                Vec::new()
+            } else {
+                inner.connections.remove(&connection.device_id);
+                inner.fail_pending(&connection.device_id, "device_offline", now)
+            }
+        };
+        self.record_outcomes(outcomes).await;
+    }
+
+    /// Revocation's effect on the live channel: the device is marked revoked (so a frame
+    /// already in flight is dropped even before its socket observes the close), its pending
+    /// commands complete as `device_offline`, and the channel is closed with
+    /// [`CLOSE_DEVICE_REVOKED`]. Returns whether a channel was open.
+    pub async fn revoke(&self, device_id: &str) -> bool {
+        let (was_online, outcomes) = {
+            let mut inner = self.inner();
+            let now = self.now_ms();
+            inner.revoked.insert(device_id.to_owned());
+            let closed = inner.connections.remove(device_id);
+            let was_online = closed.is_some();
+            if let Some(connection) = closed {
+                // The close signal is sent before the command sender is dropped, so the
+                // channel task reports the reason rather than a generic end.
+                let _ = connection.close.send(Some(CLOSE_DEVICE_REVOKED));
+            }
+            (
+                was_online,
+                inner.fail_pending(device_id, "device_offline", now),
+            )
+        };
+        self.record_outcomes(outcomes).await;
+        was_online
     }
 
     /// Records the `hello` a connection sent. A replaced connection's late hello is ignored:
@@ -491,107 +624,128 @@ impl DeviceRegistry {
     }
 
     /// Hands one command to the device's channel.
-    pub fn dispatch(
+    pub async fn dispatch(
         &self,
         device_id: &str,
+        actor: &str,
         name: &str,
         args: Option<Value>,
         timeout_ms: Option<i64>,
     ) -> Result<Dispatch, DispatchError> {
+        let (result, outcomes) = self.dispatch_locked(device_id, actor, name, args, timeout_ms);
+        self.record_outcomes(outcomes).await;
+        result
+    }
+
+    /// The locked half of [`Self::dispatch`]. It returns the terminal facts it observed along
+    /// with the result so the guard is released before any audit row is written.
+    fn dispatch_locked(
+        &self,
+        device_id: &str,
+        actor: &str,
+        name: &str,
+        args: Option<Value>,
+        timeout_ms: Option<i64>,
+    ) -> (Result<Dispatch, DispatchError>, Vec<CommandOutcome>) {
         let name = name.trim();
         if name.is_empty() || name.len() > MAX_COMMAND_NAME_BYTES {
-            return Err(DispatchError::InvalidName);
+            return (Err(DispatchError::InvalidName), Vec::new());
         }
         let deadline_ms = match timeout_ms {
             None => DEFAULT_COMMAND_TIMEOUT_MS,
             Some(value) if (1..=MAX_COMMAND_TIMEOUT_MS).contains(&value) => value,
-            Some(_) => return Err(DispatchError::InvalidTimeout),
+            Some(_) => return (Err(DispatchError::InvalidTimeout), Vec::new()),
         };
         let now = self.now_ms();
         let mut inner = self.inner();
-        // Throttle creation before anything else: a flood of attempts must not append audit
-        // rows or reach the device.
-        inner
-            .creates
-            .entry(device_id.to_owned())
-            .or_insert_with(|| {
-                TokenBucket::new(
-                    limits::COMMAND_BURST,
-                    limits::COMMAND_CREATES_PER_SECOND,
-                    now,
-                )
+        let mut outcomes = Vec::new();
+        let result = (|| -> Result<Dispatch, DispatchError> {
+            // Throttle creation before anything else: a flood of attempts must not append
+            // audit rows or reach the device.
+            inner
+                .creates
+                .entry(device_id.to_owned())
+                .or_insert_with(|| {
+                    TokenBucket::new(
+                        limits::COMMAND_BURST,
+                        limits::COMMAND_CREATES_PER_SECOND,
+                        now,
+                    )
+                })
+                .take(1.0, now)
+                .map_err(|retry_after_ms| DispatchError::RateLimited { retry_after_ms })?;
+            outcomes = inner.expire(now);
+            // Clone the sender out of the map: the guard borrows the whole registry, so one
+            // borrow cannot stay alive while the command table is updated.
+            let Some(sender) = inner
+                .connections
+                .get(device_id)
+                .map(|connection| connection.commands.clone())
+            else {
+                return Err(DispatchError::Offline {
+                    device_id: device_id.to_owned(),
+                });
+            };
+            if inner.in_flight(device_id) >= MAX_IN_FLIGHT_PER_DEVICE {
+                return Err(DispatchError::Capacity {
+                    device_id: device_id.to_owned(),
+                    limit: MAX_IN_FLIGHT_PER_DEVICE,
+                });
+            }
+            let command_id = format!(
+                "cmd_{}",
+                generate_secret("").map_err(|_| DispatchError::Internal)?
+            );
+            let frame = json!({
+                "type": "command",
+                "request_id": command_id,
+                "name": name,
+                "args": args.unwrap_or(Value::Null),
+                "deadline_ms": deadline_ms,
+                // The absolute server deadline. A device that dequeues the frame after it passed
+                // must refuse to start the command: a duration alone would let a queued command
+                // run long after the server already reported `timeout`.
+                "expires_at_ms": now + deadline_ms,
+            });
+            // The record exists before the frame can be answered, so an immediate result is never
+            // dropped as unknown. A full or closed channel means the writer is gone or cannot keep
+            // up: the command never reached the device, so it is refused rather than left pending.
+            inner.commands.insert(
+                command_id.clone(),
+                CommandRecord {
+                    command_id: command_id.clone(),
+                    device_id: device_id.to_owned(),
+                    name: name.to_owned(),
+                    status: CommandStatus::Pending,
+                    output: None,
+                    error: None,
+                    message: None,
+                    created_at_ms: now,
+                    completed_at_ms: None,
+                    actor: actor.to_owned(),
+                    deadline_at_ms: now + deadline_ms,
+                    retained_answer_bytes: 0,
+                },
+            );
+            if sender.try_send(frame).is_err() {
+                inner.commands.remove(&command_id);
+                return Err(DispatchError::Offline {
+                    device_id: device_id.to_owned(),
+                });
+            }
+            inner.trim();
+            Ok(Dispatch {
+                command_id,
+                deadline_ms,
             })
-            .take(1.0, now)
-            .map_err(|retry_after_ms| DispatchError::RateLimited { retry_after_ms })?;
-        inner.expire(now);
-        // Clone the sender out of the map: the guard borrows the whole registry, so one
-        // borrow cannot stay alive while the command table is updated.
-        let Some(sender) = inner
-            .connections
-            .get(device_id)
-            .map(|connection| connection.commands.clone())
-        else {
-            return Err(DispatchError::Offline {
-                device_id: device_id.to_owned(),
-            });
-        };
-        if inner.in_flight(device_id) >= MAX_IN_FLIGHT_PER_DEVICE {
-            return Err(DispatchError::Capacity {
-                device_id: device_id.to_owned(),
-                limit: MAX_IN_FLIGHT_PER_DEVICE,
-            });
-        }
-        let command_id = format!(
-            "cmd_{}",
-            generate_secret("").map_err(|_| DispatchError::Internal)?
-        );
-        let frame = json!({
-            "type": "command",
-            "request_id": command_id,
-            "name": name,
-            "args": args.unwrap_or(Value::Null),
-            "deadline_ms": deadline_ms,
-            // The absolute server deadline. A device that dequeues the frame after it passed
-            // must refuse to start the command: a duration alone would let a queued command
-            // run long after the server already reported `timeout`.
-            "expires_at_ms": now + deadline_ms,
-        });
-        // The record exists before the frame can be answered, so an immediate result is never
-        // dropped as unknown. A full or closed channel means the writer is gone or cannot keep
-        // up: the command never reached the device, so it is refused rather than left pending.
-        inner.commands.insert(
-            command_id.clone(),
-            CommandRecord {
-                command_id: command_id.clone(),
-                device_id: device_id.to_owned(),
-                name: name.to_owned(),
-                status: CommandStatus::Pending,
-                output: None,
-                error: None,
-                message: None,
-                created_at_ms: now,
-                completed_at_ms: None,
-                deadline_at_ms: now + deadline_ms,
-                retained_answer_bytes: 0,
-            },
-        );
-        if sender.try_send(frame).is_err() {
-            inner.commands.remove(&command_id);
-            return Err(DispatchError::Offline {
-                device_id: device_id.to_owned(),
-            });
-        }
-        inner.trim();
-        Ok(Dispatch {
-            command_id,
-            deadline_ms,
-        })
+        })();
+        (result, outcomes)
     }
 
     /// Completes one command from the device's `result` frame. Only a pending command of the
     /// same device can complete it, and only once.
     #[allow(clippy::too_many_arguments)]
-    pub fn complete(
+    pub async fn complete(
         &self,
         device_id: &str,
         request_id: &str,
@@ -600,76 +754,99 @@ impl DeviceRegistry {
         error: Option<String>,
         message: Option<String>,
     ) -> Result<(), ResultError> {
+        let (result, outcomes) =
+            self.complete_locked(device_id, request_id, status, output, error, message);
+        self.record_outcomes(outcomes).await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_locked(
+        &self,
+        device_id: &str,
+        request_id: &str,
+        status: ResultStatus,
+        output: Option<Value>,
+        error: Option<String>,
+        message: Option<String>,
+    ) -> (Result<(), ResultError>, Vec<CommandOutcome>) {
         let now = self.now_ms();
         let mut inner = self.inner();
-        inner.expire(now);
-        let Some(record) = inner.commands.get_mut(request_id) else {
-            return Err(ResultError::UnknownRequest {
-                request_id: request_id.to_owned(),
-            });
-        };
-        if record.device_id != device_id {
-            return Err(ResultError::RequestScopeMismatch {
-                request_id: request_id.to_owned(),
-            });
-        }
-        if record.status != CommandStatus::Pending {
-            return Err(ResultError::AlreadyCompleted {
-                request_id: request_id.to_owned(),
-            });
-        }
-        let mut answer_bytes = 0;
-        match status {
-            ResultStatus::Ok => {
-                let bytes = match output.as_ref() {
-                    None => 0,
-                    // An unserializable result is refused rather than accepted unknown.
-                    Some(value) => serde_json::to_vec(value)
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(usize::MAX),
-                };
-                if bytes > MAX_RESULT_BYTES {
+        let outcomes = inner.expire(now);
+        let result = (|| -> Result<(), ResultError> {
+            let Some(record) = inner.commands.get_mut(request_id) else {
+                return Err(ResultError::UnknownRequest {
+                    request_id: request_id.to_owned(),
+                });
+            };
+            if record.device_id != device_id {
+                return Err(ResultError::RequestScopeMismatch {
+                    request_id: request_id.to_owned(),
+                });
+            }
+            if record.status != CommandStatus::Pending {
+                return Err(ResultError::AlreadyCompleted {
+                    request_id: request_id.to_owned(),
+                });
+            }
+            let mut answer_bytes = 0;
+            match status {
+                ResultStatus::Ok => {
+                    let bytes = match output.as_ref() {
+                        None => 0,
+                        // An unserializable result is refused rather than accepted unknown.
+                        Some(value) => serde_json::to_vec(value)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX),
+                    };
+                    if bytes > MAX_RESULT_BYTES {
+                        record.status = CommandStatus::Error;
+                        record.error = Some("result_too_large".to_owned());
+                        record.message =
+                            Some(format!("a result may not exceed {MAX_RESULT_BYTES} bytes"));
+                    } else {
+                        record.status = CommandStatus::Ok;
+                        record.output = output;
+                        record.message = message.map(bounded_text);
+                        answer_bytes = bytes;
+                    }
+                }
+                ResultStatus::Error => {
                     record.status = CommandStatus::Error;
-                    record.error = Some("result_too_large".to_owned());
-                    record.message =
-                        Some(format!("a result may not exceed {MAX_RESULT_BYTES} bytes"));
-                } else {
-                    record.status = CommandStatus::Ok;
-                    record.output = output;
+                    record.error = Some(match error {
+                        Some(error) => bounded_text(error),
+                        None => "device_error".to_owned(),
+                    });
                     record.message = message.map(bounded_text);
-                    answer_bytes = bytes;
                 }
             }
-            ResultStatus::Error => {
-                record.status = CommandStatus::Error;
-                record.error = Some(match error {
-                    Some(error) => bounded_text(error),
-                    None => "device_error".to_owned(),
-                });
-                record.message = message.map(bounded_text);
-            }
-        }
-        record.completed_at_ms = Some(now);
-        // The whole retained answer is charged, not only `output`: a `message` or an `error`
-        // is just as able to grow the table as a result payload.
-        answer_bytes = answer_bytes
-            .saturating_add(record.message.as_deref().map_or(0, str::len))
-            .saturating_add(record.error.as_deref().map_or(0, str::len));
-        record.retained_answer_bytes = answer_bytes;
-        let command_id = request_id.to_owned();
-        // The mutable borrow of the record ends here, so the aggregate can be charged.
-        inner.retained_answer_bytes = inner.retained_answer_bytes.saturating_add(answer_bytes);
-        inner.completed.push_back(command_id);
-        inner.trim();
-        Ok(())
+            record.completed_at_ms = Some(now);
+            // The whole retained answer is charged, not only `output`: a `message` or an `error`
+            // is just as able to grow the table as a result payload.
+            answer_bytes = answer_bytes
+                .saturating_add(record.message.as_deref().map_or(0, str::len))
+                .saturating_add(record.error.as_deref().map_or(0, str::len));
+            record.retained_answer_bytes = answer_bytes;
+            let command_id = request_id.to_owned();
+            // The mutable borrow of the record ends here, so the aggregate can be charged.
+            inner.retained_answer_bytes = inner.retained_answer_bytes.saturating_add(answer_bytes);
+            inner.completed.push_back(command_id);
+            inner.trim();
+            Ok(())
+        })();
+        (result, outcomes)
     }
 
     /// One command's current state, with a passed deadline already reflected as `timeout`.
-    pub fn command(&self, command_id: &str) -> Option<CommandRecord> {
-        let now = self.now_ms();
-        let mut inner = self.inner();
-        inner.expire(now);
-        inner.commands.get(command_id).cloned()
+    pub async fn command(&self, command_id: &str) -> Option<CommandRecord> {
+        let (record, outcomes) = {
+            let now = self.now_ms();
+            let mut inner = self.inner();
+            let outcomes = inner.expire(now);
+            (inner.commands.get(command_id).cloned(), outcomes)
+        };
+        self.record_outcomes(outcomes).await;
+        record
     }
 
     fn inner(&self) -> MutexGuard<'_, RegistryInner> {
@@ -775,7 +952,10 @@ pub async fn control_socket(
         .on_upgrade(move |socket| async move {
             let (commands_tx, commands_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_DEVICE);
             let (close_tx, close_rx) = watch::channel(None);
-            let connection = state.management.connect(&device_id, commands_tx, close_tx);
+            let connection = state
+                .management
+                .connect(&device_id, commands_tx, close_tx)
+                .await;
             run_channel(socket, state, device_id, connection, commands_rx, close_rx).await;
         })
         .into_response())
@@ -828,7 +1008,10 @@ async fn run_channel(
                             .await;
                         break;
                     }
-                    if handle_frame(&state, &device_id, &connection, text.as_str()).is_err() {
+                    if handle_frame(&state, &device_id, &connection, text.as_str())
+                        .await
+                        .is_err()
+                    {
                         let _ = sink
                             .send(Message::Close(Some(policy_close(CLOSE_MALFORMED_FRAME))))
                             .await;
@@ -854,18 +1037,23 @@ async fn run_channel(
             },
         }
     }
-    state.management.disconnect(&connection);
+    state.management.disconnect(&connection).await;
 }
 
 /// Applies one device frame. Only a frame that is not valid JSON closes the channel: a bad
 /// telemetry *value* is dropped and stays visible as stale telemetry, and a stale result is
 /// ignored, because neither is a framing fault.
-fn handle_frame(
+async fn handle_frame(
     state: &AppState,
     device_id: &str,
     connection: &ManagementConnection,
     text: &str,
 ) -> Result<(), ()> {
+    // Defence in depth: a revoked device's channel is closed in the same request, but a frame
+    // already read from the socket must not refresh telemetry or describe the device.
+    if state.management.is_revoked(device_id) {
+        return Ok(());
+    }
     let frame: DeviceFrame = serde_json::from_str(text).map_err(|_| ())?;
     match frame {
         DeviceFrame::Hello {
@@ -890,10 +1078,10 @@ fn handle_frame(
             error,
             message,
         } => {
-            let _ =
-                state
-                    .management
-                    .complete(device_id, &request_id, status, output, error, message);
+            let _ = state
+                .management
+                .complete(device_id, &request_id, status, output, error, message)
+                .await;
         }
     }
     Ok(())

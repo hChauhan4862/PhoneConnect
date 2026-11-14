@@ -9,8 +9,8 @@ use axum::http::{Method, StatusCode};
 use common::{ADMIN_TOKEN, NOW_MS, TestApp};
 use phoneconnect_server::store::{Clock, ManualClock, SystemClock};
 use phoneconnect_server::telemetry::{
-    MAX_RECENT_SAMPLES, MAX_TRACKED_DEVICES, RETENTION_MS, STALE_AFTER_MS, TelemetryAggregator,
-    TelemetryError, TelemetryFreshness, TelemetrySample,
+    MAX_CONNECTIVITY_BYTES, MAX_RECENT_SAMPLES, MAX_TRACKED_DEVICES, RETENTION_MS, STALE_AFTER_MS,
+    TelemetryAggregator, TelemetryError, TelemetryFreshness, TelemetrySample,
 };
 use serde_json::{Value, json};
 
@@ -299,6 +299,67 @@ async fn the_status_surface_reports_telemetry_freshness() {
         Value::from(71),
         "a stale reading is still shown, explicitly marked stale"
     );
+}
+
+#[tokio::test]
+async fn connectivity_must_be_a_short_printed_label() {
+    let (aggregator, clock) = aggregator_at(NOW_MS);
+
+    // A real label is accepted and kept verbatim.
+    let mut legitimate = sample(clock.now_ms(), 5.0, 50);
+    legitimate.connectivity = Some("wifi".to_owned());
+    aggregator
+        .ingest("dev_a", legitimate)
+        .expect("a short label is accepted");
+    assert_eq!(
+        aggregator
+            .aggregate("dev_a")
+            .expect("tracked")
+            .latest
+            .connectivity
+            .as_deref(),
+        Some("wifi")
+    );
+
+    // The cap itself is inclusive: a value at the documented length still fits.
+    let mut at_cap = sample(clock.now_ms(), 5.0, 50);
+    at_cap.connectivity = Some("c".repeat(MAX_CONNECTIVITY_BYTES));
+    aggregator
+        .ingest("dev_a", at_cap)
+        .expect("a label at the cap is accepted");
+
+    // One byte past it is refused, so 16 retained samples cannot pin an unbounded string.
+    let mut too_long = sample(clock.now_ms(), 5.0, 50);
+    too_long.connectivity = Some("c".repeat(MAX_CONNECTIVITY_BYTES + 1));
+    assert!(matches!(
+        aggregator.ingest("dev_a", too_long),
+        Err(TelemetryError::InvalidSample { reason }) if reason.contains("connectivity")
+    ));
+
+    // Printable ASCII only: a captured value cannot smuggle control characters onward.
+    let mut control_chars = sample(clock.now_ms(), 5.0, 50);
+    control_chars.connectivity = Some("wifi\nDEBUG".to_owned());
+    assert!(matches!(
+        aggregator.ingest("dev_a", control_chars),
+        Err(TelemetryError::InvalidSample { reason }) if reason.contains("printable")
+    ));
+
+    // The HTTP route applies the same bound.
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("owner-1").await;
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/telemetry"),
+            Some(&credential),
+            Some(json!({
+                "sampled_at_ms": app.now(),
+                "connectivity": "x".repeat(MAX_CONNECTIVITY_BYTES + 1)
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_sample");
 }
 
 #[tokio::test]

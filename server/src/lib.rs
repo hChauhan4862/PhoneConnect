@@ -62,10 +62,10 @@ pub struct AppState {
     /// bounded in-flight command table commands are dispatched through.
     pub management: Arc<DeviceRegistry>,
     pub clock: Arc<dyn Clock>,
-    /// Dispatch audit rows are written after the attempt is resolved and are best-effort.
-    /// This counts the writes that failed, so an untraced attempt — accepted or refused — is
-    /// visible in `/health` instead of only on stderr.
-    audit_write_failures: AtomicU64,
+    /// Audit rows are written after the action is resolved and are best-effort. This counts
+    /// the writes that failed, so an untraced attempt — accepted, refused, or an outcome the
+    /// device never answered — is visible in `/health` instead of only on stderr.
+    audit_write_failures: Arc<AtomicU64>,
 }
 
 /// Startup failures. Both a missing admin token and an unavailable signature key stop the
@@ -127,7 +127,15 @@ impl AppState {
             Arc::clone(&clock),
         ));
         let telemetry = Arc::new(TelemetryAggregator::new(Arc::clone(&clock)));
-        let management = Arc::new(DeviceRegistry::new(Arc::clone(&clock)));
+        let audit_write_failures = Arc::new(AtomicU64::new(0));
+        // The registry writes `command.outcome` rows on the same store path and the same
+        // failure counter, so a command that ends without a device answer is as traceable as
+        // its dispatch.
+        let management = Arc::new(DeviceRegistry::new(
+            Arc::clone(&clock),
+            Arc::clone(&store),
+            Arc::clone(&audit_write_failures),
+        ));
         Ok(Self {
             store,
             auth,
@@ -137,7 +145,7 @@ impl AppState {
             telemetry,
             management,
             clock,
-            audit_write_failures: AtomicU64::new(0),
+            audit_write_failures,
         })
     }
 

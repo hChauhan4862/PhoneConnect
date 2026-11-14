@@ -677,6 +677,124 @@ async fn every_dispatch_attempt_writes_one_audit_row() {
     server.abort();
 }
 
+#[tokio::test]
+async fn a_timeout_writes_the_dispatch_row_and_an_outcome_row() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    let (status, body) = app
+        .dispatch_command(
+            &device_id,
+            "user-a",
+            json!({ "name": "device.ping", "args": null, "timeout_ms": 500 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let command_id = body["command_id"].as_str().expect("command_id").to_owned();
+    control::next_json(&mut socket).await;
+
+    app.clock.advance_ms(500);
+    // The read path settles the deadline, so the outcome row exists once it returns.
+    let (status, body) = app.command(&command_id, "user-a").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "timeout");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows readable");
+    assert_eq!(
+        rows.len(),
+        2,
+        "accepted plus the terminal outcome: {rows:?}"
+    );
+    let accepted = rows
+        .iter()
+        .find(|row| row.action == "command.dispatch")
+        .expect("the dispatch row is kept");
+    assert_eq!(accepted.outcome, "accepted");
+    assert_eq!(accepted.actor, "user-a");
+    assert_eq!(accepted.error, None);
+    let outcome = rows
+        .iter()
+        .find(|row| row.action == "command.outcome")
+        .expect("a command that ends without an answer records its outcome");
+    assert_eq!(outcome.outcome, "timeout");
+    assert_eq!(outcome.actor, "user-a", "the same asserted actor");
+    assert_eq!(outcome.device_id, device_id);
+    assert_eq!(outcome.error, None);
+    assert!(
+        outcome.at_ms > accepted.at_ms,
+        "the outcome is stamped when it happened, not when it was dispatched"
+    );
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_device_answer_writes_only_the_dispatch_row() {
+    let app = TestApp::new();
+    let (device_id, credential) = app.enroll_new("user-a").await;
+    let (mut socket, _base, server) = control::connect_ok(&app, &device_id, &credential).await;
+
+    let (status, body) = app
+        .dispatch_command(&device_id, "user-a", info_command())
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let command_id = body["command_id"].as_str().expect("command_id").to_owned();
+    control::next_json(&mut socket).await;
+    control::send(
+        &mut socket,
+        control::result(&command_id, "ok", json!({ "model": "Pixel 8" })),
+    )
+    .await;
+
+    let body = wait_for_completion(&app, &command_id, "user-a").await;
+    assert_eq!(body["status"], "ok");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows readable");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an answered command has no outcome row: {rows:?}"
+    );
+    assert_eq!(rows[0].action, "command.dispatch");
+    assert_eq!(rows[0].outcome, "accepted");
+
+    socket.close(None).await.expect("channel closed");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_refused_dispatch_writes_no_outcome_row() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("user-a").await;
+
+    // No management channel: the attempt never became an `accepted` command.
+    let (status, body) = app
+        .dispatch_command(&device_id, "user-a", info_command())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "device_offline");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows readable");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].action, "command.dispatch");
+    assert_eq!(rows[0].outcome, "refused");
+    assert_eq!(rows[0].error.as_deref(), Some("device_offline"));
+}
+
 async fn wait_for_completion(app: &TestApp, command_id: &str, user_id: &str) -> serde_json::Value {
     for _ in 0..200 {
         let (status, body) = app.command(command_id, user_id).await;

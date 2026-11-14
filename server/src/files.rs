@@ -22,7 +22,8 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use crate::commands::{
-    CommandAccepted, CommandError, CommandQuery, dispatch_for_actor, record_refusal, required_user,
+    CommandAccepted, CommandError, CommandQuery, authorize_control, dispatch_for_actor,
+    record_refusal, required_user,
 };
 use crate::{ApiJson, AppState};
 
@@ -176,7 +177,8 @@ pub async fn rename_entry(
 /// Authorizes the caller, records a refusal the server makes itself, and dispatches.
 ///
 /// Arguments are built before this runs because they are pure; nothing is dispatched (and no
-/// refusal is audited) until the caller is authorized, so a stranger learns nothing.
+/// refusal is audited) until the caller holds the admin token *and* control of this device, so a
+/// stranger cannot append a row naming a device it may not touch.
 async fn submit(
     state: &AppState,
     device_id: &str,
@@ -190,6 +192,13 @@ async fn submit(
         .require_admin(headers)
         .map_err(CommandError::from)?;
     let actor = required_user(query)?;
+    // The authorization decision comes before the request-shape check, so a refusal row is
+    // only written for a caller that could act on the device it named, and an unauthorized
+    // attempt is classified by the authorization failure.
+    if let Err(error) = authorize_control(state, device_id, &actor).await {
+        record_refusal(state, device_id, &actor, error.code()).await;
+        return Err(FileRequestError::Command(error));
+    }
     let args = match args {
         Ok(args) => args,
         Err(error) => {

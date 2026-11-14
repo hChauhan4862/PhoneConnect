@@ -77,6 +77,10 @@ pub async fn revoke_device(
             device_id: device_id.clone(),
         },
     );
+    // The management channel is a second live assertion of the credential's authority: close
+    // it in the same request, so a revoked device stops refreshing telemetry and its status
+    // stops looking fresh.
+    state.management.revoke(&device_id).await;
     Ok(Json(Revocation {
         revoked: true,
         revoked_at,

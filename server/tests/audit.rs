@@ -723,3 +723,64 @@ async fn the_device_filter_is_an_exact_match_not_a_prefix() {
         Err(StoreError::UnknownDevice { .. })
     ));
 }
+
+#[tokio::test]
+async fn an_unauthorized_caller_cannot_shape_or_redirect_the_refusal_it_causes() {
+    // The actor of a row is asserted by the admin-token holder: nothing verifies it until
+    // accounts exist. What the server can decide is *whether* the caller may act on the device
+    // it named, so a refusal row is only written after that decision. A stranger therefore
+    // cannot make a request-shape check append `invalid_request` in someone else's name, and
+    // the row always names the device the caller actually named.
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/files/list?user_id=user-b"),
+            Some(ADMIN_TOKEN),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"], "lease_read_only",
+        "the authorization failure classifies the attempt, not its body"
+    );
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, "refused");
+    assert_eq!(rows[0].error.as_deref(), Some("lease_read_only"));
+    assert_eq!(rows[0].device_id, device_id);
+    assert_eq!(
+        rows[0].actor, "user-b",
+        "the row carries the caller's own assertion, and nothing else"
+    );
+
+    // An authorized caller's malformed body is still traced under its own, more specific code.
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &format!("/api/devices/{device_id}/files/list?user_id=owner-1"),
+            Some(ADMIN_TOKEN),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_request");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].outcome, "refused");
+    assert_eq!(rows[0].error.as_deref(), Some("invalid_request"));
+    assert_eq!(rows[0].actor, "owner-1");
+}

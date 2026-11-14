@@ -28,6 +28,12 @@ pub const MAX_RECENT_SAMPLES: usize = 16;
 /// Devices tracked at once. The deployment ceiling is 200 background-connected devices.
 pub const MAX_TRACKED_DEVICES: usize = 200;
 
+/// Longest accepted `connectivity` label. A report names a transport (`wifi`, `cellular`), not
+/// prose: 16 samples retained per device means an unbounded string would let one agent pin
+/// megabytes. Printable ASCII only, so a captured value cannot smuggle control characters into
+/// a console or a log.
+pub const MAX_CONNECTIVITY_BYTES: usize = 64;
+
 /// Default retention for aggregates: 30 days, matching session and audit retention.
 pub const RETENTION_MS: UnixMs = 30 * 24 * 60 * 60 * 1_000;
 
@@ -76,6 +82,21 @@ impl TelemetrySample {
             if total == 0 || used > total {
                 return Err(TelemetryError::InvalidSample {
                     reason: "memory usage must fit within the reported total",
+                });
+            }
+        }
+        if let Some(connectivity) = self.connectivity.as_deref() {
+            if connectivity.len() > MAX_CONNECTIVITY_BYTES {
+                return Err(TelemetryError::InvalidSample {
+                    reason: "connectivity must be at most 64 bytes",
+                });
+            }
+            if !connectivity
+                .chars()
+                .all(|value| value.is_ascii_graphic() || value == ' ')
+            {
+                return Err(TelemetryError::InvalidSample {
+                    reason: "connectivity must be printable ASCII",
                 });
             }
         }
