@@ -42,6 +42,14 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
    60 s); a repeatedly refused credential stops it as `offline` instead of looping. The
    channel never starts a service, posts a notification, or publishes a status: the service
    reports its state in the existing notification.
+7. **Files.** `files.list`, `files.read`, `files.write`, `files.mkdir`, `files.delete`, and
+   `files.rename` operate inside one root: the app's own external files directory (no storage
+   permission, removed with the app), never `/`. `PathGuard` resolves every request — rejecting
+   `..`, absolute paths, NUL, and symlinks whose real target leaves the root — before a handler
+   touches the filesystem, and the handlers run on `Dispatchers.IO`, never on the command
+   receive loop. A read returns at most 256 KiB of decoded bytes per chunk with an honest
+   `truncated`; a write accepts at most 1 MiB decoded (`too_large` beyond that); delete removes
+   a file or an *empty* directory and is never recursive (`dir_not_empty`).
 
 ## Layout
 
@@ -66,6 +74,8 @@ ADB is used only to sideload the app; it is never the runtime identity or the tr
 | `net/DeviceControlChannel.kt` | The management WebSocket: hello, telemetry, command results, bounded reconnect. |
 | `control/CommandDispatcher.kt` | Routes command names to handlers; an unimplemented name is `unknown_command`. |
 | `control/DeviceInfoHandler.kt` | `device.info` and the `hello` description, from `Build` only. |
+| `control/PathGuard.kt` | The one root, and the only place a requested path becomes a concrete path. |
+| `control/FileHandler.kt` | The six `files.*` commands: chunked reads, capped writes, empty-directory delete. |
 | `telemetry/TelemetrySampler.kt` | Battery, memory, and connectivity mapped from the framework; unsupported metrics stay null. |
 | `RecoveryReceiver.kt` | Boot and post-update recovery with `goAsync`, refusing gracefully when the OS refuses. |
 | `AgentSettings.kt` / `AgentDiagnostics.kt` | Hub URL and the last background-start refusal. |
@@ -149,9 +159,11 @@ still stop the agent. The notification and setup screen say so and show recovery
 - **Ticket signatures are not verified.** The Ed25519 signature is carried from the hub but
   not checked; TLS authenticity to the hub is the trust anchor, exactly as the Rust transport
   documents for trust-on-first-use. Porting Ed25519 verification is follow-up work.
-- **Only three management commands exist.** `device.info`, `device.ping`, and `telemetry.now`
-  are implemented; files, apps, screen capture, console/logcat, and toggles are follow-up
-  tasks that add handler files to the same dispatcher. CPU percentage is reported as `null`:
-  Android does not expose per-app CPU counters to an ordinary app.
+- **The management vocabulary is small.** `device.info`, `device.ping`, `telemetry.now`, and
+  the `files.*` commands are implemented; apps, screen capture, console/logcat, and toggles are
+  follow-up tasks that add handler files to the same dispatcher. File transfers stay inside the
+  app's own external files directory: shared storage at large needs a scoped-storage design of
+  its own and is not offered. CPU percentage is reported as `null`: Android does not expose
+  per-app CPU counters to an ordinary app.
 - **Instrumentation tests cannot run in this environment** (no AVD, no emulator system
   images), so the emulator smoke test and real-Keystore/OEM behaviour are unverified here.

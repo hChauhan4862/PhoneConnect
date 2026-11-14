@@ -20,9 +20,10 @@ This is the foundation milestone, not a finished product.
 - The web UI is a static admin surface. It renders the snapshot it last read and polls a
   command until the device answers; there is no server-to-client push channel.
 - Each enrolled device keeps a second, authenticated management connection to the server
-  carrying JSON telemetry and commands. `device.info`, `device.ping`, and `telemetry.now`
-  work end to end from the web command console; every later device feature plugs into the
-  same channel. The sealed peer relay is unchanged and the server still cannot read it.
+  carrying JSON telemetry and commands. `device.info`, `device.ping`, `telemetry.now`, and the
+  `files.*` commands work end to end from the one web UI (the command console and the file
+  browser); every later device feature plugs into the same channel. The sealed peer relay is
+  unchanged and the server still cannot read it.
 - Direct hole-punched paths are implemented and tested in the transport, but both shipped
   clients use the relay. Production connectivity is relay-only.
 - Telemetry aggregates are bounded and kept in memory.
@@ -73,10 +74,10 @@ the APK build, and the Docker end-to-end test.
 
 The component READMEs are the source of truth for what does and does not work:
 
-- `android/README.md` — no direct-path port, no ticket-signature verification, and only three
-  management commands (`device.info`, `device.ping`, `telemetry.now`). ADB, files, media,
-  apps, input, screen mirroring, and audio are not implemented, and the phone is not remotely
-  controllable.
+- `android/README.md` — no direct-path port, no ticket-signature verification, and a small
+  management vocabulary (`device.info`, `device.ping`, `telemetry.now`, and the `files.*`
+  commands inside one app-private directory). ADB, media, apps, input, screen mirroring, and
+  audio are not implemented, and the phone is not remotely controllable.
 - `native/README.md` — there is no Android-side TCP bridge, so the loopback proxy does not
   reach a phone yet; no screen creates a session until the server's user login and MFA land.
   Only macOS has been built here; Windows and Linux are untested.

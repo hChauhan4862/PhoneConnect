@@ -13,6 +13,8 @@ import android.os.IBinder
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.phoneconnect.agent.control.CommandDispatcher
+import com.phoneconnect.agent.control.FileHandler
+import com.phoneconnect.agent.control.PathGuard
 import com.phoneconnect.agent.net.DeviceControlChannel
 import com.phoneconnect.agent.net.HubClient
 import com.phoneconnect.agent.net.TransportSessionRunner
@@ -25,6 +27,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /** Outcome of asking the system for the foreground service. */
 sealed interface StartResult {
@@ -142,10 +145,20 @@ open class ConnectionService : Service() {
         val sampler = TelemetrySampler.fromContext(this)
         return DeviceControlChannel(
             hub = hub,
-            dispatcher = CommandDispatcher(telemetry = sampler),
+            dispatcher = CommandDispatcher(
+                telemetry = sampler,
+                files = FileHandler(PathGuard(filesRoot())),
+            ),
             telemetry = sampler,
         )
     }
+
+    /**
+     * The one directory file commands may touch: this app's own external files directory,
+     * which needs no storage permission and is removed with the app. Never `/`, never shared
+     * storage at large.
+     */
+    private fun filesRoot(): File = getExternalFilesDir(null) ?: filesDir
 
     /** Dispatcher for the management channel's socket work; tests override it. */
     internal open fun managementDispatcher(): CoroutineDispatcher = Dispatchers.IO

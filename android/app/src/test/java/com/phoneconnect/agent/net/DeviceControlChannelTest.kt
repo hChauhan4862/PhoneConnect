@@ -79,7 +79,7 @@ class DeviceControlChannelTest {
                         when (frame.optString("type")) {
                             "hello" -> {
                                 webSocket.send(command("cmd_1", "device.ping"))
-                                webSocket.send(command("cmd_2", "files.list"))
+                                webSocket.send(command("cmd_2", "no.such_command"))
                             }
 
                             "result" -> results.trySend(frame)
