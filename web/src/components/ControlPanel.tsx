@@ -171,12 +171,20 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
           code: "invalid_result",
           message: "the device's answer does not confirm the change",
         });
+        // The device answered `ok` but said nothing about the value: for brightness that can
+        // mean the mode changed, so the map is read again instead of kept.
+        if (key === "brightness") await read(() => mounted.current);
         return;
       }
       setNotice(noticeFor(label, key, result));
       await read(() => mounted.current);
     } catch (error) {
-      if (mounted.current) setActionFailure(failureOfError(error));
+      if (mounted.current) {
+        setActionFailure(failureOfError(error));
+        // The poll can fail after the command reached the device, so a brightness failure here
+        // is an unknown outcome too: the old map may already be wrong.
+        if (key === "brightness") await read(() => mounted.current);
+      }
     } finally {
       if (mounted.current) setBusy(false);
     }
@@ -221,7 +229,11 @@ export function ControlPanel({ api, deviceId, userId, pollIntervalMs }: ControlP
       ) : null}
 
       {actionFailure ? (
-        <FailureNotice failure={actionFailure} note={failureNote(actionFailure)} />
+        <FailureNotice
+          failure={actionFailure}
+          lead={failureLead(actionFailure)}
+          note={failureNote(actionFailure)}
+        />
       ) : null}
       {notice ? (
         <p role="status" className="notice">
@@ -402,10 +414,20 @@ function actionFailureOf(command: CommandView): Failure {
   };
 }
 
+/// The one code whose meaning needs a lead of its own: the device may well have done it, so the
+/// default "The device did not do that" would contradict the note below it.
+const FAILURE_LEADS: Record<string, string> = {
+  unconfirmed: "The device could not confirm that",
+};
+
 /// The one code whose meaning needs a sentence of its own: the change was accepted but nothing
 /// confirmed it.
 const UNCONFIRMED_NOTE =
-  "the device accepted the change but could not confirm it, so the panel does not treat it as applied";
+  "the device accepted the change but could not read the value back, so the panel does not treat it as applied";
+
+function failureLead(failure: Failure): string | undefined {
+  return FAILURE_LEADS[failure.code];
+}
 
 function failureNote(failure: Failure): string | undefined {
   return failure.code === "unconfirmed" ? UNCONFIRMED_NOTE : undefined;

@@ -34,8 +34,9 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/routing.ts` — `matchRoute`, `navigate`, and `useRoute`. Routes are plain paths:
   `/` (devices), `/devices/:id` (status), `/devices/:id/telemetry` (live telemetry),
   `/devices/:id/commands` (the command console), `/devices/:id/files` (the file browser),
-  `/devices/:id/apps` (the app inventory), `/devices/:id/screen` (one screen snapshot), and
-  `/devices/:id/console` (system properties and the two documented refusals).
+  `/devices/:id/apps` (the app inventory), `/devices/:id/screen` (one screen snapshot),
+  `/devices/:id/console` (system properties and the two documented refusals), and `/audit`
+  (the durable command/revocation log).
   The server's SPA fallback serves the same document for each, so a reload or deep link works.
 - `src/api.ts` — the REST surface as typed views (`DeviceStatus`, `LeaseStatusView`,
   `TelemetryView`, …). Failures are `ApiError { status, code }`; there is no success-shaped
@@ -44,7 +45,11 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
 - `src/host/` — the single place host differences live (see below).
 - `src/routes/` — one component per route. `AccessGateRoute`, `DeviceListRoute`,
   `DeviceStatusRoute`, `TelemetryRoute`, `CommandsRoute`, `FilesRoute`, `AppsRoute`,
-  `ScreenRoute`, `ConsoleRoute`, `NotFoundRoute`.
+  `ScreenRoute`, `ConsoleRoute`, `AuditRoute`, `NotFoundRoute`. `AuditRoute` asks the server
+  for the newest rows, filters by exact device id on the server (an unknown device is an empty
+  answer, never another device's rows), shows a refusal with the stored machine code, clears
+  the previous device's rows the moment the filter changes, and renders a failed read as an
+  alert — never as an empty log or an "all clear".
 - `src/components/` — small presentational pieces plus `LeasePanel` (the lease surface),
   `TelemetryPanel` (bounded aggregates and explicit freshness), `CommandPanel` (dispatch
   and poll), and `FileList` (one directory's entries). `FileList` is presentational: `FilesRoute`
@@ -76,9 +81,11 @@ npm run build     # emits dist/, which the server serves from PHONECONNECT_WEB_R
   secondary viewer gets a short "requires control access" line instead of the panel, because
   `control.get` would answer `lease_read_only` — a refusal the viewer can do nothing about.
   A failed change renders the device's reason token as the sentence the operator needs (an
-  unknown token is shown verbatim), words `unconfirmed` as "the device accepted the change but
-  could not confirm it", and re-reads the readings after an `unconfirmed` answer or a failed
-  brightness change, because either can leave the device different from the map on screen.
+  unknown token is shown verbatim). An `unconfirmed` answer opens with "The device could not
+  confirm that" rather than the default "did not do that", and the panel re-reads the readings
+  after an `unconfirmed` answer or any brightness outcome it cannot pin down (a refusal, an
+  `ok` whose output is not a confirmation, or a poll that fails after the command was
+  accepted), because any of those can leave the device different from the map on screen.
 - `src/data/useResource.ts` — one load/retry primitive; `src/data/controlReasons.ts` — the
   device's constant control reasons as the sentences the panel shows; `src/session.ts` — the
   browser session (admin token + acting user id) used until local password login and MFA land.

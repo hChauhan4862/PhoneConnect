@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  ApiError,
   type ApiClient,
   type CommandAccepted,
   type CommandView,
@@ -159,6 +160,8 @@ describe("the control panel", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("not_permitted");
+    // A genuine refusal keeps the lead that says the device did not do it.
+    expect(alert).toHaveTextContent(/did not do that/i);
     // The device's reason token is rendered as the sentence an operator can act on.
     expect(alert).toHaveTextContent(/Do Not Disturb access/i);
     expect(screen.queryByText(/device confirmed/i)).not.toBeInTheDocument();
@@ -254,11 +257,74 @@ describe("the control panel", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("unconfirmed");
-    expect(alert).toHaveTextContent(/accepted the change but could not confirm/i);
+    // The lead sentence must not claim the device refused a change it may well have made.
+    expect(alert).toHaveTextContent(/could not confirm that/i);
+    expect(alert).not.toHaveTextContent(/did not do that/i);
     // The value may or may not have moved, so the map is read again rather than assumed.
     await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
     const list = screen.getByRole("list", { name: /control readings/i });
     expect(within(list).getByText("4")).toBeInTheDocument();
+  });
+
+  it("re-reads brightness when the device's ok answer cannot be read", async () => {
+    const user = userEvent.setup();
+    const granted: ControlReadingsOutput = {
+      ...READINGS,
+      brightness_mode: 1,
+      unavailable: { ...READINGS.unavailable },
+    };
+    delete granted.unavailable.brightness;
+    delete granted.unavailable.dnd_filter;
+
+    const api = fakeApi([
+      command({ output: granted }),
+      // The device says ok but the output is not a change confirmation: the outcome is unknown.
+      command({ name: "control.set", output: { note: "not a confirmation" } }),
+      command({ output: { ...granted, brightness: 120, brightness_mode: 0 } }),
+    ]);
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/brightness value/i);
+    await user.clear(field);
+    await user.type(field, "120");
+    await user.click(screen.getByRole("button", { name: /set brightness/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("invalid_result");
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
+  });
+
+  it("re-reads brightness when the poll fails after the command was accepted", async () => {
+    const user = userEvent.setup();
+    const granted: ControlReadingsOutput = {
+      ...READINGS,
+      brightness_mode: 1,
+      unavailable: { ...READINGS.unavailable },
+    };
+    delete granted.unavailable.brightness;
+    delete granted.unavailable.dnd_filter;
+
+    const api = fakeApi([]);
+    let polls = 0;
+    api.command = vi.fn(async () => {
+      polls += 1;
+      if (polls === 1) return command({ output: granted });
+      if (polls === 2) throw new ApiError(0, "network_unavailable");
+      return command({ output: { ...granted, brightness_mode: 0 } });
+    });
+    renderPanel(api);
+    await screen.findByRole("list", { name: /control readings/i });
+
+    const field = screen.getByLabelText(/brightness value/i);
+    await user.clear(field);
+    await user.type(field, "120");
+    await user.click(screen.getByRole("button", { name: /set brightness/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("network_unavailable");
+    // The command may have reached the device, so the old map must not survive the error.
+    await waitFor(() => expect(api.controlReadings).toHaveBeenCalledTimes(2));
   });
 
   it("renders the mode-left-manual brightness reason as a sentence, not a token", async () => {
