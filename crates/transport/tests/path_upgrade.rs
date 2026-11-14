@@ -35,6 +35,19 @@ const DEVICE_ID: &str = "dev_transport";
 const RELAY_ENDPOINT: &str = "http://relay.test/api/sessions";
 const SESSION: &str = "sess_direct";
 
+/// Latency every stub relay advertises to path selection.
+///
+/// Selection prefers the direct path only when the round trip it *measured* is no worse than
+/// the relay's, and that measurement is wall clock: on loopback it is microseconds, but it
+/// also contains whatever the scheduler added between sending the probe and reading its
+/// acknowledgement. The stubs below forward frames with no delay at all - this number feeds
+/// selection and nothing else - so it is set far above any plausible loopback measurement,
+/// while still being a latency a real relay on a poor network reports. That keeps the
+/// assertion about the state machine instead of about how busy this runner was. The comparison
+/// itself is covered exactly, without a clock, by
+/// `selection_prefers_the_lowest_latency_validated_path`.
+const STUB_RELAY_LATENCY: Duration = Duration::from_secs(1);
+
 // --------------------------------------------------------------------------------------
 // Server-side rendezvous and relay fixtures. The transport crate deliberately has no
 // server dependency, so the tests supply the server side the way the real server does:
@@ -307,18 +320,36 @@ fn unique_epoch() -> Epoch {
     )
 }
 
+/// Probe bounds for a path that is *expected* to validate.
+///
+/// Each attempt is a deadline for a peer's acknowledgement, so it has to survive the worst
+/// pause a loaded runner gives a task, not just a loopback round trip: at 40 ms a single
+/// descheduling was enough to burn an attempt, and three burned attempts fail a negotiation
+/// that was never actually refused. These are the production defaults (250 ms), and the whole
+/// window is `max_attempts` of them, so a correct peer still validates on its first attempt
+/// and pays nothing.
+///
+/// Tests that expect negotiation to *fail* set their own tighter bounds: there the deadline
+/// only has to elapse, and the shorter it is the faster the failure is proven.
 fn fast_probes() -> ProbeConfig {
     ProbeConfig {
-        attempt_timeout: Duration::from_millis(40),
-        max_attempts: 3,
+        attempt_timeout: Duration::from_millis(250),
+        max_attempts: 4,
     }
 }
 
+/// Switch bounds for a path that is expected to commit.
+///
+/// `timeout` is also the retry interval, so the whole request budget is `retries` of them
+/// (one second); `confirmation_timeout` covers the confirm/confirm-ack exchange after that.
+/// Both are deadlines for the peer to answer, not decisions about how fast it is, so they are
+/// generous: a loaded runner can add tens of milliseconds to any round trip and still commit,
+/// and only a peer that really stopped answering spends the budget.
 fn fast_switch() -> SwitchConfig {
     SwitchConfig {
         retries: 4,
-        timeout: Duration::from_millis(100),
-        confirmation_timeout: Duration::from_millis(600),
+        timeout: Duration::from_millis(250),
+        confirmation_timeout: Duration::from_secs(2),
     }
 }
 
@@ -344,10 +375,42 @@ async fn socket() -> Arc<UdpSocket> {
 }
 
 async fn recv(path: &ConnectedPath) -> Envelope {
-    timeout(Duration::from_secs(3), path.recv_frame())
+    // A deadline, not a bound on how fast the path is: a frame that crosses loopback arrives
+    // in microseconds, and this only has to outlast a pause this process cannot control. Ten
+    // seconds is far past the health and receive bounds used below, so a frame that is
+    // genuinely lost is still reported by the path's own deadline first.
+    timeout(Duration::from_secs(10), path.recv_frame())
         .await
         .expect("frame arrives within the test deadline")
         .expect("frame decodes")
+}
+
+/// How long a test waits for a `direct_health_timeout` to run out before it asserts the
+/// consequence.
+///
+/// The deadline is measured from the last authenticated datagram, so a sleep that only just
+/// exceeds it can leave the deadline unexpired when the scheduler pauses the task that would
+/// have noticed. Three health bounds make "the peer has been silent long enough" unambiguous
+/// while keeping the wait short enough to run.
+fn past_health(health: Duration) -> Duration {
+    health * 3
+}
+
+/// Polls `condition` until it holds, or fails the test after `deadline`.
+///
+/// Used where a test used to sleep for "long enough" and then assert on a counter: the wait is
+/// on the very condition the assertion is about, so a loaded runner polls for longer instead of
+/// racing a fixed number, and the deadline still fails a path that is genuinely stuck instead
+/// of hanging.
+async fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < deadline,
+            "condition was still false after {deadline:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn client_setup(socket: Arc<UdpSocket>, harness: &Harness) -> PathSetup {
@@ -503,7 +566,7 @@ async fn a_ticket_for_another_identity_is_refused_at_connect() {
     )
     .expect("candidates");
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
 
     let error = PathController::connect(
@@ -633,10 +696,10 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
     .expect("device candidates");
 
     let (client_relay, client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(120)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(120)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
     let (client_path, device_path) = tokio::join!(
@@ -663,7 +726,7 @@ async fn direct_path_is_selected_when_both_peers_answer_authenticated_probes() {
     assert_eq!(
         client_path.path_kind(),
         PathKind::Direct,
-        "a validated direct path beats a 120 ms relay"
+        "a validated direct path beats a relay that advertises a second"
     );
     assert_eq!(device_path.path_kind(), PathKind::Direct);
     assert!(
@@ -737,10 +800,10 @@ async fn relay_path_is_used_transparently_when_direct_negotiation_fails() {
     .expect("device candidates");
 
     let (client_relay, client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
     let client_path = PathController::connect(
@@ -835,7 +898,12 @@ async fn direct_negotiation_fails_explicitly_without_a_relay() {
 
     assert!(matches!(error, PathError::NoPath), "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(500),
+        // The configured budget is two 20 ms attempts, so 10 ms of wall clock would be the
+        // "fast" reading if the machine were idle. The bound is deliberately not that: it has
+        // to hold on a runner that deschedules this task for a while, and what it rules out is
+        // an *unbounded* wait - the 5 s receive deadline, or a retry that never stops - which
+        // is two and a half times away from here.
+        started.elapsed() < Duration::from_secs(2),
         "bounded probes fail fast instead of hanging"
     );
 }
@@ -861,6 +929,7 @@ async fn probe_timeouts_are_bounded_and_reported() {
     .expect("candidates");
 
     let probes = ProbeConfig {
+        // Deliberately short: the peer never answers, so this deadline only has to elapse.
         attempt_timeout: Duration::from_millis(25),
         max_attempts: 2,
     };
@@ -884,7 +953,12 @@ async fn probe_timeouts_are_bounded_and_reported() {
         "{error}"
     );
     assert!(
-        elapsed < Duration::from_millis(300),
+        // Two 25 ms attempts are the whole budget, so an idle machine finishes in ~50 ms. The
+        // assertion is not "it finished fast": it is "it waited for its budget and no longer",
+        // which is what a broken bound (a 5 s receive deadline, or an attempts loop that never
+        // stops) would fail. 2 s leaves a loaded runner forty times the budget for scheduling
+        // pauses and still fails anything unbounded.
+        elapsed < Duration::from_secs(2),
         "two 25 ms attempts cannot take {elapsed:?}"
     );
 }
@@ -911,10 +985,10 @@ async fn a_relay_session_migrates_to_a_direct_path_and_keeps_relay_fallback() {
     )
     .expect("candidates");
     let (client_relay, client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
     let client_path = PathController::connect(
@@ -1056,14 +1130,22 @@ impl SpyPeer {
         seq
     }
 
-    /// Answers probes and switch requests like a validated peer would, until `deadline`.
-    async fn serve(&mut self, until: Instant) {
+    /// Answers probes and switch requests like a validated peer would, until `stop` is
+    /// notified.
+    ///
+    /// A wall-clock window used to stand in for "until the test is done with me": on a loaded
+    /// runner the connect or the upgrade it covers can outlast any number chosen here, and the
+    /// spy would fall silent mid-handshake. The notification is the real condition, so the spy
+    /// serves for exactly as long as the test needs it.
+    async fn serve(&mut self, stop: &tokio::sync::Notify) {
         let mut buffer = vec![0u8; 65_535];
-        while Instant::now() < until {
-            let remaining = until - Instant::now();
-            let Ok(Ok((length, from))) =
-                tokio::time::timeout(remaining, self.socket.recv_from(&mut buffer)).await
-            else {
+        loop {
+            let received = tokio::select! {
+                biased;
+                () = stop.notified() => return,
+                received = self.socket.recv_from(&mut buffer) => received,
+            };
+            let Ok((length, from)) = received else {
                 return;
             };
             match ProbePacket::decode(&buffer[..length], &self.credentials) {
@@ -1127,13 +1209,16 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
     )
     .expect("candidates");
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(20)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
-    let serve = tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_millis(1_500);
-        spy.serve(deadline).await;
-        spy
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let serve = tokio::spawn({
+        let stop = Arc::clone(&stop);
+        async move {
+            spy.serve(&stop).await;
+            spy
+        }
     });
     let device_path = PathController::connect(
         device_ticket,
@@ -1147,16 +1232,19 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
     .expect("device connects");
     assert_eq!(device_path.path_kind(), PathKind::Direct);
 
+    stop.notify_one();
     let mut spy = serve.await.expect("spy task");
     let captured = spy.send_sealed(&envelope("req-replay-1", b"first")).await;
     assert_eq!(recv(&device_path).await, envelope("req-replay-1", b"first"));
 
     // Upgrade in place with the same ticket round: the replay window and sequence space
     // must survive, or the captured frame below would be accepted again.
-    let serve = tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_millis(1_200);
-        spy.serve(deadline).await;
-        spy
+    let serve = tokio::spawn({
+        let stop = Arc::clone(&stop);
+        async move {
+            spy.serve(&stop).await;
+            spy
+        }
     });
     let upgrade_ticket = harness.ticket(PeerRole::Device);
     assert_eq!(
@@ -1166,6 +1254,7 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
             .expect("upgrade keeps the direct path"),
         PathKind::Direct
     );
+    stop.notify_one();
     let mut spy = serve.await.expect("spy task");
 
     // Replay the captured datagram byte for byte: it must never surface as a frame.
@@ -1174,6 +1263,8 @@ async fn a_captured_frame_cannot_be_replayed_after_an_upgrade() {
         .send_to(&captured, peer)
         .await
         .expect("replay sent");
+    // A window for a frame that must *not* arrive, so a longer one only makes the claim
+    // stronger; 250 ms is many times what a delivered frame needs on loopback.
     let replay = timeout(Duration::from_millis(250), device_path.recv_frame()).await;
     assert!(
         replay.is_err(),
@@ -1223,10 +1314,10 @@ async fn frames_crossing_a_concurrent_upgrade_are_not_lost() {
     .expect("device candidates");
 
     let (client_relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(60)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(60)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let (client_path, device_path) = tokio::join!(
         PathController::connect(
@@ -1263,6 +1354,9 @@ async fn frames_crossing_a_concurrent_upgrade_are_not_lost() {
                     .await
                     .expect("send during upgrade");
                 sent.push(frame);
+                // Pacing, not synchronisation: the frames are spread across the upgrade
+                // window so some of them are in flight while it happens. Nothing is asserted
+                // about this sleep, and a slow runner only spreads them further.
                 tokio::time::sleep(Duration::from_millis(12)).await;
             }
             sent
@@ -1332,10 +1426,10 @@ async fn a_one_sided_punch_stays_on_the_relay() {
     .expect("device candidates");
 
     let (client_relay, _client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
     let (client_path, device_path) = tokio::join!(
@@ -1470,7 +1564,7 @@ async fn control_paths_are_bounded_by_the_control_only_frame_profile() {
     );
 
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let identity = harness.identity(PeerRole::Client);
     let epoch = unique_epoch();
@@ -1501,7 +1595,7 @@ async fn control_paths_are_bounded_by_the_control_only_frame_profile() {
 async fn a_path_configuration_without_a_usable_direct_limit_is_refused() {
     let harness = Harness::new(SESSION).await;
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let identity = harness.identity(PeerRole::Client);
     let epoch = unique_epoch();
@@ -1664,7 +1758,10 @@ async fn the_websocket_relay_measures_its_own_round_trip() {
         .latency()
         .expect("the attach handshake measures the relay round trip instead of guessing 50 ms");
     assert!(
-        measured < Duration::from_secs(1),
+        // What this proves is that a measurement exists and is plausible, not how long the
+        // runner took: the handshake is one round trip over loopback and the assertion is an
+        // order of magnitude above what a stalled task can add to it.
+        measured < Duration::from_secs(10),
         "a loopback relay round trip cannot take {measured:?}"
     );
 
@@ -1721,10 +1818,10 @@ async fn a_round_rotation_during_upgrade_keeps_one_reader_and_loses_no_frames() 
     )
     .expect("device candidates");
     let (client_relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(60)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(60)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let (client_path, device_path) = tokio::join!(
         PathController::connect(
@@ -1807,6 +1904,9 @@ async fn a_round_rotation_during_upgrade_keeps_one_reader_and_loses_no_frames() 
                     .await
                     .expect("send during rotation");
                 sent.push(frame);
+                // Pacing, not synchronisation: the frames are spread across the upgrade
+                // window so some of them are in flight while it happens. Nothing is asserted
+                // about this sleep, and a slow runner only spreads them further.
                 tokio::time::sleep(Duration::from_millis(12)).await;
             }
             sent
@@ -1865,7 +1965,7 @@ async fn a_pinned_peer_identity_fails_closed_before_any_frame() {
     )
     .expect("candidates");
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
 
     // Peer identity otherwise arrives through the server-signed ticket, so a compromised
@@ -2049,10 +2149,10 @@ async fn asymmetric_ack_loss_never_commits_one_peer_and_keeps_delivering() {
     )
     .expect("device candidates");
     let (client_relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
 
     let switch = SwitchConfig {
@@ -2169,16 +2269,19 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
     )
     .expect("device candidates");
     let (client_relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
+    // A liveness deadline, not a decision: eight keepalives fit inside it, so a loaded runner
+    // has to lose the path for a long time before silence can be mistaken for death.
+    let health = Duration::from_millis(400);
     let config = PathConfig {
         probe: fast_probes(),
         switch: fast_switch(),
-        direct_health_timeout: Duration::from_millis(150),
-        keepalive_interval: Duration::from_millis(40),
+        direct_health_timeout: health,
+        keepalive_interval: Duration::from_millis(50),
         ..PathConfig::default()
     };
     let (client_path, device_path) = tokio::join!(
@@ -2210,7 +2313,7 @@ async fn a_direct_path_that_stops_delivering_falls_back_to_the_relay() {
     // Cut the direct path: no datagram reaches either side any more.
     stop.store(true, Ordering::SeqCst);
     proxy_task.await.expect("proxy stops");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(past_health(health)).await;
 
     assert_eq!(
         client_path.path_kind(),
@@ -2269,10 +2372,10 @@ async fn connect_through_proxy(
     )
     .expect("device candidates");
     let (client_relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let (client, device) = tokio::join!(
         PathController::connect(
@@ -2340,7 +2443,10 @@ async fn a_single_lost_confirmation_is_retransmitted_and_both_sides_commit() {
             switch: SwitchConfig {
                 retries: 4,
                 timeout: Duration::from_millis(60),
-                confirmation_timeout: Duration::from_millis(900),
+                // The lost confirmation costs one retry at `timeout` (60 ms). This is the
+                // deadline for that retry to land, so it carries the scheduling headroom: the
+                // test is about the retransmission happening, not about how quickly.
+                confirmation_timeout: Duration::from_secs(3),
             },
             ..PathConfig::default()
         },
@@ -2464,16 +2570,19 @@ async fn an_idle_session_and_a_one_way_sender_stay_on_the_direct_path() {
     )
     .expect("device candidates");
     let (client_relay, client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
+    // Ten keepalives fit inside the health bound, so the idle window below can be long
+    // without a scheduler pause turning it into silence the path has to demote for.
+    let health = Duration::from_secs(1);
     let config = PathConfig {
         probe: fast_probes(),
         switch: fast_switch(),
-        direct_health_timeout: Duration::from_millis(200),
-        keepalive_interval: Duration::from_millis(40),
+        direct_health_timeout: health,
+        keepalive_interval: Duration::from_millis(100),
         ..PathConfig::default()
     };
     let (client_path, device_path) = tokio::join!(
@@ -2498,9 +2607,10 @@ async fn an_idle_session_and_a_one_way_sender_stay_on_the_direct_path() {
     let device_path = device_path.expect("device connects");
     assert_eq!(client_path.path_kind(), PathKind::Direct);
 
-    // Idle well past the health bound: keepalives keep the path alive, so silence is not
-    // mistaken for death.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Idle for two whole health bounds: keepalives keep the path alive, so silence is not
+    // mistaken for death. Two bounds is what makes the claim mean something - idling for less
+    // than one bound would be survived with no keepalive at all.
+    tokio::time::sleep(health * 2).await;
     assert_eq!(
         client_path.path_kind(),
         PathKind::Direct,
@@ -2632,6 +2742,9 @@ async fn a_demoted_direct_path_re_promotes_when_the_peer_returns() {
         .run(Arc::clone(&stop)),
     );
 
+    // Eight keepalives fit inside the health bound, so only the deliberate freeze below can
+    // make the path look dead, and the freeze lasts three bounds so it unambiguously is.
+    let health = Duration::from_millis(400);
     let (client_path, device_path) = connect_through_proxy(
         &harness,
         proxy_addr,
@@ -2640,8 +2753,8 @@ async fn a_demoted_direct_path_re_promotes_when_the_peer_returns() {
         PathConfig {
             probe: fast_probes(),
             switch: fast_switch(),
-            direct_health_timeout: Duration::from_millis(150),
-            keepalive_interval: Duration::from_millis(40),
+            direct_health_timeout: health,
+            keepalive_interval: Duration::from_millis(50),
             ..PathConfig::default()
         },
     )
@@ -2650,7 +2763,7 @@ async fn a_demoted_direct_path_re_promotes_when_the_peer_returns() {
 
     // Freeze the path: nothing crosses any more.
     paused.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(past_health(health)).await;
 
     let first = envelope("req-repromote-1", b"after the freeze");
     client_path.send_frame(&first).await.expect("send");
@@ -2719,7 +2832,7 @@ async fn a_refused_pin_does_not_burn_the_ticket_or_the_epoch() {
     )
     .expect("candidates");
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let impostor = IdentityKey::generate().expect("impostor identity");
 
@@ -2767,7 +2880,7 @@ async fn a_ticket_cannot_open_two_paths() {
     )
     .expect("candidates");
     let (relay, _probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(5)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
 
     PathController::connect(
@@ -2902,7 +3015,7 @@ impl RelayChannel for SaturatedRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -2917,12 +3030,14 @@ async fn a_receive_that_outlives_the_health_bound_keeps_a_live_path_direct() {
         PathConfig {
             probe: fast_probes(),
             switch: fast_switch(),
-            direct_health_timeout: Duration::from_millis(100),
-            keepalive_interval: Duration::from_millis(30),
+            // Ten keepalives fit inside the health bound: the peer is answering throughout,
+            // and a scheduler pause must not be the thing that ends the path.
+            direct_health_timeout: Duration::from_millis(500),
+            keepalive_interval: Duration::from_millis(50),
             recv_timeout: Duration::from_secs(2),
             ..PathConfig::default()
         },
-        Duration::from_millis(60),
+        STUB_RELAY_LATENCY,
         // The device gets no relay, so its frame can only arrive on the direct path.
         [true, false],
     )
@@ -2945,8 +3060,8 @@ async fn a_receive_that_outlives_the_health_bound_keeps_a_live_path_direct() {
         async move { client.recv_frame().await }
     });
 
-    // Four health bounds of silence with the peer still answering keepalives.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Three health bounds of silence with the peer still answering keepalives.
+    tokio::time::sleep(past_health(Duration::from_millis(500))).await;
     assert_eq!(
         client.path_kind(),
         PathKind::Direct,
@@ -2955,7 +3070,7 @@ async fn a_receive_that_outlives_the_health_bound_keeps_a_live_path_direct() {
 
     let frame = envelope("req-slow-recv", b"arrives after the health bound");
     pair.device.send_frame(&frame).await.expect("direct send");
-    let received = timeout(Duration::from_secs(3), waiting)
+    let received = timeout(Duration::from_secs(10), waiting)
         .await
         .expect("the blocked receive returns")
         .expect("receive task")
@@ -3003,9 +3118,12 @@ async fn a_silent_direct_path_still_demotes_on_receive() {
         PathConfig {
             probe: fast_probes(),
             switch: fast_switch(),
-            direct_health_timeout: Duration::from_millis(100),
-            keepalive_interval: Duration::from_millis(30),
-            recv_timeout: Duration::from_millis(400),
+            // The peer is silenced on purpose, so this bound is what the test makes happen,
+            // not something it races: the pause is three bounds long and the receive deadline
+            // is twice the bound, leaving room for the demotion to be observed.
+            direct_health_timeout: Duration::from_millis(300),
+            keepalive_interval: Duration::from_millis(40),
+            recv_timeout: Duration::from_millis(600),
             ..PathConfig::default()
         },
     )
@@ -3013,7 +3131,7 @@ async fn a_silent_direct_path_still_demotes_on_receive() {
     assert_eq!(client_path.path_kind(), PathKind::Direct);
 
     paused.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(past_health(Duration::from_millis(300))).await;
 
     let started = Instant::now();
     let error = timeout(Duration::from_secs(2), client_path.recv_frame())
@@ -3054,7 +3172,7 @@ async fn a_direct_only_path_reports_a_receive_timeout_not_no_path() {
             recv_timeout: Duration::from_millis(150),
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [false, false],
     )
     .await;
@@ -3081,11 +3199,15 @@ async fn a_re_promoted_path_starts_in_the_bounded_transition() {
         PathConfig {
             probe: fast_probes(),
             switch: fast_switch(),
-            direct_health_timeout: Duration::from_millis(200),
-            keepalive_interval: Duration::from_millis(40),
+            direct_health_timeout: Duration::from_millis(500),
+            keepalive_interval: Duration::from_millis(50),
+            // The transition has to still be running when the test looks at it, so the bound
+            // is long enough that no pause this process can suffer ends it first. The test
+            // ends it deliberately, by proving the peer reads direct.
+            transition_timeout: Duration::from_secs(30),
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3164,7 +3286,7 @@ async fn a_one_sided_re_promotion_never_commits_the_upgraded_side() {
             keepalive_interval: Duration::from_millis(40),
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3191,8 +3313,12 @@ async fn a_one_sided_re_promotion_never_commits_the_upgraded_side() {
     )
     .expect("client candidates");
 
+    // The handshake budget is `retries * switch.timeout + confirmation_timeout` (three
+    // seconds), and this is the deadline for *waiting it out*: it has to be longer than the
+    // budget, not equal to it, or a loaded runner reports the test deadline instead of the
+    // relay the client is supposed to report.
     let kind = timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(10),
         pair.client
             .upgrade_with(&upgrade_ticket, &candidates, NOW_MS),
     )
@@ -3230,7 +3356,7 @@ async fn a_one_way_burst_stops_duplicating_within_the_bound() {
             transition_max_frames: 8,
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3309,7 +3435,7 @@ async fn relay_backpressure_during_a_transition_is_surfaced_and_stops_duplicatio
         sends: AtomicUsize::new(0),
     });
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let config = PathConfig {
         probe: fast_probes(),
@@ -3383,7 +3509,7 @@ async fn inbound_ring_overflow_is_reported_on_the_path() {
             transition_max_frames: 4,
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3394,8 +3520,10 @@ async fn inbound_ring_overflow_is_reported_on_the_path() {
         let frame = envelope(&format!("req-overflow-{index}"), b"filling the ring");
         pair.device.send_frame(&frame).await.expect("send");
     }
-    // Give the reader a moment to accept and overflow the ring.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait on the counter the assertion is about instead of sleeping "long enough": the ring
+    // overflows as soon as the 17th frame past its capacity is read, and the deadline only
+    // fails a path that never reports the loss at all.
+    wait_until(Duration::from_secs(10), || pair.client.dropped_frames() > 0).await;
 
     assert!(
         pair.client.dropped_frames() > 0,
@@ -3439,7 +3567,7 @@ impl RelayChannel for ClosedRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -3503,16 +3631,19 @@ async fn a_one_way_outbound_fault_after_commit_keeps_delivering_over_the_relay()
     )
     .expect("device candidates");
     let (client_relay, client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
+    // The client's keepalives are still answered by the peer's probes, so ten of them fit
+    // inside the health bound and only the peer's own silence demotes anything here.
+    let health = Duration::from_millis(500);
     let config = PathConfig {
         probe: fast_probes(),
         switch: fast_switch(),
-        direct_health_timeout: Duration::from_millis(150),
-        keepalive_interval: Duration::from_millis(40),
+        direct_health_timeout: health,
+        keepalive_interval: Duration::from_millis(50),
         recv_timeout: Duration::from_secs(1),
         transition_timeout: Duration::from_secs(30),
         transition_max_frames: 4,
@@ -3553,7 +3684,7 @@ async fn a_one_way_outbound_fault_after_commit_keeps_delivering_over_the_relay()
     // Our outbound direction fails; the peer's still works, so our keepalives are answered
     // and nothing here may conclude the path is dead.
     one_way.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(past_health(health)).await;
 
     // The peer stopped hearing us and sends on the relay. A committed path that only reads
     // the direct socket never sees this.
@@ -3647,7 +3778,7 @@ async fn a_relay_that_closes_ends_duplication_and_a_delivered_frame_is_not_an_er
         sends: AtomicUsize::new(0),
     });
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let config = PathConfig {
         probe: fast_probes(),
@@ -3721,7 +3852,7 @@ async fn a_local_drop_gap_is_a_frames_lost_signal_not_a_counter_regression() {
             transition_max_frames: 4,
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3732,8 +3863,12 @@ async fn a_local_drop_gap_is_a_frames_lost_signal_not_a_counter_regression() {
         let frame = envelope(&format!("req-gap-{index}"), b"filling the ring");
         pair.device.send_frame(&frame).await.expect("send");
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(pair.client.dropped_frames() >= 16);
+    // Poll the counter rather than sleep and hope: the loss is reported as soon as the reader
+    // passes the ring's capacity, and this deadline only fails a path that never reports it.
+    wait_until(Duration::from_secs(10), || {
+        pair.client.dropped_frames() >= 16
+    })
+    .await;
 
     let error = timeout(Duration::from_secs(2), pair.client.recv_frame())
         .await
@@ -3770,7 +3905,7 @@ async fn the_dropped_frame_counter_stays_monotonic_after_shutdown() {
             transition_max_frames: 4,
             ..PathConfig::default()
         },
-        Duration::from_millis(10),
+        STUB_RELAY_LATENCY,
         [true, true],
     )
     .await;
@@ -3778,7 +3913,10 @@ async fn the_dropped_frame_counter_stays_monotonic_after_shutdown() {
         let frame = envelope(&format!("req-shutdown-{index}"), b"filling the ring");
         pair.device.send_frame(&frame).await.expect("send");
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_until(Duration::from_secs(10), || {
+        pair.client.dropped_frames() >= 16
+    })
+    .await;
 
     let before = pair.client.dropped_frames();
     assert!(before >= 16, "the loss happened: {before}");
@@ -3882,7 +4020,7 @@ impl RelayChannel for IdleRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -3927,7 +4065,7 @@ impl RelayChannel for DeadRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -4003,7 +4141,7 @@ impl RelayChannel for DyingRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -4127,14 +4265,20 @@ async fn a_healthy_direct_path_keeps_its_relay_usable_past_the_relay_idle_timeou
     )
     .expect("device candidates");
 
-    let idle_timeout = Duration::from_millis(300);
+    // The in-process model of the server's idle rule. A keepalive every `timeout / 10` keeps
+    // it attached through any pause this process can suffer; the old 300 ms bound was only
+    // three keepalives wide, which a loaded runner can miss even though the path pings.
+    let idle_timeout = Duration::from_secs(1);
     let client_relay = IdleRelay::new(harness.relay_peer(PeerRole::Client).await, idle_timeout);
     let device_relay = IdleRelay::new(harness.relay_peer(PeerRole::Device).await, idle_timeout);
+    // Ten direct-path keepalives fit inside the health bound, and the relay keepalive is a
+    // tenth of the model's idle timeout: neither has to be tight to be proven.
+    let health = Duration::from_millis(500);
     let config = PathConfig {
         probe: fast_probes(),
         switch: fast_switch(),
-        direct_health_timeout: Duration::from_millis(150),
-        keepalive_interval: Duration::from_millis(40),
+        direct_health_timeout: health,
+        keepalive_interval: Duration::from_millis(50),
         recv_timeout: Duration::from_secs(1),
         transition_timeout: Duration::from_secs(30),
         transition_max_frames: 4,
@@ -4171,12 +4315,14 @@ async fn a_healthy_direct_path_keeps_its_relay_usable_past_the_relay_idle_timeou
         "the direct frame committed"
     );
 
-    // Ten times the relay's idle timeout of healthy direct traffic: nothing is sent on the
-    // relay by either peer, because direct is working.
-    tokio::time::sleep(idle_timeout * 10).await;
+    // More than twice the relay's idle timeout of healthy direct traffic: nothing is sent on
+    // the relay by either peer, because direct is working. Two and a half idle timeouts is
+    // what proves the ping is doing the work - an unattended relay is closed after one - and
+    // it keeps the test short enough to run.
+    tokio::time::sleep(idle_timeout * 5 / 2).await;
     assert!(
         client_relay.alive() && device_relay.alive(),
-        "the relay must still be attached after ten {} ms idle timeouts of healthy direct \
+        "the relay must still be attached after {} ms idle timeouts of healthy direct \
          traffic",
         idle_timeout.as_millis()
     );
@@ -4187,7 +4333,7 @@ async fn a_healthy_direct_path_keeps_its_relay_usable_past_the_relay_idle_timeou
 
     // A one-way outbound fault: the peer stops hearing us, demotes, and sends on the relay.
     one_way.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(past_health(health)).await;
     let peer_frame = envelope("req-liveness-peer", b"the peer is on the relay");
     device_path
         .send_frame(&peer_frame)
@@ -4223,7 +4369,7 @@ async fn a_healthy_direct_path_keeps_its_relay_usable_past_the_relay_idle_timeou
 async fn an_idle_direct_receive_is_a_timeout_not_a_relay_closure() {
     let harness = Harness::new(SESSION).await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let dead = DeadRelay::new();
     let config = PathConfig {
@@ -4247,7 +4393,12 @@ async fn an_idle_direct_receive_is_a_timeout_not_a_relay_closure() {
     let warmup = envelope("req-idle-relay-warmup", b"commit to direct");
     device_path.send_frame(&warmup).await.expect("warmup send");
     assert_eq!(recv(&client_path).await, warmup);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The assertion below is about the keepalive reaching the relay, so wait for that rather
+    // than for a duration that is meant to contain one.
+    wait_until(Duration::from_secs(10), || {
+        dead.keepalives.load(Ordering::SeqCst) > 0
+    })
+    .await;
 
     let error = timeout(Duration::from_secs(2), client_path.recv_frame())
         .await
@@ -4283,7 +4434,7 @@ async fn an_idle_direct_receive_is_a_timeout_not_a_relay_closure() {
 async fn a_send_that_needs_a_dead_relay_reports_the_close_instead_of_success() {
     let harness = Harness::new(SESSION).await;
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let dying = DyingRelay::new(harness.relay_peer(PeerRole::Client).await);
     let config = PathConfig {
@@ -4307,9 +4458,14 @@ async fn a_send_that_needs_a_dead_relay_reports_the_close_instead_of_success() {
     device_path.send_frame(&warmup).await.expect("warmup send");
     assert_eq!(recv(&client_path).await, warmup);
 
-    // The relay closes while nothing is using it. The keepalive is what notices.
+    // The relay closes while nothing is using it. The keepalive is what notices, so wait for
+    // the keepalive that follows the closure instead of sleeping for roughly one of them.
+    let keepalives_before = dying.keepalives();
     dying.die();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    wait_until(Duration::from_secs(10), || {
+        dying.keepalives() > keepalives_before
+    })
+    .await;
 
     client_path
         .fallback_to_relay()
@@ -4379,7 +4535,7 @@ impl RelayChannel for ControlledRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -4426,7 +4582,7 @@ impl RelayChannel for MalformedRelay {
     }
 
     fn latency(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
+        Some(STUB_RELAY_LATENCY)
     }
 }
 
@@ -4503,7 +4659,7 @@ async fn re_promote(
 async fn a_held_relay_frame_is_delivered_before_the_direct_frames_queued_behind_it() {
     let harness = Harness::new(SESSION).await;
     let (client_relay, _client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let controlled = ControlledRelay::new(harness.relay_peer(PeerRole::Device).await);
     let (client_path, device_path, client_addr, device_addr) = connect_pair_with_relays(
@@ -4579,7 +4735,7 @@ async fn a_held_relay_frame_is_delivered_before_the_direct_frames_queued_behind_
 async fn a_held_relay_frame_that_left_the_replay_window_is_reported_as_loss() {
     let harness = Harness::new(SESSION).await;
     let (client_relay, _client_probe) = harness
-        .relay_channel(PeerRole::Client, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Client, Some(STUB_RELAY_LATENCY))
         .await;
     let controlled = ControlledRelay::new(harness.relay_peer(PeerRole::Device).await);
     let (client_path, device_path, client_addr, device_addr) = connect_pair_with_relays(
@@ -4667,7 +4823,7 @@ async fn a_malformed_relay_copy_does_not_lose_the_direct_frame_already_received(
     let harness = Harness::new(SESSION).await;
     let malformed = MalformedRelay::new(malformed_relay_frame());
     let (device_relay, _device_probe) = harness
-        .relay_channel(PeerRole::Device, Some(Duration::from_millis(10)))
+        .relay_channel(PeerRole::Device, Some(STUB_RELAY_LATENCY))
         .await;
     let (client_path, device_path, _, _) = connect_pair_with_relays(
         &harness,
