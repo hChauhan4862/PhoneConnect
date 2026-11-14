@@ -70,6 +70,13 @@ export interface ProxyEndpointRequest {
   session: RendezvousSession | EstablishedSession;
 }
 
+/// A rotation of the server's ticket verification key: what the shell pinned and what the
+/// server advertises now. A user must confirm before the shell pins the new value.
+export interface TicketKeyRotation {
+  pinned: string;
+  current: string;
+}
+
 /// Optional capabilities the native shell registers. Any absent method falls back to the
 /// browser behavior for that one operation.
 export interface NativeHostBridge {
@@ -83,6 +90,17 @@ export interface NativeHostBridge {
     request: ProxyEndpointRequest,
   ): Promise<LocalEndpoint> | LocalEndpoint;
   closeEndpoint?(deviceId: string, stream: string): Promise<boolean> | boolean;
+  /// The pending rotation, for a user-facing confirmation. Never pins anything.
+  pendingTicketKey?(
+    sessionId: string,
+    capability: string,
+  ): Promise<TicketKeyRotation> | TicketKeyRotation;
+  /// Pins `expectedCurrent` after the user confirmed it.
+  trustTicketKey?(
+    expectedCurrent: string,
+    sessionId: string,
+    capability: string,
+  ): Promise<void> | void;
 }
 
 function globals(source: Window): Record<string, unknown> {

@@ -8,6 +8,8 @@ import type {
   EndpointCapability,
   HostAdapter,
   OpenEndpointResult,
+  TicketKeyRotationResult,
+  TrustTicketKeyResult,
 } from "./HostAdapter";
 import {
   readHostBridge,
@@ -91,6 +93,42 @@ export function createNativeHost(context: NativeHostContext): HostAdapter {
         return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
       }
       return { status: "closed", closed: await bridge.closeEndpoint(deviceId, stream) };
+    },
+
+    async pendingTicketKey(
+      sessionId: string,
+      capability: string,
+    ): Promise<TicketKeyRotationResult> {
+      const bridge = readHostBridge();
+      if (!bridge?.pendingTicketKey) {
+        return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+      }
+      return {
+        status: "pending",
+        rotation: await bridge.pendingTicketKey(sessionId, capability),
+      };
+    },
+
+    async trustTicketKey(
+      expectedCurrent: string,
+      sessionId: string,
+      capability: string,
+    ): Promise<TrustTicketKeyResult> {
+      const bridge = readHostBridge();
+      if (!bridge?.trustTicketKey) {
+        return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+      }
+      try {
+        await bridge.trustTicketKey(expectedCurrent, sessionId, capability);
+        return { status: "trusted" };
+      } catch (error) {
+        // The shell refuses a key that changed after the user looked; say so instead of
+        // reporting success.
+        return {
+          status: "refused",
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
     },
   };
 }

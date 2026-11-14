@@ -3005,11 +3005,14 @@ name = "phoneconnect-native"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "phoneconnect-protocol",
+ "phoneconnect-server",
  "phoneconnect-transport",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-notification",

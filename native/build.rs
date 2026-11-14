@@ -21,6 +21,8 @@ fn main() {
             "native_identity_key",
             "open_endpoint",
             "close_endpoint",
+            "pending_ticket_key",
+            "trust_ticket_key",
         ]),
     ))
     .expect("generate the Tauri ACL");

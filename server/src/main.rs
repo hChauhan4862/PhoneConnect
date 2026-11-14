@@ -4,12 +4,17 @@
 //! single-node deployment: the bootstrap admin token is required, the database path and
 //! listen address are optional, and the relay endpoint is advertised to peers.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use phoneconnect_server::auth::{ADMIN_TOKEN_ENV, admin_token_from_env};
 use phoneconnect_server::config::{PUBLIC_URL_ENV, relay_endpoint_for};
 use phoneconnect_server::relay::RelayLimits;
+use phoneconnect_server::rendezvous::TicketAuthority;
 use phoneconnect_server::retention::{DEFAULT_RETENTION_INTERVAL, RetentionJob};
+use phoneconnect_server::signing_key::{
+    DEFAULT_TICKET_KEY_PATH, TICKET_KEY_PATH_ENV, load_or_create,
+};
 use phoneconnect_server::store::{DeviceStore, SqliteStore, SystemClock};
 use phoneconnect_server::web::{WebUi, router_with_web_ui};
 use phoneconnect_server::{AppState, build_router};
@@ -37,13 +42,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_endpoint = relay_endpoint_for(&public_url);
     let web_root = environment_or(WEB_ROOT_ENV, DEFAULT_WEB_ROOT);
 
+    // The signing key persists, so a restart does not rotate the verification key a native
+    // client pinned on first use. A corrupt key file stops startup; it is never regenerated.
+    let ticket_key_path = environment_or(TICKET_KEY_PATH_ENV, DEFAULT_TICKET_KEY_PATH);
+    let tickets = Arc::new(TicketAuthority::from_signing_key(load_or_create(
+        Path::new(&ticket_key_path),
+    )?));
+
     let store: Arc<dyn DeviceStore> = Arc::new(SqliteStore::open(&database_path)?);
-    let state = Arc::new(AppState::new(
+    let state = Arc::new(AppState::with_tickets(
         store,
         admin_token,
         relay_endpoint,
         RelayLimits::default(),
         Arc::new(SystemClock),
+        tickets,
     )?);
 
     // The browser and the native shell load the same server URL; there is no second bundle.

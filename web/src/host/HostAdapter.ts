@@ -13,6 +13,7 @@ import type {
   NativeHostContext,
   NotificationInput,
   ProxyEndpointRequest,
+  TicketKeyRotation,
   TrayStatus,
 } from "./hostContext";
 
@@ -20,6 +21,7 @@ export type {
   LocalEndpoint,
   NotificationInput,
   ProxyEndpointRequest,
+  TicketKeyRotation,
   TrayStatus,
 };
 
@@ -39,6 +41,15 @@ export type CloseEndpointResult =
   | { status: "closed"; closed: boolean }
   | { status: "unavailable"; reason: string };
 
+export type TicketKeyRotationResult =
+  | { status: "pending"; rotation: TicketKeyRotation }
+  | { status: "unavailable"; reason: string };
+
+export type TrustTicketKeyResult =
+  | { status: "trusted" }
+  | { status: "refused"; reason: string }
+  | { status: "unavailable"; reason: string };
+
 export interface OpenViewOptions {
   /// A detached view becomes a separate OS window under a native host.
   detached: boolean;
@@ -56,6 +67,17 @@ export interface HostAdapter {
   identityKey(): Promise<string>;
   openEndpoint(request: ProxyEndpointRequest): Promise<OpenEndpointResult>;
   closeEndpoint(deviceId: string, stream: string): Promise<CloseEndpointResult>;
+  /// The server key rotation awaiting confirmation, or unavailable when the host has no pin.
+  pendingTicketKey(
+    sessionId: string,
+    capability: string,
+  ): Promise<TicketKeyRotationResult>;
+  /// Pins the key the user confirmed. Never called automatically.
+  trustTicketKey(
+    expectedCurrent: string,
+    sessionId: string,
+    capability: string,
+  ): Promise<TrustTicketKeyResult>;
 }
 
 export function createHostAdapter(context?: NativeHostContext): HostAdapter {

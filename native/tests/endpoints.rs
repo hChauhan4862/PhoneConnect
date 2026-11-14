@@ -324,7 +324,11 @@ fn manager_with_pin(name: &str, pin_value: &str) -> (EndpointManager, std::path:
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("test directory");
     let pin = directory.join(PIN_FILE_NAME);
-    std::fs::write(&pin, format!("{pin_value}\n")).expect("seed the pin");
+    let origin = url::Url::parse(SERVER)
+        .expect("server URL")
+        .origin()
+        .ascii_serialization();
+    std::fs::write(&pin, format!("origin: {origin}\nkey: {pin_value}\n")).expect("seed the pin");
     let server = url::Url::parse(SERVER).expect("server URL");
     let trust = Arc::new(TicketTrust::new(server.clone(), pin));
     let manager = EndpointManager::new(
@@ -463,7 +467,7 @@ async fn a_page_chosen_verification_key_is_refused_by_the_pin() {
         .expect_err("the pinned key wins over the page");
     match error {
         EndpointError::Trust(TrustError::PinChanged { remedy, .. }) => {
-            assert!(remedy.contains("delete"), "{remedy}");
+            assert!(remedy.contains("accept"), "{remedy}");
         }
         other => panic!("expected a pin change, got {other:?}"),
     }
@@ -471,10 +475,10 @@ async fn a_page_chosen_verification_key_is_refused_by_the_pin() {
         manager.endpoints().await.is_empty(),
         "a refused key binds no port"
     );
-    assert_eq!(
-        std::fs::read_to_string(&pin).expect("pin").trim(),
-        "pinned-key",
-        "the pin is never replaced by a page value"
+    let recorded = std::fs::read_to_string(&pin).expect("pin");
+    assert!(
+        recorded.contains("key: pinned-key"),
+        "the pin is never replaced by a page value: {recorded}"
     );
     std::fs::remove_dir_all(&directory).ok();
 }

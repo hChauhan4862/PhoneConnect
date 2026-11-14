@@ -60,6 +60,8 @@ notify({ title, body })        // OS notification
 identityKey()                  // the shell's X25519 public key, for POST /api/sessions
 openEndpoint(request)          // establish/reuse a session, bind a port
 closeEndpoint(deviceId, stream)
+pendingTicketKey(sessionId, capability)  // show a rotation, never pin it
+trustTicketKey(expectedCurrent, sessionId, capability)  // pin after confirmation
 ```
 
 `proxyCapabilities` is derived from what the endpoint manager is serving when the window is
@@ -114,15 +116,24 @@ supplies — so the shell pins that key itself instead of trusting the page:
   (`GET <server>/api/sessions/<id>/candidates` with the session capability) and stores it in
   the shell's config directory: `~/Library/Application Support/PhoneConnect/` (macOS),
   `%APPDATA%\PhoneConnect\` (Windows), `$XDG_CONFIG_HOME/phoneconnect` or
-  `~/.config/phoneconnect` (Linux), file `ticket-verification-key`.
+  `~/.config/phoneconnect` (Linux). The file is named
+  `ticket-verification-key-<origin hash>` and records the origin inside it, so switching
+  servers never reuses another server's pin and a pin recorded for a different origin is
+  refused.
+- The fetch does not follow redirects: the anchor can only come from the configured origin.
+  The file is written `0600` through `create_new` temp file and rename; on Unix a symlinked
+  pin is refused rather than followed. On Windows there is no Unix mode: the file is created
+  with `create_new` under the per-user `%APPDATA%` directory and inherits that directory's
+  ACL. That assumption is **not verified here** (no Windows build in this environment).
 - Every later open requires the page-supplied key to equal the pin. On a mismatch the shell
   asks the origin once more and refuses with `PinChanged`, naming whether the server rotated
   its key or the page presented a key the server does not use.
-- A rotation is never silently accepted. The server generates its ticket signing key at
-  process start, so a server restart rotates it: confirm the new key with the operator, then
-  delete the pin file (the shell's documented reset) and reopen the endpoint. The pin file is
-  written `0600` through a temporary file and rename, so a crash cannot leave a truncated
-  anchor.
+- A rotation is never silently accepted. The server persists its signing key
+  (`PHONECONNECT_TICKET_KEY_PATH`), so a restart does not rotate it; replacing that key does.
+  When it changes, the page (or the tray) shows `pendingTicketKey()` — old key, new key — and
+  only `trustTicketKey()` with the value the user confirmed replaces the pin. `trustTicketKey`
+  fetches again first and refuses (`RotationMoved`) if the server changed in between, so a
+  stale confirmation pins nothing.
 
 An endpoint disappears from `localEndpoints()` when it is closed, when its capability
 expires (bounded by the ticket and `MAX_ENDPOINT_TTL_SECONDS`), or when the path fails: the
@@ -228,7 +239,12 @@ What is proven is the native half:
   ticket for another device are refused too.
 - `native/tests/trust.rs` covers the pin: first use pins, a page key that differs is refused
   with the remedy, a rotated server key is refused, the pin survives a restart without another
-  fetch, an unreachable server without a pin fails closed, and reset forgets the pin.
+  fetch, an unreachable server without a pin fails closed, reset forgets the pin, a pin from
+  another origin is refused, redirects are not followed, a symlinked pin is refused, and a
+  rotation is pinned only with the confirmed current key.
+- `native/tests/trust_server.rs` proves the coupling: an in-process server issues a session,
+  the shell fetches the key from the real candidates route, the pin equals the advertised key,
+  and a second read does not rewrite the pin file.
 - Unit tests in `native/src/endpoints.rs` show the server's default relay is on the shell's
   default origin, and that a server-observed direct candidate is filtered out so the relay is
   the selected path.

@@ -17,7 +17,7 @@ mod shell {
 
     use phoneconnect_native::endpoints::{EndpointManager, EndpointPolicy, OpenEndpointRequest};
     use phoneconnect_native::proxy::{LocalEndpoint, ProxyLimits};
-    use phoneconnect_native::trust::{TicketTrust, default_pin_path};
+    use phoneconnect_native::trust::{PendingRotation, TicketTrust, default_pin_path};
     use phoneconnect_native::web_shell::{
         self, NotificationInput, TrayStatus, bridge_script, capability_origins, host_context,
         host_context_script, is_same_origin, resolve_route, route_window_label, tray_tooltip,
@@ -40,6 +40,7 @@ mod shell {
     struct ShellState {
         server_url: Url,
         endpoints: Arc<EndpointManager>,
+        trust: Arc<TicketTrust>,
     }
 
     impl ShellState {
@@ -145,6 +146,36 @@ mod shell {
         Ok(state.endpoints.close(&device_id, &stream).await)
     }
 
+    /// The rotation a user may confirm: the pinned key and what the server advertises now.
+    #[tauri::command]
+    async fn pending_ticket_key(
+        state: State<'_, ShellState>,
+        session_id: String,
+        capability: String,
+    ) -> Result<PendingRotation, String> {
+        state
+            .trust
+            .pending_rotation(&session_id, &capability)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replaces the pinned key with the value the user confirmed. Nothing else writes a pin:
+    /// a rotation is never accepted automatically.
+    #[tauri::command]
+    async fn trust_ticket_key(
+        state: State<'_, ShellState>,
+        expected_current: String,
+        session_id: String,
+        capability: String,
+    ) -> Result<(), String> {
+        state
+            .trust
+            .accept_rotation(&expected_current, &session_id, &capability)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// The loopback endpoints currently exposed to the page.
     #[tauri::command]
     async fn local_endpoints(state: State<'_, ShellState>) -> Result<Vec<LocalEndpoint>, String> {
@@ -154,7 +185,7 @@ mod shell {
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let server_url = web_shell::configured_server_url()?;
         let identity = IdentityKey::generate()?;
-        let pin_path = default_pin_path().ok_or(
+        let pin_path = default_pin_path(&server_url).ok_or(
             "no config directory for the ticket verification key pin; set HOME or XDG_CONFIG_HOME",
         )?;
         let trust = Arc::new(TicketTrust::new(server_url.clone(), pin_path));
@@ -162,7 +193,7 @@ mod shell {
             identity,
             ProxyLimits::default(),
             EndpointPolicy::new(server_url.clone()),
-            Some(trust),
+            Some(Arc::clone(&trust)),
         ));
         let setup_endpoints = Arc::clone(&endpoints);
         let setup_server = server_url.clone();
@@ -174,6 +205,7 @@ mod shell {
             .manage(ShellState {
                 server_url,
                 endpoints,
+                trust,
             })
             .invoke_handler(tauri::generate_handler![
                 open_window,
@@ -182,7 +214,9 @@ mod shell {
                 native_identity_key,
                 open_endpoint,
                 close_endpoint,
-                local_endpoints
+                local_endpoints,
+                pending_ticket_key,
+                trust_ticket_key
             ])
             .setup(move |app| {
                 install_tray(app.handle())?;
@@ -226,7 +260,9 @@ mod shell {
             .permission("allow-notify")
             .permission("allow-native-identity-key")
             .permission("allow-open-endpoint")
-            .permission("allow-close-endpoint");
+            .permission("allow-close-endpoint")
+            .permission("allow-pending-ticket-key")
+            .permission("allow-trust-ticket-key");
         for pattern in capability_origins(server) {
             capability = capability.remote(pattern);
         }

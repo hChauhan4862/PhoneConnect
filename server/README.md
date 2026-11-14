@@ -259,18 +259,20 @@ device.
 | `PHONECONNECT_LISTEN_ADDR` | `0.0.0.0:8080` | Listen address. |
 | `PHONECONNECT_DATABASE_PATH` | `/data/phoneconnect.sqlite3` | SQLite file; mount a volume here. |
 | `PHONECONNECT_PUBLIC_URL` | `http://127.0.0.1:8080` | The origin clients use. The relay base is derived as `<origin>/api/sessions` and one session appends `/{session_id}/relay`, so the advertised relay is always on the origin a native client loaded. Set it to the public HTTPS origin behind a TLS proxy. |
+| `PHONECONNECT_TICKET_KEY_PATH` | `/data/ticket-signing-key` | Ed25519 ticket signing key. Created `0600` on first start and reused afterwards, so a restart does not rotate the verification key native clients pinned. A corrupt or symlinked file stops startup; it is never regenerated or followed. |
 | `PHONECONNECT_WEB_ROOT` | `web/dist` | Directory of the built web app, served at `/` (the image uses `/app/web`). |
 
 A peer that reconnects fetches a fresh ticket and re-reads its candidates: each ticket's
 single-use nonce is half of that connection's key epoch, and the transport refuses to open a
 second path with a ticket it already used.
 
-The ticket signing key is generated at process start, so a restart invalidates outstanding
-tickets (30 s), changes the advertised verification key, and a multi-replica deployment would
-need shared key material. Identity keys are per device and per client and are stored as public
-values only. The native shell pins the verification key on first use, so after a server
-restart it refuses a changed key with the remedy `native/README.md` documents (delete the pin
-file after confirming the new key); it never silently accepts a rotation.
+The ticket signing key is persisted (`PHONECONNECT_TICKET_KEY_PATH`), so a restart keeps the
+advertised verification key and native clients keep their pin. Replacing the key file—or
+pointing a deployment at a different one—rotates the key: a pinned client then refuses with
+the remedy `native/README.md` documents and can accept the new key through the shell's
+explicit, user-confirmed trust action; it never accepts a rotation silently. Identity keys are
+per device and per client and are stored as public values only. A multi-replica deployment
+needs the same key file on every replica.
 
 Terminate TLS at a reverse proxy; all public endpoints require TLS in production.
 

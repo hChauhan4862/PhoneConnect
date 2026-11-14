@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local permissions for the shell's own windows. The four bridge commands plus the endpoint and identity commands are granted to the configured server origin by a capability minted at startup (main.rs), not by a wildcard here.",
+  "description": "Local permissions for the shell's own windows. The bridge commands are granted to the configured server origin by a capability minted at startup (main.rs), not by a wildcard here.",
   "windows": [
     "*"
   ],
@@ -13,6 +13,8 @@
     "allow-notify",
     "allow-native-identity-key",
     "allow-open-endpoint",
-    "allow-close-endpoint"
+    "allow-close-endpoint",
+    "allow-pending-ticket-key",
+    "allow-trust-ticket-key"
   ]
 }

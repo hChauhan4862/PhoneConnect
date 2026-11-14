@@ -7,6 +7,8 @@ import type {
   CloseEndpointResult,
   HostAdapter,
   OpenEndpointResult,
+  TicketKeyRotationResult,
+  TrustTicketKeyResult,
 } from "./HostAdapter";
 import { IN_PAGE_NOTIFICATION_EVENT } from "./hostContext";
 
@@ -40,6 +42,14 @@ export function createBrowserHost(): HostAdapter {
     },
 
     async closeEndpoint(): Promise<CloseEndpointResult> {
+      return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+    },
+
+    async pendingTicketKey(): Promise<TicketKeyRotationResult> {
+      return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
+    },
+
+    async trustTicketKey(): Promise<TrustTicketKeyResult> {
       return { status: "unavailable", reason: ENDPOINTS_UNAVAILABLE };
     },
 

@@ -9,6 +9,8 @@ services:
       # publicly known bootstrap token. Generate one with `openssl rand -base64 32`.
       PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:?set PHONECONNECT_ADMIN_TOKEN to a random admin bearer token}
       PHONECONNECT_PUBLIC_URL: http://127.0.0.1:8080
+      # Persisted, so a restart does not rotate the key native clients pinned.
+      PHONECONNECT_TICKET_KEY_PATH: /data/ticket-signing-key
     ports:
       # Loopback only: a deployment reaches the server through its TLS-terminating
       # reverse proxy, never directly on all interfaces.

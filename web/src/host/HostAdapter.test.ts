@@ -118,6 +118,16 @@ describe("browserHost", () => {
       status: "unavailable",
       reason: expect.stringMatching(/native shell/),
     });
+    await expect(host.pendingTicketKey("sess_1", "cap")).resolves.toEqual({
+      status: "unavailable",
+      reason: expect.stringMatching(/native shell/),
+    });
+    await expect(
+      host.trustTicketKey("new-key", "sess_1", "cap"),
+    ).resolves.toEqual({
+      status: "unavailable",
+      reason: expect.stringMatching(/native shell/),
+    });
   });
 });
 
@@ -212,6 +222,41 @@ describe("nativeHost", () => {
       closed: true,
     });
     expect(closeEndpoint).toHaveBeenCalledWith("dev_1", "adb");
+  });
+
+  it("shows a server key rotation and pins it only after confirmation", async () => {
+    const pendingTicketKey = vi.fn(async () => ({
+      pinned: "old-key",
+      current: "new-key",
+    }));
+    const trustTicketKey = vi.fn(async () => {});
+    installBridge({ pendingTicketKey, trustTicketKey });
+    const host = createHostAdapter(nativeContext);
+
+    await expect(host.pendingTicketKey("sess_1", "cap")).resolves.toEqual({
+      status: "pending",
+      rotation: { pinned: "old-key", current: "new-key" },
+    });
+    expect(pendingTicketKey).toHaveBeenCalledWith("sess_1", "cap");
+    await expect(
+      host.trustTicketKey("new-key", "sess_1", "cap"),
+    ).resolves.toEqual({ status: "trusted" });
+    expect(trustTicketKey).toHaveBeenCalledWith("new-key", "sess_1", "cap");
+  });
+
+  it("reports a refused rotation instead of claiming success", async () => {
+    const trustTicketKey = vi.fn(async () => {
+      throw new Error("the server key changed again");
+    });
+    installBridge({ trustTicketKey });
+    const host = createHostAdapter(nativeContext);
+
+    await expect(
+      host.trustTicketKey("new-key", "sess_1", "cap"),
+    ).resolves.toEqual({
+      status: "refused",
+      reason: "the server key changed again",
+    });
   });
 
   it("reports endpoint capability as unavailable when the shell lacks it", async () => {

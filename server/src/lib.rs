@@ -14,6 +14,7 @@ pub mod leases;
 pub mod relay;
 pub mod rendezvous;
 pub mod retention;
+pub mod signing_key;
 pub mod status;
 pub mod store;
 pub mod telemetry;
@@ -71,6 +72,26 @@ impl AppState {
         relay_limits: RelayLimits,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, AppStateError> {
+        Self::with_tickets(
+            store,
+            admin_token,
+            relay_endpoint,
+            relay_limits,
+            clock,
+            Arc::new(TicketAuthority::new()?),
+        )
+    }
+
+    /// Builds the state with a caller-supplied ticket authority, so a deployment can persist
+    /// its signing key instead of generating a new one on every start.
+    pub fn with_tickets(
+        store: Arc<dyn DeviceStore>,
+        admin_token: impl Into<String>,
+        relay_endpoint: impl Into<String>,
+        relay_limits: RelayLimits,
+        clock: Arc<dyn Clock>,
+        tickets: Arc<TicketAuthority>,
+    ) -> Result<Self, AppStateError> {
         let relay_endpoint = relay_endpoint.into();
         let auth = Arc::new(Authenticator::new(
             Arc::clone(&store),
@@ -83,7 +104,6 @@ impl AppState {
             Arc::clone(&store),
             Arc::clone(&clock),
         ));
-        let tickets = Arc::new(TicketAuthority::new()?);
         let leases = Arc::new(LeaseStore::new(
             Arc::clone(&store),
             Arc::clone(&relay),
