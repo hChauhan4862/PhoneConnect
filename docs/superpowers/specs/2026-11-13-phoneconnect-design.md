@@ -180,6 +180,28 @@ behavior, and future non-ADB transports.
 - Resume tokens are scoped to a session and expire; replayed commands must be rejected.
 - Protocol errors are explicit and observable; no success-shaped fallback responses.
 
+### Two channels, two confidentiality rules
+
+The system needs both peer-to-peer streams and server-mediated management, and they have
+different threat models. Keeping that explicit prevents later features from silently
+weakening the peer guarantee.
+
+1. **Peer channel (sealed)** — relay and direct paths carry `Envelope` frames sealed with the
+   two peers' identity keys. The server routes ciphertext and cannot read it. Used for
+   anything that is peer-to-peer by nature: proxy bytes, mirroring, audio, clipboard.
+2. **Management channel (server-mediated, TLS)** — each enrolled device keeps an authenticated
+   WebSocket to the server for management: telemetry samples, command dispatch and results
+   (files, apps, screen capture, shell/logcat, toggles). The payloads are JSON and the server
+   can read them, exactly as a management console must. This is a deliberate, documented
+   trade: the operator running the server can see management traffic, but never sealed peer
+   streams. The channel is authorized by the device credential, is rate-limited and bounded,
+   and never carries stored files or media.
+3. **A device may hold both.** The management channel powers the one web UI; the sealed peer
+   channel powers native proxy and media sessions. Neither bypasses the other's authorization:
+   management commands require an active control lease or owner access, and peer sessions
+   require a control-flagged session for control-kind frames.
+
+
 ### Connectivity
 
 1. Android agent and native client maintain authenticated control connections to the
