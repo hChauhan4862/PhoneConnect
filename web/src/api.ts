@@ -196,6 +196,37 @@ export interface SystemPropsOutput {
   selected: Record<string, string | null>;
 }
 
+/// `control.get` output: one reading per key, `null` when the platform refused it, and the
+/// constant reason for every key the device will not read or change. A key in [unavailable]
+/// may still carry a reading: that means the value is known and it is the *change* that the
+/// platform refuses.
+export interface ControlReadingsOutput {
+  brightness: number | null;
+  brightness_mode: number | null;
+  volume_music: number | null;
+  volume_max: number | null;
+  rotation: number | null;
+  dnd_filter: number | null;
+  night_mode: number | null;
+  wifi_enabled: boolean | null;
+  bluetooth_enabled: boolean | null;
+  mobile_data_enabled: boolean | null;
+  battery_saver: boolean | null;
+  battery_percent: number | null;
+  unavailable: Record<string, string>;
+}
+
+/// A value `control.set` accepts. The device validates the range and answers `invalid_args`
+/// outside it; the panel never guesses a range the device did not report.
+export type ControlValue = number | boolean;
+
+/// `control.set` output: the change the device applied and confirmed by reading it back.
+export interface ControlSetOutput {
+  key: string;
+  value: ControlValue;
+  applied: boolean;
+}
+
 export interface RevocationEvent {
   lease_id: string;
   device_id: string;
@@ -294,6 +325,17 @@ export interface ApiClient {
     userId: string,
     keys?: string[],
   ): Promise<CommandAccepted>;
+  /// Device control. Each returns the accepted command id, polled like any other command: the
+  /// device's readings, its refusals (`not_permitted` with a machine reason), and a change it
+  /// did not keep (`not_applied`) are the only results.
+  controlReadings(deviceId: string, userId: string): Promise<CommandAccepted>;
+  setControl(
+    deviceId: string,
+    userId: string,
+    key: string,
+    value: ControlValue,
+  ): Promise<CommandAccepted>;
+  rebootDevice(deviceId: string, userId: string): Promise<CommandAccepted>;
 }
 
 /// A refusal that names the status and stable machine code the server returned. A transport
@@ -417,7 +459,25 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
         `/api/devices/${encodeURIComponent(deviceId)}/console/props?user_id=${encodeURIComponent(userId)}`,
         keys === undefined ? {} : { keys },
       ),
+    controlReadings: (deviceId, userId) =>
+      controlRequest(deviceId, userId, "get", {}),
+    setControl: (deviceId, userId, key, value) =>
+      controlRequest(deviceId, userId, "set", { key, value }),
+    rebootDevice: (deviceId, userId) => controlRequest(deviceId, userId, "reboot", {}),
   };
+
+  function controlRequest(
+    deviceId: string,
+    userId: string,
+    operation: string,
+    body: unknown,
+  ): Promise<CommandAccepted> {
+    return request<CommandAccepted>(
+      "POST",
+      `/api/devices/${encodeURIComponent(deviceId)}/control/${operation}?user_id=${encodeURIComponent(userId)}`,
+      body,
+    );
+  }
 
   function filesRequest(
     deviceId: string,

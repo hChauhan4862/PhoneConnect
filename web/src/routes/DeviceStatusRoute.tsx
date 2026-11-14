@@ -1,5 +1,6 @@
 import type { ApiClient } from "../api";
 import { useResource } from "../data/useResource";
+import { ControlPanel } from "../components/ControlPanel";
 import { DeviceIdentity } from "../components/DeviceIdentity";
 import { ErrorNotice } from "../components/ErrorNotice";
 import { HostActions } from "../components/HostActions";
@@ -61,6 +62,7 @@ export function DeviceStatusRoute({
         onChanged={resource.reload}
       />
       <TelemetryPanel telemetry={status.telemetry} />
+      <ControlPanel api={api} deviceId={status.device.device_id} userId={userId} />
       <p>
         <RouteLink to={commandsPath(status.device.device_id)}>
           Open the command console
