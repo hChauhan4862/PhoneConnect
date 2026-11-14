@@ -29,10 +29,11 @@ pub mod telemetry;
 pub mod web;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{FromRequest, Request, rejection::JsonRejection};
+use axum::extract::{FromRequest, Request, State, rejection::JsonRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -61,6 +62,10 @@ pub struct AppState {
     /// bounded in-flight command table commands are dispatched through.
     pub management: Arc<DeviceRegistry>,
     pub clock: Arc<dyn Clock>,
+    /// Dispatch audit rows are written after the command is enqueued and are best-effort.
+    /// This counts the writes that failed, so an untraced attempt is visible in `/health`
+    /// instead of only on stderr.
+    audit_write_failures: AtomicU64,
 }
 
 /// Startup failures. Both a missing admin token and an unavailable signature key stop the
@@ -132,11 +137,23 @@ impl AppState {
             telemetry,
             management,
             clock,
+            audit_write_failures: AtomicU64::new(0),
         })
     }
 
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// Records one failed best-effort audit write. The action it describes already happened,
+    /// so this is an operational signal, never a change to the caller's outcome.
+    pub fn note_audit_write_failure(&self) -> u64 {
+        self.audit_write_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// How many best-effort audit writes have failed since this process started.
+    pub fn audit_write_failures(&self) -> u64 {
+        self.audit_write_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -330,6 +347,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
+/// Liveness plus the one operational counter this server keeps: best-effort audit writes that
+/// failed. A non-zero count means an executed command may be untraced.
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "audit_write_failures": state.audit_write_failures(),
+    }))
 }

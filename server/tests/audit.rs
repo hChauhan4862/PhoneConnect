@@ -6,10 +6,13 @@
 
 mod common;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::http::{Method, StatusCode};
 use common::{ADMIN_TOKEN, NOW_MS, TestApp};
 use phoneconnect_server::retention::RetentionJob;
-use phoneconnect_server::store::{AuditEntry, DeviceStore, StoreError, UnixMs};
+use phoneconnect_server::store::{AuditEntry, DeviceStore, SqliteStore, StoreError, UnixMs};
 use phoneconnect_server::telemetry::RETENTION_MS;
 use serde_json::{Value, json};
 
@@ -324,6 +327,240 @@ async fn revocations_are_audited_against_their_device() {
         assert_eq!(row["device_id"], device_id);
         assert_ne!(row["action"], "command.dispatch");
     }
+}
+
+#[tokio::test]
+async fn an_idempotent_revocation_retry_appends_no_second_row() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+    let lease_id = granted["lease_id"].as_str().expect("lease id").to_owned();
+    let session = app.create_session(&device_id).await;
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let (status, body) = app.revoke_lease(&lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app.revoke("sessions", &session_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app.revoke("devices", &device_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first_revocation_ms = app.now();
+
+    // Every revocation endpoint is idempotent. A retry is not a second event: it must keep
+    // the original timestamp and append nothing.
+    app.clock.advance_ms(DAY_MS);
+    let (status, body) = app.revoke_lease(&lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app.revoke("sessions", &session_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = app.revoke("devices", &device_id, Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    assert_eq!(
+        rows.len(),
+        3,
+        "one row per revocation event, not per call: {rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row.at_ms, first_revocation_ms, "the effective time is kept");
+        assert_eq!(row.outcome, "accepted");
+    }
+}
+
+#[tokio::test]
+async fn a_repeat_revocation_by_another_allowed_actor_keeps_the_first_actor() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+    let (status, body) = app
+        .handoff_lease(&device_id, "owner-1", "user-b", 600)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lease_id = body["lease"]["lease_id"]
+        .as_str()
+        .expect("the handed-off lease")
+        .to_owned();
+    let handed_off_ms = app.now();
+
+    app.clock.advance_ms(60_000);
+    let (status, body) = app.revoke_lease(&lease_id, "user-b").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revoked_ms = app.now();
+
+    // The owner is allowed to revoke too; the retry must not relabel the event.
+    app.clock.advance_ms(60_000);
+    let (status, body) = app.revoke_lease(&lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    let revocations: Vec<_> = rows
+        .iter()
+        .filter(|row| row.action == "lease.revoke")
+        .collect();
+    assert_eq!(revocations.len(), 1, "{rows:?}");
+    assert_eq!(revocations[0].actor, "user-b");
+    assert_eq!(revocations[0].at_ms, revoked_ms);
+    assert_ne!(handed_off_ms, revoked_ms);
+}
+
+#[tokio::test]
+async fn a_handoff_records_the_replaced_lease_and_its_actor() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+
+    app.clock.advance_ms(1_000);
+    let (status, body) = app
+        .handoff_lease(&device_id, "owner-1", "user-b", 600)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body["replaced"].is_null(),
+        "the previous lease is reported"
+    );
+    let handed_off_ms = app.now();
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), 1, "one sharing event: {rows:?}");
+    assert_eq!(rows[0].action, "lease.handoff");
+    assert_eq!(rows[0].actor, "owner-1");
+    assert_eq!(rows[0].at_ms, handed_off_ms);
+    assert_eq!(rows[0].outcome, "accepted");
+    assert!(rows[0].error.is_none());
+}
+
+#[tokio::test]
+async fn a_handoff_that_replaces_nothing_is_not_an_event() {
+    let app = TestApp::new();
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+    let (status, granted) = app.acquire_lease(&device_id, "owner-1", 600).await;
+    assert_eq!(status, StatusCode::CREATED, "{granted}");
+    let lease_id = granted["lease_id"].as_str().expect("lease id").to_owned();
+    let (status, body) = app.revoke_lease(&lease_id, "owner-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    app.clock.advance_ms(1_000);
+    let (status, body) = app
+        .handoff_lease(&device_id, "owner-1", "user-b", 600)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["replaced"].is_null());
+
+    let rows = app
+        .store
+        .list_audit(Some(&device_id), 10)
+        .await
+        .expect("audit rows");
+    assert_eq!(rows.len(), 1, "nothing was replaced: {rows:?}");
+    assert_eq!(rows[0].action, "lease.revoke");
+}
+
+#[tokio::test]
+async fn a_dispatch_audit_failure_is_counted_and_reported_by_health() {
+    // Real SQLite: the audit table is gone, so the best-effort dispatch row cannot be
+    // written. The refusal is still the response, the failure is visible in /health, and
+    // nothing pretends the attempt was traced.
+    let path = scratch_path("dispatch-audit-failure");
+    let store = Arc::new(SqliteStore::open(&path).expect("file store"));
+    let app = TestApp::with_store(store);
+    let (device_id, _credential) = app.enroll_new("owner-1").await;
+
+    let probe = rusqlite::Connection::open(&path).expect("probe connection");
+    probe
+        .execute_batch("DROP TABLE audit_log")
+        .expect("the audit table is broken on purpose");
+
+    let (status, body) = app
+        .dispatch_command(
+            &device_id,
+            "owner-1",
+            json!({ "name": "device.ping", "args": null, "timeout_ms": null }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "device_offline", "the refusal is unchanged");
+
+    let (status, body) = app.request(Method::GET, "/health", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(
+        body["audit_write_failures"], 1,
+        "the untraced attempt is visible: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_unfiltered_listing_is_served_by_an_index_not_a_table_scan() {
+    let path = scratch_path("unfiltered-listing");
+    let store = SqliteStore::open(&path).expect("file store");
+    for offset in 0..10 {
+        store
+            .insert_audit(AuditEntry {
+                at_ms: NOW_MS + offset,
+                actor: "owner-1".to_owned(),
+                action: "command.dispatch".to_owned(),
+                device_id: "dev_1".to_owned(),
+                outcome: "accepted".to_owned(),
+                error: None,
+            })
+            .await
+            .expect("audit row");
+    }
+
+    let probe = rusqlite::Connection::open(&path).expect("probe connection");
+    let plan = {
+        let mut statement = probe
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT at_ms, actor, action, device_id, outcome, error
+                 FROM audit_log ORDER BY at_ms DESC, id DESC LIMIT 50",
+            )
+            .expect("prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan rows")
+            .join(" | ")
+    };
+    assert!(
+        plan.contains("audit_log_by_time"),
+        "the unfiltered listing needs its index: {plan}"
+    );
+    assert!(
+        !plan
+            .split(" | ")
+            .any(|step| step.contains("SCAN audit_log") && !step.contains("USING INDEX")),
+        "the unfiltered listing must not scan the table: {plan}"
+    );
+}
+
+/// A fresh database path under Cargo's per-test scratch directory.
+fn scratch_path(name: &str) -> PathBuf {
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("audit");
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let path = directory.join(format!("{name}.db"));
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 #[tokio::test]

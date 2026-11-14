@@ -226,6 +226,28 @@ impl AuditEntry {
     }
 }
 
+/// Who asked for a revocation, and the action to record. The row is written in the same
+/// transaction that changes the record, stamped with the effective revocation time, so an
+/// idempotent retry appends nothing and no revocation can commit untraced.
+#[derive(Debug, Clone, Copy)]
+pub struct RevocationAudit<'a> {
+    pub actor: &'a str,
+    pub action: &'static str,
+}
+
+impl RevocationAudit<'_> {
+    fn accepted(&self, at_ms: UnixMs, device_id: &str) -> AuditEntry {
+        AuditEntry {
+            at_ms,
+            actor: self.actor.to_owned(),
+            action: self.action.to_owned(),
+            device_id: device_id.to_owned(),
+            outcome: "accepted".to_owned(),
+            error: None,
+        }
+    }
+}
+
 /// How many stale records one retention run deleted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RetentionCounts {
@@ -299,10 +321,16 @@ pub trait DeviceStore: Send + Sync {
         credential_hash: &str,
     ) -> Result<Option<DeviceRecord>, StoreError>;
 
-    /// Revokes the device and every live session it owns in one transaction, returning
-    /// the time device revocation took effect. Idempotent: revoking twice succeeds and
-    /// keeps the first revocation time.
-    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
+    /// Revokes the device and every live session it owns in one transaction, and appends
+    /// `audit`'s row in that same transaction, stamped with the effective revocation time.
+    /// Idempotent: revoking twice succeeds, keeps the first time, and appends nothing, so a
+    /// retry cannot claim a later revocation or another actor.
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+        audit: RevocationAudit<'_>,
+    ) -> Result<UnixMs, StoreError>;
 
     async fn insert_session(&self, session: SessionRecord) -> Result<(), StoreError>;
 
@@ -338,7 +366,14 @@ pub trait DeviceStore: Send + Sync {
         capability_hash: &str,
     ) -> Result<Option<SessionRecord>, StoreError>;
 
-    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError>;
+    /// Revokes the session and appends `audit`'s row in the same transaction, keyed by the
+    /// session's device. An idempotent repeat appends nothing.
+    async fn revoke_session(
+        &self,
+        session_id: &str,
+        now_ms: UnixMs,
+        audit: RevocationAudit<'_>,
+    ) -> Result<UnixMs, StoreError>;
 
     /// Every enrolled device, oldest first. The status surface lists devices; it never
     /// exposes credentials.
@@ -362,22 +397,27 @@ pub trait DeviceStore: Send + Sync {
     /// told apart from one that never existed.
     async fn latest_lease(&self, device_id: &str) -> Result<Option<ControlLease>, StoreError>;
 
-    /// Revokes one lease and returns when revocation took effect. Idempotent: revoking
-    /// twice keeps the first time and the first reason.
+    /// Revokes one lease and returns when revocation took effect. The audit row is written in
+    /// the same transaction. Idempotent: revoking twice keeps the first time, the first
+    /// reason, and the one row.
     async fn revoke_lease(
         &self,
         lease_id: &str,
         now_ms: UnixMs,
         reason: LeaseRevocationReason,
+        audit: RevocationAudit<'_>,
     ) -> Result<UnixMs, StoreError>;
 
     /// Revokes the device's active lease, if any, and inserts `lease` in one transaction,
-    /// returning the replaced lease. Handoff is atomic, so control is never unowned.
+    /// returning the replaced lease. Handoff is atomic, so control is never unowned, and the
+    /// replaced lease's audit row is part of the same transaction. Replacing nothing writes no
+    /// row.
     async fn replace_lease(
         &self,
         lease: ControlLease,
         now_ms: UnixMs,
         reason: LeaseRevocationReason,
+        audit: RevocationAudit<'_>,
     ) -> Result<Option<ControlLease>, StoreError>;
 
     /// Associates a session with the lease that authorized it. A control session's
@@ -477,6 +517,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS audit_log_by_device
     ON audit_log(device_id, at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS audit_log_by_time
+    ON audit_log(at_ms DESC, id DESC);
 ";
 
 /// SQLite-backed [`DeviceStore`] for tests and single-node deployments.
@@ -694,7 +736,12 @@ impl DeviceStore for SqliteStore {
         })
     }
 
-    async fn revoke_device(&self, device_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError> {
+    async fn revoke_device(
+        &self,
+        device_id: &str,
+        now_ms: UnixMs,
+        audit: RevocationAudit<'_>,
+    ) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend_error)?;
             let revoked = transaction
@@ -710,15 +757,19 @@ impl DeviceStore for SqliteStore {
                     device_id: device_id.to_owned(),
                 });
             };
-            let effective_ms = revoked_at_ms.unwrap_or(now_ms);
-            if revoked_at_ms.is_none() {
-                transaction
-                    .execute(
-                        "UPDATE devices SET revoked_at_ms = ?1 WHERE device_id = ?2",
-                        params![effective_ms, device_id],
-                    )
-                    .map_err(backend_error)?;
-            }
+            let effective_ms = match revoked_at_ms {
+                Some(existing) => existing,
+                None => {
+                    transaction
+                        .execute(
+                            "UPDATE devices SET revoked_at_ms = ?1 WHERE device_id = ?2",
+                            params![now_ms, device_id],
+                        )
+                        .map_err(backend_error)?;
+                    insert_audit_row(&transaction, audit.accepted(now_ms, device_id))?;
+                    now_ms
+                }
+            };
             // Cascade even on a repeat revocation, so no live session outlives its device.
             transaction
                 .execute(
@@ -853,31 +904,41 @@ impl DeviceStore for SqliteStore {
         })
     }
 
-    async fn revoke_session(&self, session_id: &str, now_ms: UnixMs) -> Result<UnixMs, StoreError> {
+    async fn revoke_session(
+        &self,
+        session_id: &str,
+        now_ms: UnixMs,
+        audit: RevocationAudit<'_>,
+    ) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
-            let revoked = connection
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let revoked = transaction
                 .query_row(
-                    "SELECT revoked_at_ms FROM sessions WHERE session_id = ?1",
+                    "SELECT device_id, revoked_at_ms FROM sessions WHERE session_id = ?1",
                     params![session_id],
-                    |row| row.get::<_, Option<UnixMs>>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<UnixMs>>(1)?)),
                 )
                 .optional()
                 .map_err(backend_error)?;
-            let Some(revoked_at_ms) = revoked else {
+            let Some((device_id, revoked_at_ms)) = revoked else {
                 return Err(StoreError::UnknownSession {
                     session_id: session_id.to_owned(),
                 });
             };
-            if let Some(revoked_at_ms) = revoked_at_ms {
-                return Ok(revoked_at_ms);
-            }
-            connection
-                .execute(
-                    "UPDATE sessions SET revoked_at_ms = ?1 WHERE session_id = ?2",
-                    params![now_ms, session_id],
-                )
-                .map_err(backend_error)?;
-            Ok(now_ms)
+            let Some(revoked_at_ms) = revoked_at_ms else {
+                transaction
+                    .execute(
+                        "UPDATE sessions SET revoked_at_ms = ?1 WHERE session_id = ?2",
+                        params![now_ms, session_id],
+                    )
+                    .map_err(backend_error)?;
+                insert_audit_row(&transaction, audit.accepted(now_ms, &device_id))?;
+                transaction.commit().map_err(backend_error)?;
+                return Ok(now_ms);
+            };
+            // A repeat is not a second event: keep the first time, append nothing.
+            transaction.commit().map_err(backend_error)?;
+            Ok(revoked_at_ms)
         })
     }
 
@@ -959,32 +1020,38 @@ impl DeviceStore for SqliteStore {
         lease_id: &str,
         now_ms: UnixMs,
         reason: LeaseRevocationReason,
+        audit: RevocationAudit<'_>,
     ) -> Result<UnixMs, StoreError> {
         self.with_connection(|connection| {
-            let existing = connection
+            let transaction = connection.transaction().map_err(backend_error)?;
+            let existing = transaction
                 .query_row(
-                    "SELECT revoked_at_ms FROM control_leases WHERE lease_id = ?1",
+                    "SELECT device_id, revoked_at_ms FROM control_leases WHERE lease_id = ?1",
                     params![lease_id],
-                    |row| row.get::<_, Option<UnixMs>>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<UnixMs>>(1)?)),
                 )
                 .optional()
                 .map_err(backend_error)?;
-            let Some(revoked_at_ms) = existing else {
+            let Some((device_id, revoked_at_ms)) = existing else {
                 return Err(StoreError::UnknownLease {
                     lease_id: lease_id.to_owned(),
                 });
             };
-            if let Some(revoked_at_ms) = revoked_at_ms {
-                return Ok(revoked_at_ms);
-            }
-            connection
-                .execute(
-                    "UPDATE control_leases SET revoked_at_ms = ?1, revoked_reason = ?2
-                     WHERE lease_id = ?3",
-                    params![now_ms, reason.as_str(), lease_id],
-                )
-                .map_err(backend_error)?;
-            Ok(now_ms)
+            let Some(revoked_at_ms) = revoked_at_ms else {
+                transaction
+                    .execute(
+                        "UPDATE control_leases SET revoked_at_ms = ?1, revoked_reason = ?2
+                         WHERE lease_id = ?3",
+                        params![now_ms, reason.as_str(), lease_id],
+                    )
+                    .map_err(backend_error)?;
+                insert_audit_row(&transaction, audit.accepted(now_ms, &device_id))?;
+                transaction.commit().map_err(backend_error)?;
+                return Ok(now_ms);
+            };
+            // A repeat is not a second event: keep the first time and the first reason.
+            transaction.commit().map_err(backend_error)?;
+            Ok(revoked_at_ms)
         })
     }
 
@@ -993,6 +1060,7 @@ impl DeviceStore for SqliteStore {
         lease: ControlLease,
         now_ms: UnixMs,
         reason: LeaseRevocationReason,
+        audit: RevocationAudit<'_>,
     ) -> Result<Option<ControlLease>, StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend_error)?;
@@ -1005,6 +1073,9 @@ impl DeviceStore for SqliteStore {
                         params![now_ms, reason.as_str(), previous.lease_id],
                     )
                     .map_err(backend_error)?;
+                // The replaced lease's event is part of this transaction; replacing nothing
+                // writes nothing.
+                insert_audit_row(&transaction, audit.accepted(now_ms, &previous.device_id))?;
             }
             insert_lease_row(&transaction, &lease)?;
             transaction.commit().map_err(backend_error)?;
@@ -1120,24 +1191,7 @@ impl DeviceStore for SqliteStore {
     }
 
     async fn insert_audit(&self, entry: AuditEntry) -> Result<(), StoreError> {
-        entry.validate()?;
-        self.with_connection(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO audit_log (at_ms, actor, action, device_id, outcome, error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        entry.at_ms,
-                        entry.actor,
-                        entry.action,
-                        entry.device_id,
-                        entry.outcome,
-                        entry.error,
-                    ],
-                )
-                .map_err(backend_error)?;
-            Ok(())
-        })
+        self.with_connection(|connection| insert_audit_row(connection, entry))
     }
 
     async fn list_audit(
@@ -1179,6 +1233,25 @@ impl DeviceStore for SqliteStore {
             Ok(rows)
         })
     }
+}
+
+fn insert_audit_row(connection: &Connection, entry: AuditEntry) -> Result<(), StoreError> {
+    entry.validate()?;
+    connection
+        .execute(
+            "INSERT INTO audit_log (at_ms, actor, action, device_id, outcome, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.at_ms,
+                entry.actor,
+                entry.action,
+                entry.device_id,
+                entry.outcome,
+                entry.error,
+            ],
+        )
+        .map_err(backend_error)?;
+    Ok(())
 }
 
 fn audit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {

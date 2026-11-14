@@ -38,7 +38,7 @@ derive no traffic key. It never exposes ADB and never interprets a payload.
 
 | Method | Path | Credential | Purpose |
 |---|---|---|---|
-| `GET` | `/health` | none | Liveness only; never touches sessions. |
+| `GET` | `/health` | none | Liveness plus `audit_write_failures`, the best-effort dispatch audit writes that failed since startup. Never touches sessions. |
 | `POST` | `/api/enrollment-tokens` | admin | `{token, expires_at}` for one owner. |
 | `POST` | `/api/devices/enroll` | enrollment token | Consumes the token once; body is `{token, identity_key}` and the response is `{device_id, credential}`. The device's X25519 identity public key is pinned here. |
 | `POST` | `/api/sessions` | admin | Authorizes a device session; body is `{device_id, client_identity_key, control?, user_id?}`, response `{session_id, capability, expires_at, ticket, verification_key}`. `control: true` requires a live lease held by `user_id`; the default session is read-only. |
@@ -350,18 +350,27 @@ name, and an unimplemented one comes back as `unknown_command`.
 Dispatch requires the admin token *and* the actor's access to the device (its owner, or the
 active lease holder); the actor is the `user_id` query parameter because the admin token
 carries no identity. Every attempt writes one `audit_log` row with actor, action, device,
-outcome, and error code — that row is the durable trace, not the command itself.
+outcome, and error code — that row is the durable trace (written best-effort after
+enqueue; see [Audit](#audit)), not the command itself.
 
 ## Audit
 
 Every dispatch attempt — accepted, refused, or timed out — writes one durable `audit_log` row:
 `at_ms`, `actor`, `action` (`command.dispatch`), `device_id`, `outcome` (`accepted` or
-`refused`), and the machine `error` code when there is one. Every accepted revocation writes
-its own row: `device.revoke`, `session.revoke`, `lease.revoke`, and `lease.handoff` (when a
-handoff replaces a live lease). A session revocation is keyed by the session's device; the
-actor of a device or session revocation is `admin` because the bootstrap token carries no user
-identity. An enrollment-token revocation precedes any device, has no `device_id`, and is
-therefore not an audit row.
+`refused`), and the machine `error` code when there is one. The row is written **after** the
+command is enqueued and is best-effort: a failed write is logged at error level, counted as
+`audit_write_failures` in `GET /health`, and never changes the caller's outcome. The counter is
+the honest limit of the claim — a non-zero value means an executed command may be untraced.
+
+Every revocation writes its row **inside the same store transaction** that performs it, so a
+revocation can never commit untraced. The row is stamped with the effective revocation time
+and the affected device, and these endpoints are idempotent: a retried `device.revoke`,
+`session.revoke`, or `lease.revoke` keeps the first time and appends nothing, so a retry can
+never claim a later event or another actor. `lease.handoff` records the replaced lease and the
+actor that granted it; a handoff that replaces nothing writes no row. A session revocation is
+keyed by the session's device; the actor of a device or session revocation is `admin` because
+the bootstrap token carries no user identity. An enrollment-token revocation precedes any
+device, has no `device_id`, and is therefore not an audit row.
 
 `GET /api/audit` is read-only and admin-authenticated: there is no endpoint that writes,
 changes, or deletes a row. Rows carry no command arguments, file path, file bytes, or image

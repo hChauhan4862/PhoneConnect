@@ -167,7 +167,7 @@ async fn session_creation_refuses_a_revoked_device() {
     let app = TestApp::new();
     let (device_id, _) = app.enroll_new("user-a").await;
     app.store
-        .revoke_device(&device_id, app.now())
+        .revoke_device(&device_id, app.now(), common::store_device_revocation())
         .await
         .expect("device revocation persists");
 
@@ -332,7 +332,7 @@ async fn revoked_device_credential_fails_immediately() {
     let capability = session["capability"].as_str().expect("capability");
 
     app.store
-        .revoke_device(&device_id, app.now())
+        .revoke_device(&device_id, app.now(), common::store_device_revocation())
         .await
         .expect("device revocation persists");
 
@@ -355,7 +355,7 @@ async fn revoked_session_fails_immediately() {
     let capability = session["capability"].as_str().expect("capability");
 
     app.store
-        .revoke_session(session_id, app.now())
+        .revoke_session(session_id, app.now(), common::store_session_revocation())
         .await
         .expect("session revocation persists");
 
@@ -375,7 +375,11 @@ async fn health_endpoint_is_unauthenticated_and_explicit() {
         .request(axum::http::Method::GET, "/health", None, None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "audit_write_failures": 0 }),
+        "health reports the best-effort audit write failures"
+    );
 }
 
 #[tokio::test]

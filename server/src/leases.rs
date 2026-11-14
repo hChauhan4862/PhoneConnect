@@ -19,7 +19,9 @@ use serde_json::json;
 use crate::audit;
 use crate::auth::{AuthError, generate_secret};
 use crate::relay::{Relay, RelayClose};
-use crate::store::{Clock, DeviceRecord, DeviceStore, LeaseRevocationReason, StoreError, UnixMs};
+use crate::store::{
+    Clock, DeviceRecord, DeviceStore, LeaseRevocationReason, RevocationAudit, StoreError, UnixMs,
+};
 use crate::{ApiJson, AppState};
 
 pub use crate::store::ControlLease;
@@ -315,7 +317,15 @@ impl LeaseStore {
         };
         let previous = self
             .store
-            .replace_lease(lease.clone(), now, LeaseRevocationReason::Handoff)
+            .replace_lease(
+                lease.clone(),
+                now,
+                LeaseRevocationReason::Handoff,
+                RevocationAudit {
+                    actor: actor_id,
+                    action: audit::ACTION_LEASE_HANDOFF,
+                },
+            )
             .await?;
 
         let replaced = match previous {
@@ -354,7 +364,18 @@ impl LeaseStore {
         let reason = lease
             .revoked_reason
             .unwrap_or(LeaseRevocationReason::Revoked);
-        let revoked_at_ms = self.store.revoke_lease(lease_id, now, reason).await?;
+        let revoked_at_ms = self
+            .store
+            .revoke_lease(
+                lease_id,
+                now,
+                reason,
+                RevocationAudit {
+                    actor: actor_id,
+                    action: audit::ACTION_LEASE_REVOKE,
+                },
+            )
+            .await?;
         let mut event = self
             .revocation_event(&lease, actor_id, revoked_at_ms, reason)
             .await?;
@@ -565,16 +586,6 @@ pub async fn handoff_lease(
         .leases
         .handoff(&device_id, &actor_id, &to_user_id, expires_at)
         .await?;
-    if handoff.replaced.is_some() {
-        // A handoff ends the previous holder's lease; the sharing event is traceable too.
-        audit::record_revocation(
-            &state,
-            &actor_id,
-            audit::ACTION_LEASE_HANDOFF,
-            &handoff.lease.device_id,
-        )
-        .await;
-    }
     Ok(Json(handoff))
 }
 
@@ -588,13 +599,6 @@ pub async fn revoke_lease(
     state.auth.require_admin(&headers)?;
     let actor_id = required_id(&request.actor_id, "actor_id must not be empty")?;
     let event = state.leases.revoke(&lease_id, &actor_id).await?;
-    audit::record_revocation(
-        &state,
-        &event.actor_id,
-        audit::ACTION_LEASE_REVOKE,
-        &event.device_id,
-    )
-    .await;
     Ok(Json(event))
 }
 

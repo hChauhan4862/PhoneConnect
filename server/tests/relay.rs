@@ -779,7 +779,7 @@ async fn attach_re_reads_the_live_session_record() {
 
     // The relay registered a snapshot at open; revocation after that must still be seen.
     app.store
-        .revoke_session(&session_id, app.now())
+        .revoke_session(&session_id, app.now(), common::store_session_revocation())
         .await
         .expect("session revocation persists");
 
@@ -890,7 +890,7 @@ async fn attached_relay_notices_out_of_band_session_revocation() {
     let waiting = tokio::spawn(async move { client.recv_bytes().await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     app.store
-        .revoke_session(&session_id, app.now())
+        .revoke_session(&session_id, app.now(), common::store_session_revocation())
         .await
         .expect("session revocation persists");
 
@@ -937,7 +937,11 @@ async fn attached_relay_notices_out_of_band_device_revocation() {
     let waiting = tokio::spawn(async move { client.recv_bytes().await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     app.store
-        .revoke_device(&device_id, app.now())
+        .revoke_device(
+            &device_id,
+            app.now(),
+            crate::common::store_device_revocation(),
+        )
         .await
         .expect("device revocation persists");
 
@@ -1449,7 +1453,11 @@ mod transport {
         let _device = attach(&url, &credential).await;
 
         app.store
-            .revoke_device(&device_id, app.now())
+            .revoke_device(
+                &device_id,
+                app.now(),
+                crate::common::store_device_revocation(),
+            )
             .await
             .expect("revocation persists");
 
@@ -1499,7 +1507,7 @@ async fn relay_authorization_is_cached_within_the_poll_bound() {
         .expect("first frame authorizes and caches");
 
     app.store
-        .revoke_session(&session_id, app.now())
+        .revoke_session(&session_id, app.now(), common::store_session_revocation())
         .await
         .expect("session revocation persists");
 

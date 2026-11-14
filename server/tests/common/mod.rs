@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use phoneconnect_server::relay::RelayLimits;
-use phoneconnect_server::store::{Clock, ManualClock, SqliteStore};
+use phoneconnect_server::store::{Clock, ManualClock, RevocationAudit, SqliteStore};
 use phoneconnect_server::{AppState, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -19,6 +19,22 @@ pub const ADMIN_TOKEN: &str = "test-admin-token";
 /// [`relay_url`]`(session_id)`.
 pub const RELAY_ENDPOINT: &str = "https://relay.test/api/sessions";
 pub const NOW_MS: i64 = 1_760_000_000_000;
+
+/// A revocation audit for a test that drives the store directly rather than a route. The
+/// HTTP handlers always name the real actor and action.
+pub fn store_device_revocation() -> RevocationAudit<'static> {
+    RevocationAudit {
+        actor: "store-test",
+        action: phoneconnect_server::audit::ACTION_DEVICE_REVOKE,
+    }
+}
+
+pub fn store_session_revocation() -> RevocationAudit<'static> {
+    RevocationAudit {
+        actor: "store-test",
+        action: phoneconnect_server::audit::ACTION_SESSION_REVOKE,
+    }
+}
 
 /// The live relay route for one session, as advertised in leases and candidates.
 pub fn relay_url(session_id: &str) -> String {
@@ -39,6 +55,16 @@ impl TestApp {
 
     pub fn with_relay(limits: RelayLimits) -> Self {
         let store = Arc::new(SqliteStore::in_memory().expect("in-memory sqlite store"));
+        Self::with_store_and_relay(store, limits)
+    }
+
+    /// The same app over a caller-supplied store, so a test can reach the same file from a
+    /// second connection (a broken table, a query plan, a restart).
+    pub fn with_store(store: Arc<SqliteStore>) -> Self {
+        Self::with_store_and_relay(store, RelayLimits::default())
+    }
+
+    pub fn with_store_and_relay(store: Arc<SqliteStore>, limits: RelayLimits) -> Self {
         let clock = Arc::new(ManualClock::new(NOW_MS));
         let state = Arc::new(
             AppState::new(

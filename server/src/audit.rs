@@ -1,10 +1,12 @@
 //! The audit surface: every command attempt and every revocation, newest first.
 //!
-//! The log is append-only. Writers record an event where it happens — a dispatch attempt in
-//! [`crate::commands`], an administrative revocation in [`crate::admin`] or
-//! [`crate::leases`] — and this module reads it back, filtered and bounded. A row carries
-//! identity, the action, the outcome, and a machine error code only: never a command
-//! argument, a file path, a file byte, or an image.
+//! The log is append-only. A revocation writes its row inside the same store transaction that
+//! changes the record, stamped with the effective revocation time, so an idempotent retry
+//! appends nothing and no revocation commits untraced. A dispatch attempt is recorded after it
+//! is enqueued and is best-effort: [`crate::commands`] counts a failed write and `/health`
+//! reports it rather than hiding it. This module reads the log back, filtered and bounded. A
+//! row carries identity, the action, the outcome, and a machine error code only: never a
+//! command argument, a file path, a file byte, or an image.
 
 use std::sync::Arc;
 
@@ -30,6 +32,7 @@ pub const DEFAULT_AUDIT_LIMIT: usize = 50;
 /// actor of a device or session revocation is the token class itself.
 pub const ADMIN_ACTOR: &str = "admin";
 
+// The action vocabulary the revocation writers record.
 pub const ACTION_DEVICE_REVOKE: &str = "device.revoke";
 pub const ACTION_SESSION_REVOKE: &str = "session.revoke";
 pub const ACTION_LEASE_REVOKE: &str = "lease.revoke";
@@ -51,22 +54,6 @@ pub async fn list_audit(
         .await
         .map_err(AuditError::from)?;
     Ok(Json(entries))
-}
-
-/// Records one accepted revocation. The event already happened, so a failed audit write is
-/// reported operationally and never turns the revocation into an error.
-pub async fn record_revocation(state: &AppState, actor: &str, action: &str, device_id: &str) {
-    let entry = AuditEntry {
-        at_ms: state.now_ms(),
-        actor: actor.to_owned(),
-        action: action.to_owned(),
-        device_id: device_id.to_owned(),
-        outcome: "accepted".to_owned(),
-        error: None,
-    };
-    if let Err(error) = state.store.insert_audit(entry).await {
-        eprintln!("phoneconnect: revocation audit write failed: {error}");
-    }
 }
 
 #[derive(Debug, Deserialize)]

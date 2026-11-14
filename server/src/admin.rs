@@ -17,7 +17,7 @@ use crate::AppState;
 use crate::audit;
 use crate::auth::{AuthError, hash_secret};
 use crate::relay::RelayClose;
-use crate::store::{StoreError, UnixMs};
+use crate::store::{RevocationAudit, StoreError, UnixMs};
 
 /// Result of a revocation request. The revoked secret is never echoed back.
 #[derive(Debug, Serialize)]
@@ -62,7 +62,14 @@ pub async fn revoke_device(
     state.auth.require_admin(&headers)?;
     let revoked_at = state
         .store
-        .revoke_device(&device_id, state.now_ms())
+        .revoke_device(
+            &device_id,
+            state.now_ms(),
+            RevocationAudit {
+                actor: audit::ADMIN_ACTOR,
+                action: audit::ACTION_DEVICE_REVOKE,
+            },
+        )
         .await?;
     state.relay.close_device(
         &device_id,
@@ -70,13 +77,6 @@ pub async fn revoke_device(
             device_id: device_id.clone(),
         },
     );
-    audit::record_revocation(
-        &state,
-        audit::ADMIN_ACTOR,
-        audit::ACTION_DEVICE_REVOKE,
-        &device_id,
-    )
-    .await;
     Ok(Json(Revocation {
         revoked: true,
         revoked_at,
@@ -90,22 +90,21 @@ pub async fn revoke_session(
     headers: HeaderMap,
 ) -> Result<Json<Revocation>, RevocationError> {
     state.auth.require_admin(&headers)?;
-    // The row is keyed by device, so read the session's device before ending it.
-    let session = state.store.session(&session_id).await?;
+    // The store keys the audit row by the session's own device, in the same transaction.
     let revoked_at = state
         .store
-        .revoke_session(&session_id, state.now_ms())
+        .revoke_session(
+            &session_id,
+            state.now_ms(),
+            RevocationAudit {
+                actor: audit::ADMIN_ACTOR,
+                action: audit::ACTION_SESSION_REVOKE,
+            },
+        )
         .await?;
     state
         .relay
         .close_session(&session_id, RelayClose::SessionRevoked);
-    audit::record_revocation(
-        &state,
-        audit::ADMIN_ACTOR,
-        audit::ACTION_SESSION_REVOKE,
-        &session.device_id,
-    )
-    .await;
     Ok(Json(Revocation {
         revoked: true,
         revoked_at,
