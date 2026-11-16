@@ -130,3 +130,18 @@ Everything a command does not do here is not implemented: there is no mirroring,
 injection, no audio capture or recording, no calls/SMS/notification history, no agent OTA, no
 accounts, no Android TCP proxy bridge, and no direct hole-punched path on Android. The root
 `README.md` lists those gaps.
+
+## Setup-screen actions (not commands)
+
+These are things the *user* does on the device's own setup screen. They are not device
+commands, so they are not in the table above; they exist because the corresponding command is
+otherwise unreachable.
+
+| Action | What it does | Why it is a user action | Verified |
+| --- | --- | --- | --- |
+| Allow notifications | Requests `POST_NOTIFICATIONS` so the one connection notification is visible on Android 13+ | Android only lets the app ask with a system dialog, and a hidden notification would make the foreground service invisible | Emulator (dialog shown and accepted) |
+| Enable screen capture | Opens `MediaProjectionManager.createScreenCaptureIntent` and hands the grant to the service | Screen capture requires explicit per-grant consent; no command may prompt, so `screen.snapshot` answers `consent_required` until this is done | Emulator (consent → four real captures → stop → `consent_required`) |
+| Stop screen capture | Ends the projection and drops the `mediaProjection` service type | Same consent rule, in reverse | Emulator |
+| Allow brightness changes | Opens `ACTION_MANAGE_WRITE_SETTINGS` for this package | `WRITE_SETTINGS` is user-granted; without it `control.set brightness` is `not_permitted: write_settings_required` | Emulator (grant → brightness 102→200) |
+| Allow Do Not Disturb changes | Opens `ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS` | Notification-policy access is user-granted; without it `control.set dnd_filter` is `not_permitted: policy_access_required` | Emulator (`zen_mode` 0→2) |
+| Allow running in the background | Opens the battery-optimisation exemption screen for this package (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`), falling back to the settings list | The exemption is a request the user can refuse. Android and OEM battery managers may still stop the service, so the screen reports "exempt" or "may still stop this app" and never promises it cannot be stopped | Robolectric (the intent and both status texts); no physical device |
