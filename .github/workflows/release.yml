@@ -257,6 +257,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # `gh` resolves the repository from the working tree, and `--verify-tag` resolves the
+      # tag there too; without a checkout both fail with "not a git repository".
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
       # Only the artifacts that become release assets. Downloading everything also pulls the
       # Docker build-record artifact, which is not published and once failed the whole job.
       - name: Download the APKs
@@ -285,6 +292,8 @@ jobs:
       - name: Attach the assets to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Second belt: `gh` never has to infer the repository from the checkout.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
