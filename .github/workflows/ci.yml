@@ -87,7 +87,7 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
 
       # The runner image ships build-tools but not the platform. AGP 8.9.1 picks build-tools
       # 35.0.0 by default (no buildToolsVersion is set), so that is the revision to pin.
@@ -202,6 +202,10 @@ jobs:
     name: Docker image
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # `compose.yaml` refuses to interpolate without an admin token, and that applies to the
+    # `logs` and `down` steps too — so it is set for the whole job, not only for `up`.
+    env:
+      PHONECONNECT_ADMIN_TOKEN: ci-smoke-token
     steps:
       - uses: actions/checkout@v4
 
@@ -221,7 +225,7 @@ jobs:
       - name: Start the stack and prove it serves the UI and the API
         run: |
           set -euo pipefail
-          PHONECONNECT_ADMIN_TOKEN=ci-smoke-token docker compose -p pc-ci -f docker/compose.yaml up -d --no-build --force-recreate
+          docker compose -p pc-ci -f docker/compose.yaml up -d --no-build --force-recreate
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8080/health > /tmp/health.json; then break; fi
             sleep 2
@@ -238,11 +242,21 @@ jobs:
           curl -fsSI http://127.0.0.1:8080/ | grep -qi 'content-security-policy'
 
           # Enrollment and a session round-trip through the real server.
-          TOKEN=$(curl -fsS -X POST http://127.0.0.1:8080/api/enrollment-tokens             -H "Authorization: Bearer ci-smoke-token" -H 'Content-Type: application/json'             -d '{"owner_id":"ci"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
+          TOKEN=$(curl -fsS -X POST http://127.0.0.1:8080/api/enrollment-tokens \
+            -H "Authorization: Bearer $PHONECONNECT_ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"owner_id":"ci"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
           test -n "$TOKEN"
-          ENROLLED=$(curl -fsS -X POST http://127.0.0.1:8080/api/devices/enroll             -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\"}")
+          # Enrollment pins an X25519 identity key: 32 bytes of unpadded base64url. Without
+          # one the server answers 400 identity_key_required, which is a valid refusal — not
+          # a smoke failure — so the check supplies a throwaway key.
+          IDENTITY_KEY=$(python3 -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))')
+          ENROLLED=$(curl -fsS -X POST http://127.0.0.1:8080/api/devices/enroll \
+            -H 'Content-Type: application/json' \
+            -d "{\"token\":\"$TOKEN\",\"identity_key\":\"$IDENTITY_KEY\"}")
           echo "$ENROLLED" | grep -q '"device_id"'
-          curl -fsS -H "Authorization: Bearer ci-smoke-token" http://127.0.0.1:8080/api/devices | grep -q '"state":"enrolled"'
+          curl -fsS -H "Authorization: Bearer $PHONECONNECT_ADMIN_TOKEN" \
+            http://127.0.0.1:8080/api/devices | grep -q '"state":"enrolled"'
 
       - name: Logs on failure
         if: failure()
