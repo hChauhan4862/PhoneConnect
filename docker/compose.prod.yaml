@@ -10,7 +10,7 @@
 services:
   server:
     # Pin a release tag. `latest` moves under you, and a restart would silently upgrade.
-    image: ${PHONECONNECT_IMAGE:-ghcr.io/hchauhan4862/phoneconnect/server:0.1.0}
+    image: ${PHONECONNECT_IMAGE:-ghcr.io/hchauhan4862/phoneconnect/server:0.1.1}
     restart: unless-stopped
 
     environment:

@@ -1,7 +1,7 @@
 {
   "name": "phoneconnect-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "The one PhoneConnect UI, served by the server and embedded unchanged by native shells",
   "scripts": {
