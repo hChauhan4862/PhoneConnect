@@ -78,11 +78,13 @@ interruptions, and be controlled by an authorized user without repeated manual s
 
 ## Approaches considered
 
-### A. Reuse an existing local-first desktop client and add a remote transport
+### A. Reuse the existing local-first desktop client (a Tauri/Rust/React app that drives
+`adb` and `scrcpy` directly on the host) and add a server relay
 
-This would preserve the existing Tauri/Rust/React implementation and add a server
-relay. It is the fastest route to feature parity, but its process model and ADB-centric
-assumptions would constrain a new multi-user protocol and managed-agent lifecycle.
+This would preserve a mature local implementation and add a relay. It is the fastest route to
+feature parity, but its process model and host-tethered ADB assumptions constrain a new
+multi-user protocol and a background agent lifecycle, and it is not a code base this project
+may copy from without a licence review. It was evaluated as prior art, not adopted.
 
 ### B. Server-centric browser control
 

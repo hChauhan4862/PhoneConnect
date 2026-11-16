@@ -240,8 +240,9 @@
 
 After this foundation is accepted, create separate plans for:
 
-1. Android feature adapters and parity with the evaluated prototypes: files, apps,
-   input, display/mirroring, audio, diagnostics, and capability negotiation.
+1. Android feature adapters: files, apps, input, display/mirroring, audio, diagnostics,
+   and capability negotiation. Feature scope is taken from what Android itself permits
+   (see `docs/capabilities.md`), not from another product's screen list.
 2. Full web dashboard for every feature (the single UI), then the thin native shell's
    tray, detached-window, notification, and updater polish.
 3. Docker production operations, migrations, signup/MFA administration, backups, and
