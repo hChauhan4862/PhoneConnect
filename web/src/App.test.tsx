@@ -101,6 +101,7 @@ function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): Ap
       token: "pcenr_test_token",
       expires_at: NOW + 900_000,
     })),
+    revokeEnrollmentToken: vi.fn(async () => ({ revoked: true, revoked_at: NOW })),
     revokeDevice: vi.fn(async () => ({ revoked: true, revoked_at: NOW })),
     deviceStatus: vi.fn(
       typeof status === "function" ? status : async () => status,

@@ -297,7 +297,9 @@ class SetupActivityTest {
         activity.findViewById<Button>(R.id.grant_battery_exemption).performClick()
 
         val started = shadowOf(activity).nextStartedActivity
-        assertEquals(SetupActivity.SETTINGS_REQUEST_EXEMPTION, started.action)
+        // The concrete action, not the constant production builds the intent from: a
+        // misspelling must fail here instead of only on a device with no matching activity.
+        assertEquals("android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", started.action)
         assertEquals(
             "the dialog must be scoped to this app, never the whole device",
             "package:${activity.packageName}",

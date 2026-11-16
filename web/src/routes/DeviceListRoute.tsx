@@ -23,7 +23,12 @@ export function DeviceListRoute({
   const resource = useResource(`devices:${userId}`, () => api.listDevices());
   const [pendingRevoke, setPendingRevoke] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
-  const [revokeFailure, setRevokeFailure] = useState<unknown>(null);
+  // The device the failure belongs to travels with it, so a stale error can never read as
+  // another device's result.
+  const [revokeFailure, setRevokeFailure] = useState<{
+    deviceId: string;
+    error: unknown;
+  } | null>(null);
 
   const reload = resource.reload;
 
@@ -36,7 +41,7 @@ export function DeviceListRoute({
         setPendingRevoke(null);
         reload();
       } catch (error) {
-        setRevokeFailure(error);
+        setRevokeFailure({ deviceId, error });
       } finally {
         setRevoking(null);
       }
@@ -44,11 +49,17 @@ export function DeviceListRoute({
     [api, reload],
   );
 
-  if (resource.error) {
-    return <ErrorNotice error={resource.error} onRetry={reload} />;
-  }
   if (resource.loading && !resource.data) {
-    return <p>Loading devices…</p>;
+    // Onboarding does not need the list, so the panel stays available while it loads.
+    return (
+      <>
+        <section className="panel" aria-labelledby="devices-heading">
+          <h1 id="devices-heading">Devices</h1>
+          <p>Loading devices…</p>
+        </section>
+        <EnrollmentTokenPanel api={api} defaultOwner={userId} />
+      </>
+    );
   }
   const devices = resource.data?.devices ?? [];
 
@@ -57,7 +68,11 @@ export function DeviceListRoute({
       <section className="panel" aria-labelledby="devices-heading">
         <h1 id="devices-heading">Devices</h1>
 
-        {devices.length === 0 ? (
+        {/* A failed read is reported here, not in place of the whole route: minting a token
+            is the only way back to a working list, so it must stay reachable. */}
+        {resource.error ? (
+          <ErrorNotice error={resource.error} onRetry={reload} />
+        ) : devices.length === 0 ? (
           <>
             <p>No devices yet. Two steps:</p>
             <ol>
@@ -95,7 +110,13 @@ export function DeviceListRoute({
                       >
                         Confirm revoke
                       </button>
-                      <button type="button" onClick={() => setPendingRevoke(null)}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPendingRevoke(null);
+                          setRevokeFailure(null);
+                        }}
+                      >
                         Cancel revoke
                       </button>
                     </span>
@@ -118,7 +139,8 @@ export function DeviceListRoute({
 
         {revokeFailure ? (
           <p role="alert" className="notice notice-error">
-            The device was not revoked: <code>{asApiError(revokeFailure).code}</code>
+            <code>{revokeFailure.deviceId}</code> was not revoked:{" "}
+            <code>{asApiError(revokeFailure.error).code}</code>
           </p>
         ) : null}
       </section>

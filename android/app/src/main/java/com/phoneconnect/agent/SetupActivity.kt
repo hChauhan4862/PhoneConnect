@@ -227,7 +227,8 @@ open class SetupActivity : Activity() {
             startActivity(
                 when (screen) {
                     BatteryScreen.SCOPED_DIALOG ->
-                        Intent(SETTINGS_REQUEST_EXEMPTION).setData("package:$packageName".toUri())
+                        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                            .setData("package:$packageName".toUri())
                     BatteryScreen.SETTINGS_LIST ->
                         Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
                 },
@@ -244,7 +245,8 @@ open class SetupActivity : Activity() {
 
     /** Test seam: the scan is the build's own list, so a device without the dialog is covered. */
     internal open fun batteryScreenToOpen(): BatteryScreen {
-        val dialog = Intent(SETTINGS_REQUEST_EXEMPTION).setData("package:$packageName".toUri())
+        val dialog = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            .setData("package:$packageName".toUri())
         val resolves = packageManager.queryIntentActivities(dialog, 0).isNotEmpty()
         return if (resolves) BatteryScreen.SCOPED_DIALOG else BatteryScreen.SETTINGS_LIST
     }
@@ -383,12 +385,5 @@ open class SetupActivity : Activity() {
     internal companion object {
         const val REQUEST_NOTIFICATIONS = 1001
         const val REQUEST_SCREEN_CAPTURE = 1002
-
-        /**
-         * The scoped battery-exemption dialog. Android documents the action; it is spelled here
-         * because it is not exposed as a public SDK constant.
-         */
-        const val SETTINGS_REQUEST_EXEMPTION =
-            "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
     }
 }

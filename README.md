@@ -119,14 +119,17 @@ emulator, by a unit test only, or not at all.
   driven against the emulator in a real desktop browser. The file, app, screen, and console
   screens have component tests and the served SPA answers their routes, but no run has driven
   them against a live device in a real desktop browser. Onboarding — minting a single-use
-  enrollment token and revoking a device behind a confirmation — is covered by Vitest and was
-  exercised against the real server with `curl` (mint → enroll → single-use refusal → revoke),
-  but not clicked through in a browser. The audit screen (newest-first rows, a server-side
-  device filter, and explicit empty and error states) is covered by Vitest only. There is no
-  server-to-client push, so every screen renders the snapshot it last read. The audit page
-  says in visible text what its rows can and cannot mean: the actor is asserted by the token
-  holder and is not verified by the server. An `accepted` outcome means the command was
-  delivered to the device's channel, not that the device executed it.
+  enrollment token, revoking a minted token before it is used, and revoking a device behind a
+  confirmation — is covered by Vitest and was exercised against the real server with `curl`
+  (mint → enroll → single-use refusal → revoke), but not clicked through in a browser. The
+  token panel names the owner the token was minted for, warns when the operator's own
+  `localhost` origin is one the phone cannot dial, and offers to revoke the token so a secret
+  shown by mistake can be withdrawn rather than only forgotten. The audit screen (newest-first
+  rows, a server-side device filter, and explicit empty and error states) is covered by Vitest
+  only. There is no server-to-client push, so every screen renders the snapshot it last read.
+  The audit page says in visible text what its rows can and cannot mean: the actor is asserted
+  by the token holder and is not verified by the server. An `accepted` outcome means the
+  command was delivered to the device's channel, not that the device executed it.
 - **Native shell.** Builds on macOS and runs its headless `--print-context` path. The GUI path
   was not exercised here.
 

@@ -89,9 +89,10 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      # The runner image ships build-tools but not the platform; the build needs 35.
+      # The runner image ships build-tools but not the platform. AGP 8.9.1 picks build-tools
+      # 35.0.0 by default (no buildToolsVersion is set), so that is the revision to pin.
       - name: Install the SDK platform and build tools
-        run: sdkmanager --install "platforms;android-35" "build-tools;36.0.0" "platform-tools"
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -181,9 +182,15 @@ jobs:
           BIN=target/release/phoneconnect-native
           [ -f "$BIN" ] || BIN="$BIN.exe"
           "$BIN" --print-context > context.json
-          grep -q '"kind": "native"' context.json
-          grep -q 'phoneconnect.example' context.json
           cat context.json
+          # Parse the document instead of grepping its formatting: the assertions are about
+          # the values, not about how serde_json happens to pretty-print them.
+          python3 - context.json <<'PY'
+          import json, sys
+          context = json.load(open(sys.argv[1]))
+          assert context["kind"] == "native", context
+          assert "phoneconnect.example" in context["serverUrl"], context
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

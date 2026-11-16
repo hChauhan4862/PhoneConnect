@@ -23,6 +23,7 @@ function fakeApi(options: {
   listFailure?: unknown;
   issueFailure?: unknown;
   revokeFailure?: unknown;
+  revokeTokenFailure?: unknown;
   token?: { token: string; expires_at: number };
 } = {}) {
   const api = {
@@ -34,6 +35,10 @@ function fakeApi(options: {
       if (options.issueFailure) throw options.issueFailure;
       return options.token ?? { token: "pcenr_abc123", expires_at: NOW + 900_000 };
     }),
+    revokeEnrollmentToken: vi.fn(async () => {
+      if (options.revokeTokenFailure) throw options.revokeTokenFailure;
+      return { revoked: true, revoked_at: NOW };
+    }),
     revokeDevice: vi.fn(async () => {
       if (options.revokeFailure) throw options.revokeFailure;
       return { revoked: true, revoked_at: NOW };
@@ -41,6 +46,7 @@ function fakeApi(options: {
   } as unknown as ApiClient & {
     listDevices: ReturnType<typeof vi.fn>;
     issueEnrollmentToken: ReturnType<typeof vi.fn>;
+    revokeEnrollmentToken: ReturnType<typeof vi.fn>;
     revokeDevice: ReturnType<typeof vi.fn>;
   };
   return api;
@@ -142,6 +148,87 @@ describe("DeviceListRoute", () => {
     expect(screen.queryByTestId("enrollment-token")).not.toBeInTheDocument();
   });
 
+  it("names the owner a token was minted for, even after the field is edited", async () => {
+    const api = fakeApi();
+    renderList(api);
+    await screen.findByText(/No devices yet/i);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Create enrollment token/i }),
+    );
+    await screen.findByTestId("enrollment-token");
+
+    // Editing the Owner field afterwards must not make the live token look like it is theirs.
+    const ownerField = screen.getByLabelText(/Owner/i);
+    await userEvent.clear(ownerField);
+    await userEvent.type(ownerField, "someone-else");
+    expect(screen.getByText(/Enrollment token for owner-1/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Enrollment token for someone-else/i)).not.toBeInTheDocument();
+  });
+
+  it("revokes a minted token on the server so it cannot enroll", async () => {
+    const api = fakeApi();
+    renderList(api);
+    await screen.findByText(/No devices yet/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: /Create enrollment token/i }),
+    );
+    await screen.findByTestId("enrollment-token");
+
+    await userEvent.click(screen.getByRole("button", { name: /Revoke token/i }));
+
+    await waitFor(() =>
+      expect(api.revokeEnrollmentToken).toHaveBeenCalledWith("pcenr_abc123"),
+    );
+    expect(screen.queryByTestId("enrollment-token")).not.toBeInTheDocument();
+    expect(screen.getByText(/can no longer enroll a device/i)).toBeInTheDocument();
+  });
+
+  it("keeps the token visible when the server refuses to revoke it", async () => {
+    const api = fakeApi({
+      revokeTokenFailure: new ApiError(404, "enrollment_token_unknown"),
+    });
+    renderList(api);
+    await screen.findByText(/No devices yet/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: /Create enrollment token/i }),
+    );
+    await screen.findByTestId("enrollment-token");
+
+    await userEvent.click(screen.getByRole("button", { name: /Revoke token/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/enrollment_token_unknown/);
+    expect(screen.getByTestId("enrollment-token")).toBeInTheDocument();
+  });
+
+  it("keeps onboarding reachable when the device list fails", async () => {
+    const api = fakeApi({ listFailure: new ApiError(503, "store_failure") });
+    renderList(api);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/store_failure/);
+    // Minting a token is the way back to a working list, so the panel must still be there.
+    expect(
+      screen.getByRole("button", { name: /Create enrollment token/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/No devices yet/i)).not.toBeInTheDocument();
+  });
+
+  it("warns when the hub URL is a loopback address the phone cannot dial", async () => {
+    const api = fakeApi();
+    renderList(api);
+    await screen.findByText(/No devices yet/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: /Create enrollment token/i }),
+    );
+    await screen.findByTestId("enrollment-token");
+
+    // jsdom serves the tests from http://localhost:3000, the same shape as the documented
+    // local compose run: the phone would read that as itself.
+    expect(screen.getByText(/mean the phone itself/i)).toBeInTheDocument();
+  });
+
   it("requires a second confirmation before revoking a device", async () => {
     const api = fakeApi({ devices: [device()] });
     renderList(api);
@@ -188,8 +275,10 @@ describe("DeviceListRoute", () => {
     );
 
     const alert = await screen.findByRole("alert");
+    // The failure names the device it belongs to, so it cannot read as another row's result.
+    expect(alert).toHaveTextContent(/dev_1/);
     expect(alert).toHaveTextContent(/device_unknown/);
-    expect(screen.getByText("dev_1")).toBeInTheDocument();
+    expect(within(row).getByRole("link", { name: "dev_1" })).toBeInTheDocument();
   });
 
   it("offers re-enrolling, not a dead control, for a revoked device", async () => {

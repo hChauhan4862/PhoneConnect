@@ -286,6 +286,10 @@ export interface ApiClient {
     ownerId: string,
     expiresInSeconds?: number,
   ): Promise<IssuedEnrollmentToken>;
+  /// Revokes one unused enrollment token, so a token shown by mistake cannot enroll a device.
+  /// The token itself is the only handle the server keeps; a token already used or expired
+  /// answers `enrollment_token_unknown`.
+  revokeEnrollmentToken(token: string): Promise<Revocation>;
   /// Revokes a device, its live sessions, and its channel. The device row stays listed, as
   /// `revoked`, and only a new enrollment brings it back.
   revokeDevice(deviceId: string): Promise<Revocation>;
@@ -446,6 +450,11 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
         expiresInSeconds === undefined
           ? { owner_id: ownerId }
           : { owner_id: ownerId, expires_in_seconds: expiresInSeconds },
+      ),
+    revokeEnrollmentToken: (token) =>
+      request<Revocation>(
+        "POST",
+        `/api/enrollment-tokens/${encodeURIComponent(token)}/revoke`,
       ),
     revokeDevice: (deviceId) =>
       request<Revocation>(

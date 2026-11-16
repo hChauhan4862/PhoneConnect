@@ -68,8 +68,9 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
+      # AGP 8.9.1 picks build-tools 35.0.0 by default (no buildToolsVersion is set).
       - name: Install the SDK platform and build tools
-        run: sdkmanager --install "platforms;android-35" "build-tools;36.0.0" "platform-tools"
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - uses: gradle/actions/setup-gradle@v4
 
@@ -132,6 +133,11 @@ jobs:
           java-version: "21"
 
       - uses: android-actions/setup-android@v3
+
+      # The runner image ships the command-line tools but not the platform, so the job that
+      # actually builds the APKs installs it, exactly as `verify` and CI do.
+      - name: Install the SDK platform and build tools
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - uses: gradle/actions/setup-gradle@v4
 

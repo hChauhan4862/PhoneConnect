@@ -339,6 +339,13 @@ Android says, in three states: "Android exempts this app", "Android may still st
 save battery", or — when the power manager cannot be read — "Android did not say whether this app
 is exempt; assume it can still be stopped". The screen never claims the agent cannot be stopped.
 
+`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` is a Google Play-restricted permission: Play grants it
+only to the app categories it names (alarm and VoIP apps, for example). This project ships the
+agent as a sideloaded APK from its own releases, never through Play, so the restriction does not
+gate distribution — but a Play listing would have to justify or drop the declaration. The
+manifest records that position next to the permission, and the `BatteryLife` lint check is
+suppressed because the trade is known rather than overlooked.
+
 ## Known gaps in this milestone
 
 - **Direct (hole-punched) paths are not ported.** `crates/transport` probes candidates with

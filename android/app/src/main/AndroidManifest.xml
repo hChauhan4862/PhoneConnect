@@ -54,7 +54,13 @@
     <!-- The battery-optimisation exemption is a request the user can refuse. Android and OEM
          battery managers may still stop a foreground service; the setup screen asks for the
          exemption and then reports what Android says, rather than promising the app cannot be
-         stopped. The scoped request dialog needs this permission. -->
+         stopped. The scoped request dialog needs this permission.
+
+         Play policy: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS is restricted, granted only to app
+         categories Play names (for example alarm and VoIP apps). This project distributes the
+         agent as a sideloaded APK from its own releases, never through Play, so the restriction
+         does not gate shipping it; a Play listing would have to justify or drop it. The lint
+         check is suppressed because the trade is known and recorded here, not overlooked. -->
     <uses-permission
         android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
         tools:ignore="BatteryLife" />
