@@ -191,14 +191,14 @@ jobs:
           file: docker/Dockerfile
           push: false
           load: true
-          tags: phoneconnect-server:ci
+          tags: phoneconnect-server:dev
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Start the stack and prove it serves the UI and the API
         run: |
           set -euo pipefail
-          PHONECONNECT_ADMIN_TOKEN=ci-smoke-token docker compose -p pc-ci -f docker/compose.yaml up -d --no-build
+          PHONECONNECT_ADMIN_TOKEN=ci-smoke-token docker compose -p pc-ci -f docker/compose.yaml up -d --no-build --force-recreate
           for i in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8080/health > /tmp/health.json; then break; fi
             sleep 2
