@@ -5,7 +5,7 @@
 
 # The one UI is built here and served by the server, so the image ships exactly the bundle a
 # browser and the native shell load from `<server>/`.
-FROM node:24-bookworm-slim AS web
+FROM node:26-bookworm-slim AS web
 
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
