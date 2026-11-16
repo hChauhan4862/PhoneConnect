@@ -12,7 +12,6 @@ import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
 import androidx.core.content.IntentCompat
 import com.phoneconnect.agent.net.HubClient
-import com.phoneconnect.agent.system.BatteryExemption
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -58,6 +57,7 @@ class SetupActivityTest {
         TestSetupActivity.writeSettingsGranted = false
         TestSetupActivity.policyGranted = false
         TestSetupActivity.batteryExempt = false
+        TestSetupActivity.batteryScreen = SetupActivity.BatteryScreen.SCOPED_DIALOG
     }
 
     @After
@@ -291,26 +291,38 @@ class SetupActivityTest {
     }
 
     @Test
-    fun `the battery exemption is requested from the system, not assumed`() {
+    fun `the battery exemption opens the scoped dialog and names only this package`() {
         val activity = setupActivity()
 
         activity.findViewById<Button>(R.id.grant_battery_exemption).performClick()
 
         val started = shadowOf(activity).nextStartedActivity
-        assertEquals(BatteryExemption.ACTION_REQUEST_IGNORE, started.action)
-        assertEquals("package:${activity.packageName}", started.data.toString())
+        assertEquals(SetupActivity.SETTINGS_REQUEST_EXEMPTION, started.action)
+        assertEquals(
+            "the dialog must be scoped to this app, never the whole device",
+            "package:${activity.packageName}",
+            started.data.toString(),
+        )
     }
 
     @Test
-    fun `the screen says that Android may still stop the app when the exemption is missing`() {
+    fun `a build without the scoped dialog falls back to the settings list`() {
+        TestSetupActivity.batteryScreen = SetupActivity.BatteryScreen.SETTINGS_LIST
+        val activity = setupActivity()
+
+        activity.findViewById<Button>(R.id.grant_battery_exemption).performClick()
+
+        val started = shadowOf(activity).nextStartedActivity
+        assertEquals(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS, started.action)
+    }
+
+    @Test
+    fun `a missing exemption says Android may still stop the app`() {
         TestSetupActivity.batteryExempt = false
         val activity = setupActivity()
 
         val status = activity.findViewById<TextView>(R.id.battery_status).text.toString()
-        assertTrue(
-            "a missing exemption must say the app can be stopped, was '$status'",
-            status.contains("may still stop", ignoreCase = true),
-        )
+        assertTrue("a missing exemption must warn, was '$status'", status.contains("may still stop", ignoreCase = true))
         assertFalse(
             "the screen must never promise it cannot be stopped, was '$status'",
             status.contains("cannot be stopped", ignoreCase = true),
@@ -318,15 +330,25 @@ class SetupActivityTest {
     }
 
     @Test
-    fun `an exempt app reports the exemption without claiming immortality`() {
+    fun `an exemption is reported without claiming immortality`() {
         TestSetupActivity.batteryExempt = true
         val activity = setupActivity()
 
         val status = activity.findViewById<TextView>(R.id.battery_status).text.toString()
+        assertTrue("the exemption must be visible, was '$status'", status.contains("exempts this app", ignoreCase = true))
+    }
+
+    @Test
+    fun `an unreadable exemption is neither optimised nor exempt`() {
+        TestSetupActivity.batteryExempt = null
+        val activity = setupActivity()
+
+        val status = activity.findViewById<TextView>(R.id.battery_status).text.toString()
         assertTrue(
-            "the granted exemption must be visible, was '$status'",
-            status.contains("exempts this app", ignoreCase = true),
+            "an unknown state must say so and assume the app can be stopped, was '$status'",
+            status.contains("did not say", ignoreCase = true),
         )
+        assertTrue("and still warn about stopping, was '$status'", status.contains("can still be stopped"))
     }
 
     private fun setupActivity(): SetupActivity {
@@ -367,13 +389,16 @@ class SetupActivityTest {
 
         override fun hasPolicyAccess(): Boolean = policyGranted
 
-        override fun ignoresBatteryOptimizations(): Boolean = batteryExempt
+        override fun ignoresBatteryOptimizations(): Boolean? = batteryExempt
+
+        override fun batteryScreenToOpen(): BatteryScreen = batteryScreen
 
         companion object {
             lateinit var storeOverride: EnrollmentStore
             var writeSettingsGranted = false
             var policyGranted = false
-            var batteryExempt = false
+            var batteryExempt: Boolean? = false
+            var batteryScreen = SetupActivity.BatteryScreen.SCOPED_DIALOG
         }
     }
 

@@ -37,6 +37,7 @@
     <string name="setup_battery_status">Background reliability: %1$s</string>
     <string name="setup_battery_status_initial">Background reliability: not exempt from battery optimisation</string>
     <string name="setup_battery_exempt">Android exempts this app from battery optimisation.</string>
+    <string name="setup_battery_unknown">Android did not say whether this app is exempt; assume it can still be stopped.</string>
     <string name="setup_battery_not_exempt">Android may still stop this app to save battery. Use the button above and allow it; without the exemption the agent reconnects when it can, but it can be stopped.</string>
     <string name="setup_grants_unavailable">Android did not open that settings screen on this device, so the grant cannot be given here.</string>
 </resources>

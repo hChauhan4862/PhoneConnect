@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
@@ -17,7 +18,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import com.phoneconnect.agent.net.HubClient
-import com.phoneconnect.agent.system.BatteryExemption
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -210,38 +210,65 @@ open class SetupActivity : Activity() {
         )
     }
 
+    /// Which screen the battery button opens, so a test can check the choice without a device.
+    internal enum class BatteryScreen { SCOPED_DIALOG, SETTINGS_LIST }
+
     /**
-     * The battery exemption is a *request*: Android (and OEM battery managers) may still stop
-     * the service. The scoped dialog is preferred; a build that refuses it falls back to the
-     * settings list, and a device with neither says so instead of promising reliability.
+     * Ask Android for the battery-optimisation exemption. This is a request: the user can
+     * decline, and OEM battery managers may stop the service either way, so the status line
+     * below reports what Android says rather than promising the app survives.
+     *
+     * The scoped dialog names this package only. Some builds do not resolve it; the settings
+     * list is the fallback, and a device with neither says so.
      */
     private fun requestBatteryExemption() {
+        val screen = batteryScreenToOpen()
         try {
-            startActivity(BatteryExemption.request(packageName))
+            startActivity(
+                when (screen) {
+                    BatteryScreen.SCOPED_DIALOG ->
+                        Intent(SETTINGS_REQUEST_EXEMPTION).setData("package:$packageName".toUri())
+                    BatteryScreen.SETTINGS_LIST ->
+                        Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                },
+            )
         } catch (_: ActivityNotFoundException) {
+            // A build that resolves neither screen leaves the user with the guidance only.
             try {
-                startActivity(BatteryExemption.settings())
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             } catch (_: ActivityNotFoundException) {
                 batteryStatusView.text = getString(R.string.setup_grants_unavailable)
             }
         }
     }
 
+    /** Test seam: the scan is the build's own list, so a device without the dialog is covered. */
+    internal open fun batteryScreenToOpen(): BatteryScreen {
+        val dialog = Intent(SETTINGS_REQUEST_EXEMPTION).setData("package:$packageName".toUri())
+        val resolves = packageManager.queryIntentActivities(dialog, 0).isNotEmpty()
+        return if (resolves) BatteryScreen.SCOPED_DIALOG else BatteryScreen.SETTINGS_LIST
+    }
+
     private fun showBatteryState() {
         batteryStatusView.text = getString(
             R.string.setup_battery_status,
             getString(
-                if (ignoresBatteryOptimizations()) {
-                    R.string.setup_battery_exempt
-                } else {
-                    R.string.setup_battery_not_exempt
+                when (ignoresBatteryOptimizations()) {
+                    true -> R.string.setup_battery_exempt
+                    false -> R.string.setup_battery_not_exempt
+                    // Unreadable is neither "optimised" nor "exempt": say neither.
+                    null -> R.string.setup_battery_unknown
                 },
             ),
         )
     }
 
-    /** Test seam: the real answer comes from the power manager. */
-    internal open fun ignoresBatteryOptimizations(): Boolean = BatteryExemption.isIgnoring(this)
+    /** Test seam for the reading above. */
+    internal open fun ignoresBatteryOptimizations(): Boolean? = try {
+        getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName)
+    } catch (_: RuntimeException) {
+        null
+    }
 
     /** Test seams: the real answers come from the settings provider and the notification service. */
     internal open fun canWriteSettings(): Boolean = Settings.System.canWrite(this)
@@ -356,5 +383,12 @@ open class SetupActivity : Activity() {
     internal companion object {
         const val REQUEST_NOTIFICATIONS = 1001
         const val REQUEST_SCREEN_CAPTURE = 1002
+
+        /**
+         * The scoped battery-exemption dialog. Android documents the action; it is spelled here
+         * because it is not exposed as a public SDK constant.
+         */
+        const val SETTINGS_REQUEST_EXEMPTION =
+            "android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
     }
 }

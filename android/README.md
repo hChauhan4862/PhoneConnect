@@ -330,11 +330,14 @@ service improve survival but cannot promise it: users, the OS, and OEM battery m
 still stop the agent. The notification and setup screen say so and show recovery steps.
 
 The setup screen also offers the documented mitigation: an **"Allow running in the background"**
-button that opens Android's own battery-optimisation screen (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`
-for this package, falling back to the settings list when a build refuses the scoped dialog). It
-is a request the user can decline, never a grant the app takes for itself, and the status line
-reports what Android says afterwards — "Android exempts this app" or "Android may still stop this
-app to save battery". The screen never claims the agent cannot be stopped.
+button that opens Android's own battery-optimisation screen, scoped to this package
+(`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`). Before opening it the screen asks the package manager
+whether that dialog resolves on this build and falls back to the settings list when it does not,
+so a device with a non-standard settings app still gets a working button. It is a request the
+user can decline, never a grant the app takes for itself. The status line then reports what
+Android says, in three states: "Android exempts this app", "Android may still stop this app to
+save battery", or — when the power manager cannot be read — "Android did not say whether this app
+is exempt; assume it can still be stopped". The screen never claims the agent cannot be stopped.
 
 ## Known gaps in this milestone
 
