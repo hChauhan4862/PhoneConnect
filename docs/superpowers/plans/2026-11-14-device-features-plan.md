@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the reviewed transport/server/agent foundation into a usable device manager: a device reaches the server, reports real telemetry, and can be inspected and operated (files, apps, screen, console, toggles) from the one web UI. Scope is set by what an ordinary Android app can actually do, recorded per command in `docs/capabilities.md`.
+**Goal:** Turn the reviewed transport/server/agent foundation into a usable device console: a device reaches the server, reports real telemetry, and can be inspected and operated (files, apps, screen, console, toggles) from the one web UI. Scope is set by what an ordinary Android app can actually do, recorded per command in `docs/capabilities.md`.
 
 **Architecture:** Add the server-mediated management channel described in the design's "Two channels, two confidentiality rules": an authenticated device WebSocket carrying JSON commands and telemetry, and server HTTP endpoints the web UI calls. The sealed peer channel is untouched and keeps carrying proxy/media ciphertext only.
 
