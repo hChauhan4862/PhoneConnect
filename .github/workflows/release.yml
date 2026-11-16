@@ -404,23 +404,25 @@ jobs:
 
       # Only the artifacts that become release assets. Downloading everything also pulls the
       # Docker build-record artifact, which is not published and once failed the whole job.
+      # `merge-multiple` flattens every artifact into one directory without a per-name subdir.
       - name: Download the APKs
         uses: actions/download-artifact@v4
         with:
           name: release-apk
-          path: release
-          merge-multiple: true
+          path: artifacts/release-apk
 
       - name: Download the shell binaries
         uses: actions/download-artifact@v4
         with:
           pattern: phoneconnect-*
-          path: release
-          merge-multiple: true
+          path: artifacts/shell
 
-      - name: Check there is something to publish
+      # One flat directory of files, because `gh release upload` rejects a directory argument.
+      - name: Collect the files
         run: |
           set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.apk' -o -name 'phoneconnect-*' \) -exec cp {} release/ \;
           ls -l release
           test -n "$(ls -A release)" || { echo "no assets were downloaded"; exit 1; }
 
