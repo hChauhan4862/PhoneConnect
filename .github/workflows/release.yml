@@ -1,10 +1,14 @@
 name: Release
 
-# Publish by creating the release in the GitHub UI: publishing it fires `release: published`
-# and this workflow attaches the artifacts to *that* release, leaving the notes you wrote
-# alone. `workflow_dispatch` is the escape hatch for an existing tag; it creates the release
-# only when one does not exist yet. Nothing is published from a branch push.
+# Two ways in, and nothing else publishes anything:
+#   * push a `v*` tag                      -> the release is created for you
+#   * publish a release created in the UI   -> that release is reused, notes untouched
+# `workflow_dispatch` re-runs a tag by hand. A second run for a tag that already has assets is
+# skipped by the `state` job, so pushing a tag and then publishing its release cannot build
+# everything twice.
 on:
+  push:
+    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -12,23 +16,64 @@ on:
       tag:
         description: Existing tag to publish (the release is created if it is missing)
         required: true
+      force:
+        description: Rebuild even if this tag already has release assets
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # create the release and upload assets
   packages: write   # push the server image to GHCR
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.event.inputs.tag }}
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/${{ github.repository }}/server
-  RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+  # A tag push has no release payload, so the tag comes from the ref it was pushed at.
+  RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  # Cheap gate: a tag that already has release assets has been published, so a second event for
+  # the same tag (push, then the release created in the UI) must not rebuild the world.
+  state:
+    name: Is this tag already published
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Forced: rebuilding $RELEASE_TAG even though it may already have assets."
+            exit 0
+          fi
+          assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+          if [ "${assets:-0}" -gt 0 ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Release $RELEASE_TAG already has $assets assets; nothing to rebuild."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release $RELEASE_TAG has no assets; publishing."
+          fi
+
   # Everything must be green before a single artifact is published.
   verify:
+    needs: state
+    if: needs.state.outputs.publish == 'true'
     name: Verify before publishing
     runs-on: ubuntu-latest
     timeout-minutes: 40
