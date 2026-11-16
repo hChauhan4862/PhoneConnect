@@ -13,6 +13,19 @@ export interface DeviceList {
   devices: DeviceView[];
 }
 
+/// A minted enrollment token and the moment it stops working. This response is the only time
+/// the token is readable: the server stores its hash, and no endpoint can read it back.
+export interface IssuedEnrollmentToken {
+  token: string;
+  expires_at: number;
+}
+
+/// A revocation the server performed. The revoked secret is never echoed back.
+export interface Revocation {
+  revoked: boolean;
+  revoked_at: number;
+}
+
 export type SessionState = "active" | "expired" | "revoked" | "none";
 export type PathState = "none" | "unknown" | "direct_ready" | "relay";
 
@@ -266,6 +279,16 @@ export interface LeaseHandoff {
 
 export interface ApiClient {
   listDevices(): Promise<DeviceList>;
+  /// Mints one single-use enrollment token for [ownerId]. The lifetime is the server's range,
+  /// 1–3600 seconds; omitting it takes the server default. These are plain HTTP calls, not
+  /// dispatched commands: a 4xx is the server's refusal and nothing was created.
+  issueEnrollmentToken(
+    ownerId: string,
+    expiresInSeconds?: number,
+  ): Promise<IssuedEnrollmentToken>;
+  /// Revokes a device, its live sessions, and its channel. The device row stays listed, as
+  /// `revoked`, and only a new enrollment brings it back.
+  revokeDevice(deviceId: string): Promise<Revocation>;
   deviceStatus(deviceId: string, userId: string): Promise<DeviceStatus>;
   acquireLease(deviceId: string, actorId: string): Promise<LeaseView>;
   handoffLease(
@@ -416,6 +439,19 @@ export function createHttpApi(options: HttpApiOptions): ApiClient {
 
   return {
     listDevices: () => request<DeviceList>("GET", "/api/devices"),
+    issueEnrollmentToken: (ownerId, expiresInSeconds) =>
+      request<IssuedEnrollmentToken>(
+        "POST",
+        "/api/enrollment-tokens",
+        expiresInSeconds === undefined
+          ? { owner_id: ownerId }
+          : { owner_id: ownerId, expires_in_seconds: expiresInSeconds },
+      ),
+    revokeDevice: (deviceId) =>
+      request<Revocation>(
+        "POST",
+        `/api/devices/${encodeURIComponent(deviceId)}/revoke`,
+      ),
     deviceStatus: (deviceId, userId) =>
       request<DeviceStatus>(
         "GET",

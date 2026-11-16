@@ -97,6 +97,11 @@ function statusFixture(overrides: Partial<DeviceStatus> = {}): DeviceStatus {
 function createFakeApi(status: DeviceStatus | (() => Promise<DeviceStatus>)): ApiClient {
   return {
     listDevices: vi.fn(async () => ({ devices: [statusFixture().device] })),
+    issueEnrollmentToken: vi.fn(async () => ({
+      token: "pcenr_test_token",
+      expires_at: NOW + 900_000,
+    })),
+    revokeDevice: vi.fn(async () => ({ revoked: true, revoked_at: NOW })),
     deviceStatus: vi.fn(
       typeof status === "function" ? status : async () => status,
     ),
