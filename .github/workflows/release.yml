@@ -159,17 +159,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          # The per-platform tags this build pushes; the manifest step re-tags the result.
-          flavor: |
-            suffix=-${{ matrix.arch }}
-            latest=false
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+      # The tag comes from the release, not from `github.ref`: a `workflow_dispatch` runs on a
+      # branch, and `metadata-action`'s semver patterns read `github.ref`, so they would yield
+      # no tags at all and the push would fail with "tag is needed when pushing to registry".
+      - name: Work out this build's tags
+        id: tags
+        run: |
+          set -euo pipefail
+          # Registry references are lower-case; the repository name is not.
+          image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          version="${RELEASE_TAG#v}"
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            # Per-architecture tags only; the manifest job publishes the readable names.
+            echo "tags<<TAGS"
+            echo "${image}:${version}-${{ matrix.arch }}"
+            echo "TAGS"
+          } >> "$GITHUB_OUTPUT"
 
       - id: build
         uses: docker/build-push-action@v6
@@ -178,8 +185,7 @@ jobs:
           file: docker/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
