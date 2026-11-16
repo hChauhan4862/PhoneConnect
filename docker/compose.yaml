@@ -6,6 +6,9 @@
 #                             http://127.0.0.1:8080 for a local run; a real deployment sets
 #                             it to the public HTTPS origin behind its TLS proxy, because the
 #                             server advertises this value as the relay base.
+#
+# This file builds the image from source, which is what you want while changing the code. To
+# run a release, use compose.prod.yaml, which pulls the published image instead.
 services:
   server:
     build:

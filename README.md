@@ -43,7 +43,9 @@ This is an early milestone, not a finished product.
 - `native/` — the Tauri/Rust desktop shell over the server-served UI, plus loopback proxy
   endpoints.
 - `web/` — the only UI implementation, served by the server.
-- `docker/` — the server image, the compose file, and the container transport end-to-end test.
+- `docker/` — the server image, `compose.yaml` (builds from source, for development),
+  `compose.prod.yaml` (runs the published GHCR image, for a deployment), `.env.example`, and the
+  container transport end-to-end test.
 - `assets/` — the icon master (`icon.svg`) and the 512 px store asset; every other icon is
   generated from it.
 - `scripts/generate-icons.py` — renders the icon set for Android, the web UI, and the desktop
@@ -78,6 +80,25 @@ cargo test --workspace                            # Rust server, protocol, trans
 
 Each component's README documents its own commands, including `cargo clippy`, the web build,
 the APK build, and the Docker end-to-end test.
+
+## Deploy
+
+The released image runs on `linux/amd64` and `linux/arm64`, pulls without credentials, and is
+deployed with the compose file that ships beside it:
+
+```sh
+cp docker/.env.example docker/.env     # set the admin token and the public HTTPS origin
+docker compose --env-file docker/.env -f docker/compose.prod.yaml up -d
+```
+
+`docker/.env` is git-ignored because it holds the admin bearer token. Pin
+`PHONECONNECT_IMAGE` to a release tag rather than `latest` so a restart cannot upgrade the
+server under you, and set `PHONECONNECT_PUBLIC_URL` to the origin **devices** dial: the server
+advertises it as the relay base, so a value only the host can reach breaks every session.
+
+The container listens on plain HTTP and publishes on loopback; put a TLS-terminating reverse
+proxy in front of it. Its `/data` volume holds the SQLite database and both signing keys —
+losing it loses every enrollment, so back it up.
 
 ## What works today
 
@@ -164,12 +185,12 @@ not assume.
 - **Direct hole-punched paths on Android.** The Rust transport implements and tests them; the
   Android agent always uses the relay, and it does not verify ticket signatures (TLS to the hub
   is its trust anchor).
-- **Signed release publishing.** CI is configured in `.github/workflows/ci.yml` to run Rust
-  clippy and tests, the web typecheck, lint, tests, and build, the Android unit tests, lint,
-  and debug APK, and a Docker image build on every push to `main` and every pull request. It
-  has not yet been observed running on GitHub — this checkout has no remote. Nothing is
-  *published*: there is no signed release artifact, no APK or native installer release, and
-  no GHCR image push.
+- **Signed release publishing.** A push to `main` runs only the Rust and web checks; the
+  Android APK, the three-platform desktop shell, and the Docker image run on pull requests and
+  on demand, and all of them run again before a release publishes. Publishing works: create
+  the release in the GitHub UI and the workflow attaches the APKs and the shell binaries to it
+  and pushes the server image to GHCR. The release APK is **unsigned** unless the four Android
+  signing secrets are configured, so it installs but cannot be upgraded in place.
 - **Windows and Linux native builds.** Only macOS has been built here.
 - **Device control of Wi-Fi, Bluetooth, mobile data, rotation, night mode, or reboot.** These are
   refusals, not features: an ordinary installed app cannot hold the signature-level permissions

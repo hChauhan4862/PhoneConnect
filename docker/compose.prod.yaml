@@ -1,0 +1,61 @@
+# Production deployment: the published image, never a local build.
+#
+#   cp docker/.env.example docker/.env      # then fill it in
+#   docker compose --env-file docker/.env -f docker/compose.prod.yaml up -d
+#
+# `docker/.env` holds the admin token, so it is git-ignored; only `.env.example` is committed.
+# This file pairs with docker/compose.yaml, which builds from source for development — use
+# that one when you are changing the code, and this one everywhere else.
+
+services:
+  server:
+    # Pin a release tag. `latest` moves under you, and a restart would silently upgrade.
+    image: ${PHONECONNECT_IMAGE:-ghcr.io/hchauhan4862/phoneconnect/server:0.1.0}
+    restart: unless-stopped
+
+    environment:
+      # Required, and there is deliberately no default: an unset token stops the start instead
+      # of bootstrapping a deployment with a publicly known secret.
+      PHONECONNECT_ADMIN_TOKEN: ${PHONECONNECT_ADMIN_TOKEN:?set PHONECONNECT_ADMIN_TOKEN in docker/.env}
+      # The origin devices dial. The server advertises it as the relay base, so an
+      # unreachable value silently breaks every session.
+      PHONECONNECT_PUBLIC_URL: ${PHONECONNECT_PUBLIC_URL:?set PHONECONNECT_PUBLIC_URL to the https origin devices dial}
+      # On the volume, so a restart does not rotate the key native clients pinned.
+      PHONECONNECT_TICKET_KEY_PATH: /data/ticket-signing-key
+
+    ports:
+      # Loopback by default: a TLS-terminating reverse proxy publishes this origin, and the
+      # server itself has no TLS. Change the bind address only if something else fronts it.
+      - "${PHONECONNECT_BIND_ADDRESS:-127.0.0.1}:${PHONECONNECT_PORT:-8080}:8080"
+
+    volumes:
+      # SQLite database, the sealing key, and the signing key. Losing this volume loses every
+      # enrollment, so it is the one thing to back up.
+      - phoneconnect-data:/data
+
+    # The image already runs as an unprivileged user and writes only to /data and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # `/health` is unauthenticated on purpose, so a probe needs no secret.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Bounded logs: an audit-heavy relay should not be able to fill the host's disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  phoneconnect-data:

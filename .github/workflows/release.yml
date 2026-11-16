@@ -83,11 +83,24 @@ jobs:
         run: |
           ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug
 
+  # One image per architecture on that architecture's own runner, then one multi-arch manifest.
+  # Emulating the other architecture under QEMU would multiply the build time of a Rust and a
+  # Node compile for no benefit, and both runners are available to this public repository.
   image:
-    name: Publish the server image
+    name: Publish the server image (${{ matrix.arch }})
     needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,15 +118,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # The per-platform tags this build pushes; the manifest step re-tags the result.
+          flavor: |
+            suffix=-${{ matrix.arch }}
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
 
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -121,6 +139,75 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+
+      # The digest, not a tag: the tag says nothing about which platform it holds.
+      - name: Record the digest for the manifest
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.arch }}.txt"
+          cat "digests/${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  # Publishes `<version>`, `<major>.<minor>` and `latest` as one manifest listing both images,
+  # so a host pulls whatever matches its own architecture.
+  image-manifest:
+    name: Publish the multi-arch manifest
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Combine the per-architecture images
+        env:
+          RAW_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          # Registry references are lower-case; the repository name is not.
+          image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          version="${RAW_TAG#v}"
+          minor="${version%.*}"
+          amd64="$(cat digests/amd64.txt)"
+          arm64="$(cat digests/arm64.txt)"
+          test -n "$amd64"
+          test -n "$arm64"
+
+          # A pre-release such as 2.0.0-rc.1 must not take `latest` from the stable line.
+          tags=(--tag "${image}:${version}" --tag "${image}:${minor}")
+          case "$version" in
+            *-*) echo "pre-release: not tagging latest" ;;
+            *) tags+=(--tag "${image}:latest") ;;
+          esac
+
+          docker buildx imagetools create "${tags[@]}" \
+            "${image}@${amd64}" \
+            "${image}@${arm64}"
+
+      - name: Show what was published
+        env:
+          RAW_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          docker buildx imagetools inspect "${image}:${RAW_TAG#v}"
 
   android:
     name: Agent APK
@@ -252,8 +339,8 @@ jobs:
   # Runs only after the image, the APKs and every shell binary have been produced.
   publish:
     name: Attach the artifacts to the release
-    needs: [image, android, native]
-    if: ${{ always() && needs.image.result == 'success' && needs.android.result == 'success' && needs.native.result == 'success' }}
+    needs: [image-manifest, android, native]
+    if: ${{ always() && needs.image-manifest.result == 'success' && needs.android.result == 'success' && needs.native.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
