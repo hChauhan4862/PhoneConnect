@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Android 13+ themed-icon silhouette: one colour, so the dot is dropped (it would
+     disappear into the disc) and the ring is kept. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#ffffff"
+        android:fillType="evenOdd"
+        android:pathData="M54,21.6a32.4,32.4 0 1,0 0,64.8a32.4,32.4 0 1,0 0,-64.8z M54,26.67a27.33,27.33 0 1,0 0,54.66a27.33,27.33 0 1,0 0,-54.66z" />
+    <path
+        android:fillColor="#ffffff"
+        android:pathData="M54,30.65a23.35,23.35 0 1,0 0,46.7a23.35,23.35 0 1,0 0,-46.7z" />
+</vector>

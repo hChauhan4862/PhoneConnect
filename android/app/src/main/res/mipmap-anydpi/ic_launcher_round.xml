@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- An adaptive icon: the launcher supplies the mask and the parallax. The monochrome layer
+     is what Android 13+ uses for themed icons; platforms below 33 ignore the unknown tag, so
+     one resource serves every version this app supports (minSdk 28). -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

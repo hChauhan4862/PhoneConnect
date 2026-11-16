@@ -64,26 +64,26 @@ impl TelemetrySample {
                 reason: "sampled_at_ms is required",
             });
         }
-        if let Some(cpu) = self.cpu_percent {
-            if !cpu.is_finite() || !(0.0..=1000.0).contains(&cpu) {
-                return Err(TelemetryError::InvalidSample {
-                    reason: "cpu_percent must be a finite percentage",
-                });
-            }
+        if let Some(cpu) = self.cpu_percent
+            && (!cpu.is_finite() || !(0.0..=1000.0).contains(&cpu))
+        {
+            return Err(TelemetryError::InvalidSample {
+                reason: "cpu_percent must be a finite percentage",
+            });
         }
-        if let Some(battery) = self.battery_percent {
-            if battery > 100 {
-                return Err(TelemetryError::InvalidSample {
-                    reason: "battery_percent must be between 0 and 100",
-                });
-            }
+        if let Some(battery) = self.battery_percent
+            && battery > 100
+        {
+            return Err(TelemetryError::InvalidSample {
+                reason: "battery_percent must be between 0 and 100",
+            });
         }
-        if let (Some(used), Some(total)) = (self.memory_used_bytes, self.memory_total_bytes) {
-            if total == 0 || used > total {
-                return Err(TelemetryError::InvalidSample {
-                    reason: "memory usage must fit within the reported total",
-                });
-            }
+        if let (Some(used), Some(total)) = (self.memory_used_bytes, self.memory_total_bytes)
+            && (total == 0 || used > total)
+        {
+            return Err(TelemetryError::InvalidSample {
+                reason: "memory usage must fit within the reported total",
+            });
         }
         if let Some(connectivity) = self.connectivity.as_deref() {
             if connectivity.len() > MAX_CONNECTIVITY_BYTES {

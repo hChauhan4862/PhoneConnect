@@ -232,7 +232,7 @@ fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut bytes = [0u8; N];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(bytes)
@@ -714,14 +714,13 @@ fn claim_ticket(session_id: &str, role: TicketRole, nonce: &str) -> Result<(), T
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     used.retain(|_, seen| now.duration_since(*seen) < USED_TICKET_TTL);
-    if used.len() >= MAX_USED_TICKETS {
-        if let Some(oldest) = used
+    if used.len() >= MAX_USED_TICKETS
+        && let Some(oldest) = used
             .iter()
             .min_by_key(|(_, seen)| **seen)
             .map(|(key, _)| key.clone())
-        {
-            used.remove(&oldest);
-        }
+    {
+        used.remove(&oldest);
     }
     if used
         .insert((session_id.to_owned(), role_byte, nonce.to_owned()), now)
@@ -1241,10 +1240,10 @@ impl ConnectedPath {
                 // session, never "the relay is gone, create a new session" — the choice that
                 // would tear down a working direct path. The fault stays recorded, so a send
                 // that actually needs the relay still reports it.
-                if !socket.is_alive(self.config.direct_health_timeout) {
-                    if let Some(fault) = self.relay_fault() {
-                        return Err(fault.into());
-                    }
+                if !socket.is_alive(self.config.direct_health_timeout)
+                    && let Some(fault) = self.relay_fault()
+                {
+                    return Err(fault.into());
                 }
                 return Err(HolePunchError::ReceiveTimeout.into());
             }
@@ -1510,10 +1509,10 @@ impl ConnectedPath {
         .await?;
         if let Some((socket, _)) = &negotiated {
             let previous = self.replace_probe_socket(Arc::clone(socket));
-            if let Some(previous) = previous {
-                if !Arc::ptr_eq(&previous, socket) {
-                    previous.close();
-                }
+            if let Some(previous) = previous
+                && !Arc::ptr_eq(&previous, socket)
+            {
+                previous.close();
             }
         }
         let direct =
@@ -1652,12 +1651,12 @@ impl Drop for ConnectedPath {
     fn drop(&mut self) {
         // `shutdown` is the contract; this also stops a reader that was never explicitly
         // shut down, so abandoning a path does not leak a socket task.
-        if let Ok(mut socket) = self.probe_socket.lock() {
-            if let Some(socket) = socket.take() {
-                self.dropped_frames
-                    .fetch_max(socket.dropped_frames(), Ordering::SeqCst);
-                socket.close();
-            }
+        if let Ok(mut socket) = self.probe_socket.lock()
+            && let Some(socket) = socket.take()
+        {
+            self.dropped_frames
+                .fetch_max(socket.dropped_frames(), Ordering::SeqCst);
+            socket.close();
         }
         // A path that was never shut down must not keep pinging a relay nobody holds.
         self.stop_relay_keepalive();
@@ -1751,14 +1750,14 @@ impl PathController {
         }
         // Everything that can refuse the caller is checked before any state is claimed, so a
         // corrected retry with the same ticket still works.
-        if let Some(expected) = setup.expected_peer_identity {
-            if expected != verified.peer_identity_key {
-                return Err(TicketError::PeerIdentityMismatch {
-                    found: verified.peer_identity_key.to_string(),
-                    expected: expected.to_string(),
-                }
-                .into());
+        if let Some(expected) = setup.expected_peer_identity
+            && expected != verified.peer_identity_key
+        {
+            return Err(TicketError::PeerIdentityMismatch {
+                found: verified.peer_identity_key.to_string(),
+                expected: expected.to_string(),
             }
+            .into());
         }
         let peer_nonce = candidates.peer_nonce().ok_or(PathError::EpochUnavailable)?;
         claim_ticket(candidates.session_id(), ticket.role, &ticket.nonce)?;
@@ -1840,20 +1839,20 @@ impl PathController {
             }
         };
 
-        if kind == PathKind::Direct {
-            if let Some((direct_socket, HolePunchOutcome { peer, rtt })) = direct {
-                let mut state = path.state.write().await;
-                state.direct = Some(DirectState {
-                    socket: direct_socket,
-                    peer,
-                    rtt,
-                });
-                // A freshly committed path duplicates onto the relay for a bounded window
-                // until the peer proves it reads direct, so neither side can black-hole the
-                // other while they settle.
-                path.kind.store(PENDING, Ordering::SeqCst);
-                path.begin_transition();
-            }
+        if kind == PathKind::Direct
+            && let Some((direct_socket, HolePunchOutcome { peer, rtt })) = direct
+        {
+            let mut state = path.state.write().await;
+            state.direct = Some(DirectState {
+                socket: direct_socket,
+                peer,
+                rtt,
+            });
+            // A freshly committed path duplicates onto the relay for a bounded window until
+            // the peer proves it reads direct, so neither side can black-hole the other while
+            // they settle.
+            path.kind.store(PENDING, Ordering::SeqCst);
+            path.begin_transition();
         }
 
         Ok(path)

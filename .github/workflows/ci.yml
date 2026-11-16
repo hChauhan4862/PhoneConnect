@@ -1,9 +1,19 @@
 name: CI
 
+# Cost policy: a push to `main` runs only the cheap checks that catch real breakage (Rust and
+# the web UI). The slow jobs — the Android APK, the three-platform desktop shell, and the
+# Docker image — run on pull requests and on demand, and always before a release publishes,
+# so a broken artifact cannot ship. Docs-only changes run nothing.
 on:
   push:
     branches: [main]
+    paths-ignore: &docs
+      - "docs/**"
+      - "**/*.md"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
   pull_request:
+    paths-ignore: *docs
   workflow_dispatch:
 
 # Read-only by default: no CI job may write to the repository.
@@ -17,6 +27,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Everything except Rust and the web UI needs this: pull requests and manual runs.
+  FULL_MATRIX: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
 
 jobs:
   rust:
@@ -67,6 +79,7 @@ jobs:
       - run: npm run build
 
       - uses: actions/upload-artifact@v4
+        if: env.FULL_MATRIX == 'true'
         with:
           name: web-dist
           path: web/dist
@@ -74,6 +87,7 @@ jobs:
 
   android:
     name: Android
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     defaults:
@@ -104,10 +118,10 @@ jobs:
       - name: Lint
         run: ./gradlew --no-daemon :app:lintDebug
 
+      # Proves the launcher resources and R8: a bad icon or vector fails here, not at release.
       - name: Assemble debug APK
         run: ./gradlew --no-daemon :app:assembleDebug
 
-      # Proves R8 and the release manifest; signing is deliberately not configured here.
       - name: Assemble release APK (unsigned)
         run: ./gradlew --no-daemon :app:assembleRelease
 
@@ -129,10 +143,11 @@ jobs:
             android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-  # The shell loads a webview, so it is built with the `shell` feature; the default
-  # test profile stays free of webview system libraries.
+  # The shell loads a webview, so it is built with the `shell` feature; the default test
+  # profile stays free of webview system libraries.
   native:
     name: Native shell (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -161,7 +176,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev             librsvg2-dev libsoup-3.0-dev libssl-dev build-essential patchelf
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libssl-dev build-essential patchelf
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -200,6 +217,7 @@ jobs:
 
   docker:
     name: Docker image
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # `compose.yaml` refuses to interpolate without an admin token, and that applies to the
@@ -236,6 +254,9 @@ jobs:
           # The one UI is served by the server; a deep route returns the same document.
           curl -fsS http://127.0.0.1:8080/ | grep -qi '<!doctype html'
           curl -fsS http://127.0.0.1:8080/devices/abc | grep -qi '<!doctype html'
+          # The icon set the shell and the browser both load is actually served.
+          curl -fsS http://127.0.0.1:8080/favicon.svg | grep -qi '<svg'
+          curl -fsS http://127.0.0.1:8080/site.webmanifest | grep -qi 'PhoneConnect'
           # An unknown API path is a JSON 404, never the SPA.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/nope)" = "404"
           # Strict transport-ish headers are present on the document.

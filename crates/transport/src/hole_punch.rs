@@ -1090,16 +1090,16 @@ async fn switch_responder(inner: Arc<DirectInner>) {
             Ok(DirectEvent::Confirmed { from, echo }) => {
                 // Acknowledge every confirmation, including retransmissions, until the socket
                 // closes: the peer may have committed while its last confirm was still lost.
-                if *inner.peer() == Some(from) {
-                    if let Ok(seq) = inner.next_seq() {
-                        let credentials = inner
-                            .credentials
-                            .read()
-                            .map(|current| current.clone())
-                            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-                        let ack = ProbePacket::confirm_ack(seq, echo).encode(&credentials);
-                        let _ = inner.socket.send_to(&ack, from).await;
-                    }
+                if *inner.peer() == Some(from)
+                    && let Ok(seq) = inner.next_seq()
+                {
+                    let credentials = inner
+                        .credentials
+                        .read()
+                        .map(|current| current.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let ack = ProbePacket::confirm_ack(seq, echo).encode(&credentials);
+                    let _ = inner.socket.send_to(&ack, from).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,

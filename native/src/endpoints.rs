@@ -395,10 +395,11 @@ impl EndpointManager {
             } => {
                 {
                     let sessions = self.sessions.lock().await;
-                    if let Some(session) = sessions.get(&request.device_id) {
-                        if session.session_id() == ticket.session_id && session.is_usable().await {
-                            return Ok(Arc::clone(session));
-                        }
+                    if let Some(session) = sessions.get(&request.device_id)
+                        && session.session_id() == ticket.session_id
+                        && session.is_usable().await
+                    {
+                        return Ok(Arc::clone(session));
                     }
                 }
                 let session = self.establish(capability, ticket, candidates).await?;

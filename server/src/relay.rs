@@ -94,10 +94,10 @@ impl RelayLimits {
                 limits = updated;
             }
         }
-        if cap < STREAM_FRAME_LIMIT {
-            if let Ok(updated) = limits.with_stream_limit(StreamKind::Control, cap) {
-                limits = updated;
-            }
+        if cap < STREAM_FRAME_LIMIT
+            && let Ok(updated) = limits.with_stream_limit(StreamKind::Control, cap)
+        {
+            limits = updated;
         }
         limits
     }

@@ -313,10 +313,10 @@ impl TicketAuthority {
     ) -> Result<String, TicketError> {
         let mut rounds = self.rounds();
         rounds.retain(|_, round| round.expires_at > now_ms);
-        if let Some(round) = rounds.get(session_id) {
-            if round.expires_at >= now_ms {
-                return Ok(round.probe_key.clone());
-            }
+        if let Some(round) = rounds.get(session_id)
+            && round.expires_at >= now_ms
+        {
+            return Ok(round.probe_key.clone());
         }
         let probe_key =
             generate_secret("").map_err(|error| TicketError::Random(error.to_string()))?;
@@ -633,7 +633,7 @@ fn decode_hex_64(value: &str) -> Option<[u8; 64]> {
         return None;
     }
     let mut bytes = [0u8; 64];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(bytes)
@@ -932,12 +932,12 @@ pub async fn register_candidate(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(endpoint) = endpoint {
-        if endpoint.parse::<SocketAddr>().is_err() {
-            return Err(SessionError::InvalidEndpoint {
-                endpoint: endpoint.to_owned(),
-            });
-        }
+    if let Some(endpoint) = endpoint
+        && endpoint.parse::<SocketAddr>().is_err()
+    {
+        return Err(SessionError::InvalidEndpoint {
+            endpoint: endpoint.to_owned(),
+        });
     }
     let candidates =
         state

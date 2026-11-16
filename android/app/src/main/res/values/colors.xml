@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The tile colour of the launcher icon. Kept in resources so the adaptive background and
+         the legacy PNGs cannot drift apart. -->
+    <color name="ic_launcher_background">#0f766e</color>
+</resources>

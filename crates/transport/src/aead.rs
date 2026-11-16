@@ -607,14 +607,13 @@ fn claim_epoch(session_id: &str, role: TicketRole, epoch: &Epoch) -> Result<(), 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::Instant::now();
     claimed.retain(|_, seen| now.duration_since(*seen) < CLAIMED_EPOCH_TTL);
-    if claimed.len() >= MAX_CLAIMED_EPOCHS {
-        if let Some(oldest) = claimed
+    if claimed.len() >= MAX_CLAIMED_EPOCHS
+        && let Some(oldest) = claimed
             .iter()
             .min_by_key(|(_, seen)| **seen)
             .map(|(key, _)| key.clone())
-        {
-            claimed.remove(&oldest);
-        }
+    {
+        claimed.remove(&oldest);
     }
     if claimed.insert(key, now).is_some() {
         return Err(AeadError::EpochReused);

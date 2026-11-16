@@ -1,14 +1,16 @@
 name: Release
 
-# Tag a commit (for example `v0.2.0`) to publish the server image, the agent APKs and the
-# desktop shell binaries. Nothing is published from a branch push.
+# Publish by creating the release in the GitHub UI: publishing it fires `release: published`
+# and this workflow attaches the artifacts to *that* release, leaving the notes you wrote
+# alone. `workflow_dispatch` is the escape hatch for an existing tag; it creates the release
+# only when one does not exist yet. Nothing is published from a branch push.
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to publish
+        description: Existing tag to publish (the release is created if it is missing)
         required: true
 
 permissions:
@@ -16,12 +18,13 @@ permissions:
   packages: write   # push the server image to GHCR
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.release.tag_name || github.event.inputs.tag }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/${{ github.repository }}/server
+  RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
 
 jobs:
   # Everything must be green before a single artifact is published.
@@ -31,6 +34,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
@@ -68,7 +73,6 @@ jobs:
 
       - uses: android-actions/setup-android@v4
 
-      # AGP 8.9.1 picks build-tools 35.0.0 by default (no buildToolsVersion is set).
       - name: Install the SDK platform and build tools
         run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
@@ -86,6 +90,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -126,6 +132,8 @@ jobs:
         working-directory: android
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-java@v4
         with:
@@ -204,6 +212,8 @@ jobs:
             binary: target/release/phoneconnect-native.exe
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # crates/protocol/build.rs shells out to protoc on every platform.
       - uses: arduino/setup-protoc@v3
@@ -241,14 +251,12 @@ jobs:
 
   # Runs only after the image, the APKs and every shell binary have been produced.
   publish:
-    name: Create the release
+    name: Attach the artifacts to the release
     needs: [image, android, native]
     if: ${{ always() && needs.image.result == 'success' && needs.android.result == 'success' && needs.native.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -260,21 +268,44 @@ jobs:
           find artifacts -type f \( -name '*.apk' -o -name 'phoneconnect-*' \) -exec cp {} release/ \;
           ls -l release
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: PhoneConnect ${{ github.event.inputs.tag || github.ref_name }}
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          body: |
-            ## Install
-
-            - **Server:** `docker run -v phoneconnect-data:/data -e PHONECONNECT_ADMIN_TOKEN=<random> -e PHONECONNECT_PUBLIC_URL=https://your-origin -p 127.0.0.1:8080:8080 ghcr.io/${{ github.repository }}/server:${{ github.event.inputs.tag || github.ref_name }}`
-            - **Android agent:** `app-debug.apk` (debug-signed) or `app-release-*.apk`.
-            - **Desktop shell:** the `phoneconnect-*` binary for your platform. It loads the server UI you configure; it is not a second UI.
-
-            See `docs/capabilities.md` for exactly which device commands an ordinary Android app can perform, and which are refused by the platform.
-          files: release/*
+      # The release you created in the UI is reused as-is: only assets are attached, so the
+      # notes and the draft/published state stay yours. A release is created only when the
+      # tag exists but has no release yet (the `workflow_dispatch` path).
+      - name: Attach the assets to the release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; attaching the assets to it."
+            gh release upload "$tag" release/* --clobber
+            exit 0
+          fi
+
+          echo "No release for $tag yet; creating it from the existing tag."
+          # A quoted heredoc: this text is markdown, so its backticks must stay literal.
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          - **Server:** `docker run -v phoneconnect-data:/data -e PHONECONNECT_ADMIN_TOKEN=<random> -e PHONECONNECT_PUBLIC_URL=https://your-origin -p 127.0.0.1:8080:8080 ghcr.io/@REPOSITORY@/server:@IMAGE_TAG@`
+          - **Android agent:** `app-debug.apk` (debug-signed) or `app-release-*.apk`.
+          - **Desktop shell:** the `phoneconnect-*` binary for your platform. It loads the server UI you configure; it is not a second UI.
+
+          See `docs/capabilities.md` for exactly which device commands an ordinary Android app can perform, and which are refused by the platform.
+          NOTES
+          # Portable in-place rewrite: BSD `sed -i` needs an argument that GNU rejects.
+          sed "s|@REPOSITORY@|${{ github.repository }}|; s|@IMAGE_TAG@|${tag#v}|" notes.md > notes.tmp
+          mv notes.tmp notes.md
+
+          # A leading tag such as `v1.0.0-rc.1` is a pre-release, exactly as semver intends.
+          case "$tag" in
+            *-*)
+              gh release create "$tag" release/* --title "PhoneConnect $tag" \
+                --notes-file notes.md --verify-tag --prerelease
+              ;;
+            *)
+              gh release create "$tag" release/* --title "PhoneConnect $tag" \
+                --notes-file notes.md --verify-tag
+              ;;
+          esac

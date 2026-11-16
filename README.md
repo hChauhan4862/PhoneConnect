@@ -44,12 +44,17 @@ This is an early milestone, not a finished product.
   endpoints.
 - `web/` — the only UI implementation, served by the server.
 - `docker/` — the server image, the compose file, and the container transport end-to-end test.
+- `assets/` — the icon master (`icon.svg`) and the 512 px store asset; every other icon is
+  generated from it.
+- `scripts/generate-icons.py` — renders the icon set for Android, the web UI, and the desktop
+  shell from that one description.
 - `docs/` — the design spec, the implementation plan, and `docs/capabilities.md`, the device
   command matrix.
 
 ## Prerequisites
 
-- Rust 1.85 or newer (the workspace uses edition 2024).
+- Rust 1.88 or newer (the workspace uses edition 2024, and the pinned `time` release that
+  carries its security fix needs 1.88).
 - `protoc`, because `crates/protocol/build.rs` shells out to it and every Cargo command builds
   that crate:
 

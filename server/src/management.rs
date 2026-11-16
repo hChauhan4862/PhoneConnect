@@ -717,10 +717,10 @@ impl DeviceRegistry {
     /// only the current connection describes the device.
     pub fn record_hello(&self, connection: &ManagementConnection, hello: DeviceHello) {
         let mut inner = self.inner();
-        if let Some(current) = inner.connections.get_mut(&connection.device_id) {
-            if current.id == connection.connection_id {
-                current.hello = Some(hello);
-            }
+        if let Some(current) = inner.connections.get_mut(&connection.device_id)
+            && current.id == connection.connection_id
+        {
+            current.hello = Some(hello);
         }
     }
 
