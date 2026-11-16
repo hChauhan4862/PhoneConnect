@@ -89,6 +89,10 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
+      # The runner image ships build-tools but not the platform; the build needs 35.
+      - name: Install the SDK platform and build tools
+        run: sdkmanager --install "platforms;android-35" "build-tools;36.0.0" "platform-tools"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
@@ -146,9 +150,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # crates/protocol/build.rs shells out to protoc, so every OS needs it.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Tauri system libraries
         if: runner.os == 'Linux'
@@ -165,9 +171,19 @@ jobs:
       - name: Build the shell
         run: cargo build --release --features shell -p phoneconnect-native
 
-      - name: Smoke the host context (no display needed)
+      # Proves the URL policy and the injected host context without starting a webview.
+      - name: Smoke the host context
         shell: bash
-        run: ./target/release/phoneconnect-native --print-context > /dev/null 2>&1 || ./target/release/phoneconnect-native.exe --print-context > /dev/null
+        env:
+          PHONECONNECT_SERVER_URL: https://phoneconnect.example
+        run: |
+          set -euo pipefail
+          BIN=target/release/phoneconnect-native
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          "$BIN" --print-context > context.json
+          grep -q '"kind": "native"' context.json
+          grep -q 'phoneconnect.example' context.json
+          cat context.json
 
       - uses: actions/upload-artifact@v4
         with:

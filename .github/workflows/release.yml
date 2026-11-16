@@ -68,6 +68,9 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
+      - name: Install the SDK platform and build tools
+        run: sdkmanager --install "platforms;android-35" "build-tools;36.0.0" "platform-tools"
+
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Android unit tests and lint
@@ -135,10 +138,23 @@ jobs:
       - name: Assemble
         run: ./gradlew --no-daemon :app:assembleDebug :app:assembleRelease
 
-      # A signed release needs four repository secrets. Without them this step is skipped and
-      # the unsigned APK is published instead, which is installable but not upgradeable in place.
+      # A signed release needs four repository secrets. `secrets` is not an allowed context in a
+      # step-level `if:`, so presence is detected here and published as a step output. Without the
+      # secrets the unsigned APK is published instead: installable, but not upgradeable in place.
+      - name: Detect signing secrets
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Android signing secrets; publishing an unsigned release APK."
+          fi
+
       - name: Sign the release APK
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: steps.signing.outputs.present == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -183,9 +199,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protoc
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # crates/protocol/build.rs shells out to protoc on every platform.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Tauri system libraries
         if: runner.os == 'Linux'
@@ -215,9 +233,11 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # Runs only after the image, the APKs and every shell binary have been produced.
   publish:
     name: Create the release
     needs: [image, android, native]
+    if: ${{ always() && needs.image.result == 'success' && needs.android.result == 'success' && needs.native.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
