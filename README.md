@@ -85,7 +85,9 @@ emulator, by a unit test only, or not at all.
   and one authenticated management connection, and reconnects with bounded backoff. The agent's
   session flow runs against a real HTTP/WebSocket server in its JVM harness; enrollment and the
   management channel were exercised on an Android 15 emulator, where one service and one
-  notification held.
+  notification held. The setup screen offers the documented persistence mitigation — a button
+  that opens Android's battery-optimisation exemption screen — and then reports what Android
+  says. It is a request the user can decline; the app never claims it cannot be stopped.
 - **Identity and telemetry.** `device.info` and `telemetry.now` work end to end (emulator).
   `device.ping` is covered by unit tests only. `telemetry.now` reports battery, memory, and the
   active network transport; CPU percentage is always absent because Android does not expose it
@@ -116,9 +118,11 @@ emulator, by a unit test only, or not at all.
 - **Web UI.** Routes, panels, and API errors are covered by Vitest. The control panel was
   driven against the emulator in a real desktop browser. The file, app, screen, and console
   screens have component tests and the served SPA answers their routes, but no run has driven
-  them against a live device in a real desktop browser. The audit screen
-  (newest-first rows, a server-side device filter, and explicit empty and error states) is
-  covered by Vitest only; it was not driven against a live server in a browser. There is no
+  them against a live device in a real desktop browser. Onboarding — minting a single-use
+  enrollment token and revoking a device behind a confirmation — is covered by Vitest and was
+  exercised against the real server with `curl` (mint → enroll → single-use refusal → revoke),
+  but not clicked through in a browser. The audit screen (newest-first rows, a server-side
+  device filter, and explicit empty and error states) is covered by Vitest only. There is no
   server-to-client push, so every screen renders the snapshot it last read. The audit page
   says in visible text what its rows can and cannot mean: the actor is asserted by the token
   holder and is not verified by the server. An `accepted` outcome means the command was

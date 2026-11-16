@@ -51,6 +51,14 @@
          Without it the command answers not_permitted policy_access_required. -->
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
 
+    <!-- The battery-optimisation exemption is a request the user can refuse. Android and OEM
+         battery managers may still stop a foreground service; the setup screen asks for the
+         exemption and then reports what Android says, rather than promising the app cannot be
+         stopped. The scoped request dialog needs this permission. -->
+    <uses-permission
+        android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        tools:ignore="BatteryLife" />
+
     <!-- Backup is disabled so the Keystore-wrapped enrollment blob never leaves the device
          and a restore onto different hardware cannot present an undecryptable credential. -->
     <application

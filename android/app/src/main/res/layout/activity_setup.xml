@@ -91,6 +91,20 @@
             android:layout_marginTop="8dp"
             android:text="@string/setup_grant_policy_access" />
 
+        <Button
+            android:id="@+id/grant_battery_exemption"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/setup_grant_battery" />
+
+        <TextView
+            android:id="@+id/battery_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/setup_battery_status_initial" />
+
         <TextView
             android:id="@+id/grants_status"
             android:layout_width="match_parent"

@@ -329,6 +329,13 @@ This is an ordinary app. `START_STICKY`, boot recovery, and a `connectedDevice` 
 service improve survival but cannot promise it: users, the OS, and OEM battery managers can
 still stop the agent. The notification and setup screen say so and show recovery steps.
 
+The setup screen also offers the documented mitigation: an **"Allow running in the background"**
+button that opens Android's own battery-optimisation screen (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`
+for this package, falling back to the settings list when a build refuses the scoped dialog). It
+is a request the user can decline, never a grant the app takes for itself, and the status line
+reports what Android says afterwards — "Android exempts this app" or "Android may still stop this
+app to save battery". The screen never claims the agent cannot be stopped.
+
 ## Known gaps in this milestone
 
 - **Direct (hole-punched) paths are not ported.** `crates/transport` probes candidates with

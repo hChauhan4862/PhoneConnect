@@ -17,6 +17,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import com.phoneconnect.agent.net.HubClient
+import com.phoneconnect.agent.system.BatteryExemption
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,6 +46,8 @@ open class SetupActivity : Activity() {
     private lateinit var grantWriteSettingsButton: Button
     private lateinit var grantPolicyAccessButton: Button
     private lateinit var grantsStatusView: TextView
+    private lateinit var batteryStatusView: TextView
+    private lateinit var grantBatteryButton: Button
 
     /** What this screen last knew about the projection; the service is the authority. */
     private var captureOn = false
@@ -78,6 +81,9 @@ open class SetupActivity : Activity() {
         grantWriteSettingsButton = findViewById(R.id.grant_write_settings)
         grantPolicyAccessButton = findViewById(R.id.grant_policy_access)
         grantsStatusView = findViewById(R.id.grants_status)
+        batteryStatusView = findViewById(R.id.battery_status)
+        grantBatteryButton = findViewById(R.id.grant_battery_exemption)
+        grantBatteryButton.setOnClickListener { requestBatteryExemption() }
 
         hubField.setText(AgentSettings(this).hubUrl().orEmpty())
         enrollButton.setOnClickListener { enroll() }
@@ -196,12 +202,46 @@ open class SetupActivity : Activity() {
     }
 
     private fun showGrantState() {
+        showBatteryState()
         grantsStatusView.text = getString(
             R.string.setup_grants_status,
             getString(if (canWriteSettings()) R.string.setup_grant_granted else R.string.setup_grant_missing),
             getString(if (hasPolicyAccess()) R.string.setup_grant_granted else R.string.setup_grant_missing),
         )
     }
+
+    /**
+     * The battery exemption is a *request*: Android (and OEM battery managers) may still stop
+     * the service. The scoped dialog is preferred; a build that refuses it falls back to the
+     * settings list, and a device with neither says so instead of promising reliability.
+     */
+    private fun requestBatteryExemption() {
+        try {
+            startActivity(BatteryExemption.request(packageName))
+        } catch (_: ActivityNotFoundException) {
+            try {
+                startActivity(BatteryExemption.settings())
+            } catch (_: ActivityNotFoundException) {
+                batteryStatusView.text = getString(R.string.setup_grants_unavailable)
+            }
+        }
+    }
+
+    private fun showBatteryState() {
+        batteryStatusView.text = getString(
+            R.string.setup_battery_status,
+            getString(
+                if (ignoresBatteryOptimizations()) {
+                    R.string.setup_battery_exempt
+                } else {
+                    R.string.setup_battery_not_exempt
+                },
+            ),
+        )
+    }
+
+    /** Test seam: the real answer comes from the power manager. */
+    internal open fun ignoresBatteryOptimizations(): Boolean = BatteryExemption.isIgnoring(this)
 
     /** Test seams: the real answers come from the settings provider and the notification service. */
     internal open fun canWriteSettings(): Boolean = Settings.System.canWrite(this)
