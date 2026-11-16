@@ -257,16 +257,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      # Only the artifacts that become release assets. Downloading everything also pulls the
+      # Docker build-record artifact, which is not published and once failed the whole job.
+      - name: Download the APKs
+        uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: release-apk
+          path: release
+          merge-multiple: true
 
-      - name: Assemble the asset list
+      - name: Download the shell binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phoneconnect-*
+          path: release
+          merge-multiple: true
+
+      - name: Check there is something to publish
         run: |
           set -euo pipefail
-          mkdir -p release
-          find artifacts -type f \( -name '*.apk' -o -name 'phoneconnect-*' \) -exec cp {} release/ \;
           ls -l release
+          test -n "$(ls -A release)" || { echo "no assets were downloaded"; exit 1; }
 
       # The release you created in the UI is reused as-is: only assets are attached, so the
       # notes and the draft/published state stay yours. A release is created only when the
