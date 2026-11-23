@@ -1,7 +1,7 @@
 plugins {
     id("com.android.application") version "8.9.1"
-    id("org.jetbrains.kotlin.android") version "2.2.0"
-    id("com.google.protobuf") version "0.9.4"
+    id("org.jetbrains.kotlin.android") version "2.4.21"
+    id("com.google.protobuf") version "0.10.1"
 }
 
 android {
@@ -52,7 +52,7 @@ kotlin {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.29.3"
+        artifact = "com.google.protobuf:protoc:4.36.2"
     }
     generateProtoTasks {
         all().configureEach {
@@ -73,13 +73,13 @@ dependencies {
     protobuf(files("../../proto"))
 
     implementation("androidx.core:core-ktx:1.13.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
-    implementation("com.google.protobuf:protobuf-javalite:4.29.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    implementation("com.google.protobuf:protobuf-javalite:4.36.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("org.robolectric:robolectric:4.18.1")
     testImplementation("androidx.test:core:1.6.1")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
